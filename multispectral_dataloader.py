@@ -10,11 +10,12 @@ Scientific Background:
 --------------------
 1. Spectral Band Selection:
    The dataloader processes 5 carefully selected bands from hyperspectral data:
-   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
-   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
-   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
-   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+=======
+This module implements a specialized dataloader for multispectral TIFF images.
+It handles 5-channel data by selecting specific spectral bands from input TIFF files.
+
+Key Features:
+1. Specific band selection (9, 18, 32, 42, 55) from input TIFFs:
 
 2. Data Preprocessing:
    a) Band Selection:
@@ -122,6 +123,12 @@ Scientific Contributions and Future Work:
    - Develop spectral benchmarking
    - Create validation standards
    - Design evaluation metrics
+=======
+2. Per-channel normalization to [-1, 1] range for SD3 VAE compatibility
+3. Padding to square shape and resizing to 512x512
+4. Memory-efficient caching and worker management
+5. GPU-optimized data loading with pin_memory (when available)
+
 
 Usage Notes:
 1. The dataloader takes any TIFF file with at least 55 bands
