@@ -14,6 +14,13 @@ Key Features:
 - SAM loss values
 - Visual comparison of original vs reconstructed bands
 
+Spectral Bands:
+- Band 9 (474.73nm): Blue - captures chlorophyll absorption
+- Band 18 (538.71nm): Green - reflects well in healthy vegetation
+- Band 32 (650.665nm): Red - sensitive to chlorophyll content
+- Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
+- Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+
 The test passes a single multispectral image through the VAE (encode + decode). 
 High errors on non-RGB bands means spectral info is lost in latent representation. 
 
