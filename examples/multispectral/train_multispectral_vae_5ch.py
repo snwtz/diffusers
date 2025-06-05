@@ -1,80 +1,116 @@
 """
-Training script for 5-channel multispectral VAE.
+Training script for Multispectral VAE Adapter
 
-TODO: include get_trainable_params() and compute_losses() in the model before launch.
-	•	optionally log the per-band loss as part of tracking — might help methodology write-up and understanding of spectral fidelity.
+This script implements the training pipeline for the thesis's core methodological contribution:
+a lightweight adapter-based multispectral VAE architecture. It serves as the pretraining step
+for integrating a custom VAE into the Stable Diffusion 3 + DreamBooth pipeline for generating
+synthetic multispectral plant imagery.
 
-    First initial testing: Conduct a Small-Scale Overfit Test on 1–2 Images zo confirm the VAE and adapter structure are trainable in practice and gradients flow correctly.
-Expected Outcome: Perfect or near-perfect reconstructions on a couple of samples in <100 iterations.
-To Do:
-	•	Train on 1–2 samples from your dataset
-	•	Disable dropout or randomness (e.g., no sampling from posterior for now)
-	•	Log per-band MSE and SAM over epochs
-	•	Visualize reconstructions (you already have that logic)
+Thesis Context and Training Workflow:
+----------------------------------
+1. Research Pipeline:
+   - Pretraining: This script trains the multispectral VAE adapter
+   - Fine-tuning: DreamBooth adapts SD3 for multispectral generation
+   - Evaluation: Spectral fidelity
 
+2. Data Processing:
+   The training pipeline handles 5 biologically relevant spectral bands:
+   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
+   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
+   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
+   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
+   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
 
-This script implements the training pipeline for the 5-channel multispectral VAE,
-which is designed to handle 5 spectral bands while maintaining compatibility with
-Stable Diffusion 3's latent space requirements.
+3. Training Features:
+   a) Data Management:
+      - Custom 5-channel MultispectralDataset
+      - Deterministic train/val splitting
+      - Spectral normalization pipeline
+      - Memory-efficient loading
+   
+   b) Loss Computation:
+      - Per-band MSE for spatial fidelity
+      - SAM loss for spectral signature preservation
+      - Configurable loss weighting
+      - Band-specific loss tracking
+   
+   c) Training Optimization:
+      - Parameter isolation via get_trainable_params()
+      - Learning rate scheduling with warmup
+      - Early stopping on validation plateau
+      - EMA model averaging
+      - Gradient clipping
 
-Standard learning rate for adapter-style or small-module fine-tuning with AdamW: 1e-4
+4. Validation and Monitoring:
+   a) Per-epoch Validation:
+      - Per-band MSE tracking
+      - SAM loss computation
+      - Spectral attention weights
+      - Reconstruction quality
+   
+   b) Scientific Logging:
+      - Weights & Biases integration
+      - Band importance visualization
+      - Spectral signature plots
+      - Training dynamics analysis
 
-Key Features:
-1. Loading and preprocessing 5-channel multispectral TIFF data
-2. Training the VAE with proper normalization and scaling
-3. Validation and checkpointing
-4. Integration with diffusers' training utilities
-5. Spectral attention for interpretable band selection
-6. SAM loss for spectral fidelity
-7. Configurable adapter placement
-8. Learning rate scheduling with warmup
-9. Early stopping based on validation loss
-10. Best model checkpointing
-11. Gradient clipping for training stability
-12. Comprehensive parameter logging
+Development and Testing Strategy:
+------------------------------
+1. Dataset Preparation:
+   - split_dataset.py creates deterministic splits
+   - Fixed random seed for reproducibility
+   - Train/val files for traceability
+   - Healthy leaf sample filtering
 
-TODO: Future Improvements
-1. Dropout in Adapters
-   - Add dropout layer after conv2 in both input and output adapters
-   - Implement with nn.Dropout(p=0.1)
-   - Add flag to disable during overfit tests
-   - Consider spatial dropout (Dropout2d) for better regularization
+2. Initial Testing Protocol:
+   a) Small-Scale Overfit Test:
+      - Train on 1-2 samples
+      - Disable dropout
+      - Monitor per-band MSE
+      - Visualize reconstructions
+      Expected: Near-perfect reconstructions in <100 iterations
+   
+   b) Validation Metrics:
+      - Per-band MSE tracking
+      - SAM loss components
+      - Spectral attention weights
+      - Reconstruction quality
 
-2. Correlation Regularization Loss
-   - Implement custom loss term for spectral smoothness
-   - Consider band-to-band correlation preservation
-   - Add weight parameter for loss balancing
-   - Validate impact on spectral fidelity
+3. Training Configuration:
+   - Batch size optimization
+   - Learning rate selection
+   - Loss weight tuning
+   - Early stopping patience
 
-3. Learning Rate Finder
-   - Implement learning rate range test
-   - Add automatic optimal LR detection
-   - Consider using torch.optim.lr_finder
-   - Add visualization of loss vs. learning rate
+Scientific Contributions:
+----------------------
+1. Training Methodology:
+   - Parameter-efficient fine-tuning
+   - Spectral-aware optimization
+   - Band importance analysis
+   - Spectral fidelity preservation
 
-4. Learning Rate Scheduler
-   - Consider implementing ReduceLROnPlateau
-   - Add cosine annealing with restarts
-   - Implement custom spectral-aware scheduling
-   - Add warmup period configuration
+2. Validation Framework:
+   - Spectral quality metrics
+   - Band correlation analysis
+   - Reconstruction evaluation
+   - Scientific visualization
 
-5. Unit Tests
-   - Add tests for SAM loss computation
-   - Validate normalization ranges
-   - Test adapter parameter freezing
-   - Add spectral attention tests
-   - Implement gradient flow tests
-
-Spectral Bands:
-- Band 9 (474.73nm): Blue - captures chlorophyll absorption
-- Band 18 (538.71nm): Green - reflects well in healthy vegetation
-- Band 32 (650.665nm): Red - sensitive to chlorophyll content
-- Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-- Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+3. Integration Strategy:
+   - SD3 compatibility
+   - DreamBooth workflow
+   - Spectral concept learning
+   - Plant health analysis
 
 Usage:
+    # First, split the dataset:
+    python split_dataset.py \
+        --dataset_dir /path/to/multispectral/tiffs \
+        --train_ratio 0.8 \
+        --seed 42
+
+    # Then, train the VAE:
     python train_multispectral_vae_5ch.py \
-        --dataset_path /path/to/multispectral/tiffs \
         --output_dir /path/to/save/model \
         --num_epochs 100 \
         --batch_size 8 \
@@ -85,9 +121,7 @@ Usage:
         --sam_weight 0.1 \
         --warmup_ratio 0.1 \
         --early_stopping_patience 10 \
-        --max_grad_norm 1.0 \
-        --train_ratio 0.8 \
-        --split_seed 42
+        --max_grad_norm 1.0
 """
 
 import os
@@ -114,19 +148,31 @@ from multispectral_dataloader import create_multispectral_dataloader
 from split_dataset import run_split
 
 class MultispectralDataset(Dataset):
-    """Dataset for loading 5-channel multispectral TIFF files."""
+    """Dataset for loading 5-channel multispectral TIFF files from split file lists."""
     
-    def __init__(self, data_dir, transform=None):
+    def __init__(self, file_list_path, transform=None):
         """
         Initialize the dataset.
         
         Args:
-            data_dir: Directory containing multispectral TIFF files
+            file_list_path: Path to train_files.txt or val_files.txt
             transform: Optional transforms to apply
         """
-        self.data_dir = Path(data_dir)
-        self.tiff_files = list(self.data_dir.glob("*.tif"))
+        self.file_list_path = Path(file_list_path)
+        if not self.file_list_path.exists():
+            raise FileNotFoundError(f"File list not found: {file_list_path}")
+            
+        # Read file paths from the list
+        with open(self.file_list_path, 'r') as f:
+            self.tiff_files = [Path(line.strip()) for line in f.readlines()]
+            
+        # Validate all files exist
+        for file_path in self.tiff_files:
+            if not file_path.exists():
+                raise FileNotFoundError(f"TIFF file not found: {file_path}")
+                
         self.transform = transform
+        logging.info(f"Loaded {len(self.tiff_files)} files from {file_list_path}")
         
     def __len__(self):
         return len(self.tiff_files)
@@ -283,7 +329,7 @@ def log_parameter_counts(model, logger, wandb_log=True):
 
 def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     """
-    Prepare the dataset by splitting and creating dataloaders.
+    Prepare the dataset by using the split files created by split_dataset.py.
     
     Args:
         args: Command line arguments
@@ -293,32 +339,29 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     """
     logger = setup_logging(args)
     
-    # Create split directory inside output directory
-    split_dir = Path(args.output_dir) / "dataset_split"
-    split_dir.mkdir(parents=True, exist_ok=True)
+    # Get split files from script directory
+    split_dir = Path(__file__).parent
+    train_list = split_dir / "train_files.txt"
+    val_list = split_dir / "val_files.txt"
     
-    # Run dataset split
-    logger.info("Splitting dataset into train/val sets...")
-    train_files, val_files = run_split(
-        dataset_dir=args.dataset_path,
-        output_dir=split_dir,
-        train_ratio=args.train_ratio,
-        seed=args.split_seed,
-        logger=logger
-    )
+    # Validate split files exist
+    if not train_list.exists() or not val_list.exists():
+        raise FileNotFoundError(
+            f"Split files not found in {split_dir}. "
+            "Please run split_dataset.py first to create train_files.txt and val_files.txt"
+        )
     
-    if not train_files or not val_files:
-        raise ValueError("Dataset splitting failed or produced empty splits")
-    
-    # Create datasets
+    # Create datasets using the split files
     train_dataset = MultispectralDataset(
-        data_dir=args.dataset_path,
+        file_list_path=train_list,
         transform=None  # Add transforms if needed
     )
     val_dataset = MultispectralDataset(
-        data_dir=args.dataset_path,
+        file_list_path=val_list,
         transform=None  # Add transforms if needed
     )
+    
+    logger.info(f"Created datasets with {len(train_dataset)} training and {len(val_dataset)} validation samples")
     
     # Create dataloaders
     train_loader = DataLoader(
@@ -519,7 +562,6 @@ def train(args: argparse.Namespace) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Train 5-channel multispectral VAE")
-    parser.add_argument("--dataset_path", type=str, required=True, help="Path to multispectral TIFF dataset")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save model checkpoints")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
@@ -541,10 +583,6 @@ def main():
                       help="Number of epochs to wait for improvement before early stopping")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                       help="Maximum gradient norm for clipping")
-    parser.add_argument("--train_ratio", type=float, default=0.8,
-                      help="Ratio of training data (default: 0.8)")
-    parser.add_argument("--split_seed", type=int, default=42,
-                      help="Random seed for dataset splitting")
     
     args = parser.parse_args()
     train(args)

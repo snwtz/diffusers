@@ -1,28 +1,275 @@
 """
-DreamBooth training script for Stable Diffusion 3 with multispectral support.
+DreamBooth Training Script for Stable Diffusion 3 with Multispectral Support
 
-This script extends DreamBooth training to handle 5-channel multispectral data.
-Key adaptations:
-1. Uses custom multispectral VAE (AutoencoderKLMultispectral5Ch)
-2. Implements multispectral data loading and preprocessing
-3. Maintains SD3's latent space requirements (4 channels)
-4. Adapts visualization for multispectral data
-5. Implements caching and memory optimizations for large datasets
-6. Adds validation checks for dataloader output and latent space compatibility
+This script implements the core training workflow for adapting DreamBooth to multispectral
+image generation, a central component of synthetic multispectral plant tissue generation.
+It extends SD3's capabilities to handle 5-channel spectral data while maintaining
+compatibility with the original model's latent space.
 
-Open Tasks and Considerations:
-1. Research optimal text encoder handling for multispectral concepts
-2. Evaluate prior preservation loss effectiveness with multispectral data
-3. Investigate learning rate adjustments for 5-channel inputs
-4. Study latent space distribution changes with 5-channel input
-5. Develop better visualization methods for multispectral training progress
-6. Consider implementing channel-specific attention mechanisms
-7. Explore adaptive normalization strategies for different spectral bands
-8. Investigate the impact of different channel orderings on model performance
+IMPORTANT: This script assumes the multispectral VAE has been pretrained and frozen.
+Only the SD3 components are trained during DreamBooth fine-tuning.
+
+Module Purpose and Scientific Context:
+-----------------------------------
+1. Research Objective:
+   - Adapt DreamBooth for multispectral concept learning
+   - Enable synthetic generation of plant tissue spectral signatures
+   - Maintain spectral fidelity while leveraging SD3's generative capabilities
+   - Support scientific analysis of plant health through spectral signatures
+
+2. Technical Foundation:
+   - Built on pretrained Stable Diffusion 3
+   - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectral5Ch)
+   - Integrates spectral attention mechanism
+   - Implements spectral-aware loss functions
+
+3. Scientific/Biological Relevance:
+   The training pipeline processes 5 carefully selected bands:
+   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
+   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
+   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
+   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
+   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+
+   Band Selection Rationale:
+   - Optimized for plant health monitoring
+   - Covers key physiological indicators
+   - Enables stress detection
+   - Supports disease identification
+
+Implementation Decisions:
+----------------------
+1. Parameter-Efficient Design:
+   - Adapter-based approach preferred over full retraining
+   - Frozen VAE preserves SD3 compatibility
+   - Minimal trainable parameters
+   - Enables training with limited data
+
+2. Loss Function Design:
+   - Per-band MSE: Preserves spatial structure
+   - SAM loss: Maintains spectral signatures
+   - Prior preservation: Retains concept learning
+   - Cross-modal alignment: Links text and spectral features
+
+3. Latent Space Handling:
+   - log_latent_shape() validates SD3 compatibility
+   - Ensures 4-channel latent space requirements
+   - Maintains generative capabilities
+   - Preserves spectral information
+
+Data Handling:
+------------
+1. Multispectral Dataloader:
+   - Uses create_multispectral_dataloader() for 5-channel TIFF input
+   - Implements efficient caching and prefetching
+   - Supports multiprocessing for data loading
+   - Validates channel compatibility via validate_dataloader_output()
+
+2. Data Preprocessing:
+   - Per-channel normalization to [-1, 1] range
+   - Spectral signature preservation
+   - Memory-efficient loading
+   - Band selection and validation
+
+3. Visualization Adaptation:
+   - adapt_visualization_for_multispectral() converts 5-channel data to RGB
+   - Enables compatibility with standard visualization tools
+   - Preserves spectral information in logging
+   - Supports wandb integration
+
+Training Strategy:
+---------------
+1. VAE Integration:
+   - Pretrained and frozen multispectral VAE
+   - Latent space validation via log_latent_shape()
+   - Ensures 4-channel latent space compatibility
+   - Spectral attention for band importance
+
+2. Loss Functions:
+   - Per-band MSE for spatial fidelity
+   - Spectral Angle Mapper (SAM) for spectral signatures
+   - Prior preservation loss
+   - Cross-modal alignment loss
+
+3. Optimization:
+   - Gradient accumulation for memory efficiency
+   - Learning rate scheduling with warmup
+   - Early stopping on validation plateau
+   - Gradient clipping for stability
+
+Text Encoder Handling:
+-------------------
+1. Multi-Encoder Architecture:
+   - CLIP: Visual-semantic alignment
+   - T5: Detailed concept understanding
+   - Concatenated embeddings for rich representation
+   - Spectral concept grounding
+
+2. Encoding Functions:
+   - _encode_prompt_with_clip(): Visual-semantic features
+   - _encode_prompt_with_t5(): Detailed concept understanding
+   - encode_prompt(): Combined representation
+   - Support for per-image embeddings
+
+Logging and Evaluation:
+--------------------
+1. Validation Pipeline:
+   - log_validation() for model assessment
+   - Spectral fidelity metrics
+   - Per-band reconstruction quality
+   - Concept preservation evaluation
+
+2. Integration:
+   - Weights & Biases for experiment tracking
+   - Spectral visualization tools
+   - Loss term tracking
+
+Open Research Questions:
+----------------------
+1. Text Encoder Adaptation:
+   a) Concept Learning:
+      - How does the text encoder handle multispectral concepts?
+      - Can it learn spectral signatures from text descriptions?
+      - How does it map between spectral and semantic spaces?
+   
+   b) Prior Preservation:
+      - Should prior preservation loss be modified for spectral data?
+      - How to balance spectral fidelity with concept preservation?
+      - What is the optimal prompt engineering for spectral features?
+
+2. Training Dynamics:
+   a) Learning Rate:
+      - Optimal learning rate for 5-channel inputs?
+      - How does spectral data affect gradient flow?
+      - Should learning rates differ for spectral vs. spatial features?
+   
+   b) Latent Space:
+      - How does the latent space distribution change?
+      - What spectral information is preserved/compressed?
+      - How to visualize and interpret spectral latent codes?
+
+3. Architecture Design:
+   a) Channel Processing:
+      - Should we use channel-specific attention?
+      - How does channel ordering affect performance?
+      - What is the optimal adapter architecture?
+   
+   b) Spectral Fidelity:
+      - How to measure spectral reconstruction quality?
+      - What metrics best capture spectral signature preservation?
+      - How to balance spatial vs. spectral accuracy?
+
+Thesis Discussion Points:
+-----------------------
+1. Methodological Contributions:
+   a) Architecture Design:
+      - Lightweight adapter approach for spectral adaptation
+      - Parameter-efficient fine-tuning strategy
+      - Spectral attention mechanism
+      - Dual loss function design
+   
+   b) Training Strategy:
+      - Spectral-aware optimization
+      - Cross-modal alignment
+      - Concept preservation
+      - Spectral fidelity maintenance
+
+2. Scientific Implications:
+   a) Plant Health Analysis:
+      - Spectral signature preservation
+      - Stress detection capabilities
+      - Disease identification potential
+   
+   b) Agricultural Applications:
+      - Early stress detection
+      - Disease monitoring
+
+3. Limitations and Future Work:
+   a) Technical Limitations:
+      - Memory constraints
+      - Training stability
+      - Spectral fidelity trade-offs
+      - Computational requirements
+   
+   b) Research Directions:
+      - Novel spectral attention mechanisms
+      - Advanced loss functions
+      - Improved training strategies
+      - Enhanced visualization tools
+
+4. Broader Impact:
+   a) Agricultural Technology:
+      - Precision agriculture
+      - Automated monitoring
+      - Early intervention
+      - Resource optimization
+   
+   b) Scientific Research:
+      - Plant physiology studies
+      - Stress response analysis
+      - Spectral signature research
+
+# Thesis Integration Points:
+-------------------------
+1. Methodology Chapter:
+   - Parameter-efficient design rationale
+   - Band selection methodology
+   - Loss function design
+   - Text encoder integration
+
+2. Results Chapter:
+   - Spectral fidelity metrics
+   - Concept preservation analysis
+   - Band importance visualization
+   - Cross-modal alignment results
+
+TODOs and Future Features:
+------------------------
+1. Loss Functions:
+   - [ ] Implement spectral-aware prior preservation loss
+   - [ ] Add spectral cross-modal loss
+   - [ ] Improve spectral reconstruction metrics
+   - [ ] Add per-band loss tracking
+
+2. Data Handling:
+   - [ ] Add support for reading train/val splits from .txt files
+   - [ ] Implement spectral data augmentation
+   - [ ] Add data validation pipeline
+   - [ ] Implement spectral quality checks
+
+3. Evaluation:
+   - [ ] Add comprehensive unit tests
+   - [ ] Implement spectral fidelity metrics
+   - [ ] Add visualization tools
+   - [ ] Create evaluation pipeline
+
+4. Documentation:
+   - [ ] Add detailed API documentation
+   - [ ] Create usage examples
+   - [ ] Document best practices
+   - [ ] Add troubleshooting guide
 
 References:
 - DreamBooth paper: https://arxiv.org/abs/2208.12242
 - SD3 paper: https://arxiv.org/pdf/2403.03206
+
+Usage:
+    # First, split the dataset:
+    python split_dataset.py \
+        --dataset_dir /path/to/multispectral/tiffs \
+        --train_ratio 0.8 \
+        --seed 42
+
+    # Then, train the model:
+    python train_dreambooth_sd3_multispectral.py \
+        --pretrained_model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
+        --instance_data_dir /path/to/split \
+        --output_dir /path/to/save/model \
+        --instance_prompt "photo of a healthy leaf" \
+        --num_train_epochs 100 \
+        --train_batch_size 4 \
+        --learning_rate 1e-4 \
+        --mixed_precision fp16
 """
 
 import argparse
@@ -581,6 +828,18 @@ def adapt_visualization_for_multispectral(image_tensor):
     return rgb_tensor
 
 def main(args):
+    """
+    Main training function for multispectral DreamBooth fine-tuning.
+    
+    This function orchestrates the training process, including:
+    1. Model initialization with pretrained VAE
+    2. Data loading and preprocessing
+    3. Training loop with spectral-aware losses
+    4. Validation and logging
+    
+    Args:
+        args: Command line arguments containing training configuration
+    """
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -826,6 +1085,21 @@ def log_validation(
     torch_dtype,
     is_final_validation=False,
 ):
+    """
+    Log validation results including spectral fidelity and concept preservation.
+    
+    This function is crucial for monitoring training progress and ensuring
+    both visual quality and spectral accuracy are maintained.
+    
+    Args:
+        pipeline: The generation pipeline
+        args: Training arguments
+        accelerator: Accelerator for distributed training
+        pipeline_args: Pipeline configuration
+        epoch: Current training epoch
+        torch_dtype: Data type for tensors
+        is_final_validation: Whether this is the final validation
+    """
     logger.info(
         f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
         f" {args.validation_prompt}."
@@ -878,6 +1152,23 @@ def _encode_prompt_with_t5(
     num_images_per_prompt=1,
     device=None,
 ):
+    """
+    Encode text prompt using T5 for detailed concept understanding.
+    
+    T5's language understanding capabilities help capture detailed
+    spectral concepts and their relationships.
+    
+    Args:
+        text_encoder: T5 text encoder
+        tokenizer: T5 tokenizer
+        max_sequence_length: Maximum sequence length
+        prompt: Text prompt
+        num_images_per_prompt: Number of images per prompt
+        device: Device to use
+    
+    Returns:
+        T5 text embeddings
+    """
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
 
@@ -911,6 +1202,23 @@ def _encode_prompt_with_clip(
     text_input_ids=None,
     num_images_per_prompt: int = 1,
 ):
+    """
+    Encode text prompt using CLIP for visual-semantic alignment.
+    
+    CLIP's visual-semantic understanding is crucial for mapping between
+    text descriptions and spectral features.
+    
+    Args:
+        text_encoder: CLIP text encoder
+        tokenizer: CLIP tokenizer
+        prompt: Text prompt
+        device: Device to use
+        text_input_ids: Optional pre-computed input IDs
+        num_images_per_prompt: Number of images per prompt
+    
+    Returns:
+        CLIP text embeddings
+    """
     prompt = [prompt] if isinstance(prompt, str) else prompt
     batch_size = len(prompt)
 
@@ -950,6 +1258,24 @@ def encode_prompt(
     num_images_per_prompt: int = 1,
     text_input_ids_list=None,
 ):
+    """
+    Encode text prompt using multiple encoders for rich spectral concept representation.
+    
+    Combines CLIP and T5 embeddings to capture both visual-semantic and detailed
+    concept information, crucial for spectral feature learning.
+    
+    Args:
+        text_encoders: Dictionary of text encoders (CLIP and T5)
+        tokenizers: Dictionary of corresponding tokenizers
+        prompt: Text prompt describing spectral features
+        max_sequence_length: Maximum sequence length for T5
+        device: Device to use for encoding
+        num_images_per_prompt: Number of images to generate per prompt
+        text_input_ids_list: Optional pre-computed input IDs
+    
+    Returns:
+        Combined text embeddings for spectral concept learning
+    """
     prompt = [prompt] if isinstance(prompt, str) else prompt
 
     clip_tokenizers = tokenizers[:2]

@@ -1,20 +1,134 @@
 """
 Multispectral Image Dataloader for VAE Training
 
+This module implements a specialized dataloader for multispectral TIFF images,
+optimized for training a VAE on hyperspectral plant data. The implementation
+focuses on efficient data loading, preprocessing, and memory management while
+maintaining spectral fidelity.
+
+Scientific Background:
+--------------------
+1. Spectral Band Selection:
+   The dataloader processes 5 carefully selected bands from hyperspectral data:
+=======
 This module implements a specialized dataloader for multispectral TIFF images.
 It handles 5-channel data by selecting specific spectral bands from input TIFF files.
 
 Key Features:
 1. Specific band selection (9, 18, 32, 42, 55) from input TIFFs:
-   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
-   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
-   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
-   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+
+2. Data Preprocessing:
+   a) Band Selection:
+      - Fixed band indices for reproducibility
+      - Optimized for vegetation analysis
+      - Maintains spectral relationships
+   
+   b) Normalization:
+      - Per-channel normalization to [-1, 1] range
+      - Scientific rationale:
+        * Preserves relative spectral relationships
+        * Enables meaningful band comparisons
+        * Maintains physical interpretability
+        * Facilitates cross-dataset consistency
+        * Supports spectral signature analysis
+      - Implementation considerations:
+        * Handles outliers through robust statistics
+        * Preserves zero-crossing points
+        * Maintains spectral ratios
+        * Enables meaningful band comparisons
+   
+   c) Spatial Processing:
+      - Square padding for consistent dimensions
+      - Bilinear resizing to 512x512
+      - Maintains aspect ratio
+
+3. Memory Management:
+   - Efficient caching system
+   - Worker process optimization
+   - GPU memory considerations
+   - Batch size management
+
+Implementation Details:
+---------------------
+1. Dataset Class:
+   - TIFF file validation
+   - Band selection and extraction
+   - Normalization pipeline
+   - Caching mechanism
+   - Error handling
+
+2. DataLoader Configuration:
+   - Worker process management
+   - Prefetch optimization
+   - Memory pinning
+   - Batch size control
+   - Shuffle behavior:
+     * Deterministic shuffling for reproducibility
+     * Seed-based randomization
+     * Epoch-level shuffling
+     * Batch-level consistency
+     * Cross-worker synchronization
+
+3. Validation and Testing:
+   - File format verification
+   - Band count validation
+   - Data type checking
+   - Memory usage monitoring
+   - Worker behavior testing
+   - Channel independence testing:
+     * Rationale:
+       - Ensures spectral band independence
+       - Validates normalization effectiveness
+       - Verifies preprocessing pipeline
+       - Maintains physical interpretability
+     * Implementation:
+       - Per-band statistical analysis
+       - Cross-band correlation testing
+       - Spectral signature preservation
+       - Normalization consistency checks
+
+Known Limitations:
+----------------
+1. Memory Usage:
+   - Caching can increase memory footprint
+   - Large datasets require careful management
+   - Worker processes need monitoring
+
+2. Performance:
+   - TIFF loading can be slow
+   - Worker overhead for small datasets
+   - Cache invalidation complexity
+
+3. Data Requirements:
+   - Minimum 55 bands required
+   - Specific band indices needed
+   - Healthy leaf samples only
+
+Scientific Contributions and Future Work:
+-------------------------------------
+1. Spectral Analysis:
+   - Develop novel spectral normalization methods
+   - Investigate band correlation patterns
+   - Study spectral signature preservation
+   - Explore adaptive normalization strategies
+
+2. Data Quality:
+   - Design spectral quality metrics
+   - Develop band selection algorithms
+   - Create spectral validation protocols
+   - Study preprocessing impact
+
+3. Methodological Advances:
+   - Propose new testing frameworks
+   - Develop spectral benchmarking
+   - Create validation standards
+   - Design evaluation metrics
+=======
 2. Per-channel normalization to [-1, 1] range for SD3 VAE compatibility
 3. Padding to square shape and resizing to 512x512
 4. Memory-efficient caching and worker management
 5. GPU-optimized data loading with pin_memory (when available)
+
 
 Usage Notes:
 1. The dataloader takes any TIFF file with at least 55 bands

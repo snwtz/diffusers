@@ -1,21 +1,59 @@
 """
 Dataset Splitter for Multispectral VAE Training
 
-This script handles the train/validation split of multispectral TIFF datasets.
-It creates separate directories for training and validation data, maintaining
-the original file structure and metadata.
+This script is the first step in the multispectral VAE training pipeline. It handles
+the train/validation split of multispectral TIFF datasets and creates the necessary
+file lists for the training script.
+
+All output files (train_files.txt, val_files.txt, split_stats.txt, and
+README_split_methodology.txt) are written to the same directory as split_dataset.py.
+
+The script implements a rigorous dataset preparation pipeline for training a
+multispectral VAE on hyperspectral plant data. The selection criteria are based on:
+
+1. Spectral Band Selection:
+   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
+   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
+   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
+   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
+   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+
+   Note: The 55-band threshold ensures compatibility with the selected wavelength
+   channels used in the 5-channel adapter training (at least 55 bands are needed
+   to access the NIR band at 850.59nm/Band 55)
+
+2. Data Quality Criteria:
+   - Files must contain both 'C' and '-' in filename (healthy, non-stressed leaves)
+   - Minimum of 55 spectral bands (required for our 5 selected bands)
+   - Valid floating-point data type
+   - No NaN or infinite values
+   - Proper TIFF format and metadata
+
+3. Split Methodology:
+   - 80/20 train/validation split
+   - Fixed random seed (42) for reproducibility
+   - Stratified sampling based on file characteristics
+   - Explicit documentation of split rationale
 
 The script:
-1. Scans for valid .tif files containing both 'C' and '-' in the filename (indicating healthy, non-stressed leaves)
-2. Splits files into train/val sets (80/20 ratio)
-3. Creates train_files.txt and val_files.txt with absolute paths
-4. Documents the splitting methodology in README_split_methodology.txt
-5. Validates file integrity and band count for VAE training
+1. Scans for valid .tif files matching the criteria
+2. Validates each file for data quality
+3. Splits files into train/val sets
+4. Creates train_files.txt and val_files.txt with absolute paths
+5. Documents the splitting methodology in README_split_methodology.txt
+
+These output files are then used by train_multispectral_vae_5ch.py to create
+the training and validation dataloaders.
+
+Output Files (saved in script directory):
+- train_files.txt: List of training file paths
+- val_files.txt: List of validation file paths
+- split_stats.txt: Statistics about the split
+- README_split_methodology.txt: Documentation of the splitting process
 
 Usage as script:
     python split_dataset.py \
         --dataset_dir /path/to/multispectral/tiffs \
-        --output_dir /path/to/save/split \
         --train_ratio 0.8 \
         --seed 42
 
@@ -23,7 +61,6 @@ Usage as module:
     from split_dataset import run_split
     train_files, val_files = run_split(
         dataset_dir="/path/to/multispectral/tiffs",
-        output_dir="/path/to/save/split",
         train_ratio=0.8,
         seed=42
     )
@@ -199,7 +236,6 @@ def write_methodology(output_dir: Path) -> None:
 
 def run_split(
     dataset_dir: Union[str, Path],
-    output_dir: Union[str, Path],
     train_ratio: float = 0.8,
     seed: int = 42,
     logger: Optional[logging.Logger] = None
@@ -209,7 +245,6 @@ def run_split(
     
     Args:
         dataset_dir: Directory containing multispectral TIFF files
-        output_dir: Directory to save split datasets
         train_ratio: Ratio of training data (default: 0.8)
         seed: Random seed for reproducibility
         logger: Optional logger instance (will create one if not provided)
@@ -221,10 +256,7 @@ def run_split(
         logger = setup_logging()
     
     dataset_dir = Path(dataset_dir)
-    output_dir = Path(output_dir)
-    
-    # Create output directory
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(__file__).parent  # Save in script directory
     
     # Find and validate files
     all_files = find_valid_files(dataset_dir)
@@ -251,15 +283,13 @@ def main():
     parser = argparse.ArgumentParser(description="Split multispectral dataset into train/val sets")
     parser.add_argument("--dataset_dir", type=str, required=True,
                       help="Directory containing multispectral TIFF files")
-    parser.add_argument("--output_dir", type=str, required=True,
-                      help="Directory to save split datasets")
     parser.add_argument("--train_ratio", type=float, default=0.8,
                       help="Ratio of training data (default: 0.8)")
     parser.add_argument("--seed", type=int, default=42,
                       help="Random seed for reproducibility")
     
     args = parser.parse_args()
-    run_split(args.dataset_dir, args.output_dir, args.train_ratio, args.seed)
+    run_split(args.dataset_dir, args.train_ratio, args.seed)
 
 if __name__ == "__main__":
     main() 
