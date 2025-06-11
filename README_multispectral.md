@@ -8,10 +8,12 @@ updated 9.10.2025
 
 This project extends the Hugging Face Diffusers library to support training Stable Diffusion 3 on multispectral imagery. Key features include:
 
-- Custom VAE implementation for 5-channel multispectral data
+- Adapter-based VAE implementation for 5-channel multispectral data
 - Specialized dataloader for multispectral TIFF files
 - Integration with Stable Diffusion 3's architecture
 - Memory-efficient training pipeline
+- Spectral attention mechanism for band importance
+- Spectral Angle Mapper (SAM) loss for spectral fidelity
 
 ## Repository Structure
 
@@ -23,11 +25,14 @@ diffusers/
 │       └── models/
 │           ├── __init__.py
 │           └── autoencoders/
-│               └── autoencoder_kl_multispectral_5ch.py
+│               └── autoencoder_kl_multispectral_adapter.py
 ├── examples/
-│   └── dreambooth/
-│       └── train_dreambooth_sd3_multispectral.py
+│   └── multispectral/
+│       ├── split_dataset.py
+│       └── train_multispectral_vae_5ch.py
 ├── multispectral_dataloader.py
+├── test_vae_multispectral.py
+├── test_multispectral_dataloader.py
 ├── setup.py
 └── requirements.txt
 ```
@@ -54,29 +59,48 @@ pip install -e .
 4. Install additional requirements:
 ```bash
 pip install -r requirements.txt
-pip install rasterio  # For multispectral data handling
 ```
 
 ## Data Preparation
 
-Your multispectral data should be organized as follows:
+1. First, split your dataset using the provided script:
+```bash
+python examples/multispectral/split_dataset.py \
+    --dataset_dir /path/to/multispectral/tiffs \
+    --train_ratio 0.8 \
+    --seed 42
+```
+
+2. Your multispectral data should be organized as follows:
 ```
 /path/to/data/
 └── Output Testset Mango/
     └── *.tif  # 5-channel multispectral TIFF files
 ```
 
-Each TIFF file should contain at least 5 bands of spectral data in the following order:
-1. Red
-2. Green
-3. Blue
-4. Near Infrared
-5. Short Wave Infrared
+Each TIFF file should contain at least 55 bands of spectral data, with the following bands selected:
+- Band 9 (474.73nm): Blue - captures chlorophyll absorption
+- Band 18 (538.71nm): Green - reflects well in healthy vegetation
+- Band 32 (650.665nm): Red - sensitive to chlorophyll content
+- Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
+- Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
 
 ## Training
 
-To start training, run:
+1. First, train the multispectral VAE adapter:
+```bash
+python examples/multispectral/train_multispectral_vae_5ch.py \
+    --output_dir /path/to/save/model \
+    --num_epochs 100 \
+    --batch_size 8 \
+    --learning_rate 1e-4 \
+    --adapter_placement both \
+    --use_spectral_attention \
+    --use_sam_loss \
+    --sam_weight 0.1
+```
 
+2. Then, train the DreamBooth model:
 ```bash
 PYTHONPATH=$PYTHONPATH:. accelerate launch examples/dreambooth/train_dreambooth_sd3_multispectral.py \
     --pretrained_model_name_or_path="stabilityai/stable-diffusion-3-medium-diffusers" \
@@ -97,22 +121,41 @@ PYTHONPATH=$PYTHONPATH:. accelerate launch examples/dreambooth/train_dreambooth_
 
 ## Key Components
 
-### 1. Multispectral VAE
-The `AutoencoderKLMultispectral5Ch` class extends the standard VAE to handle 5-channel multispectral data while maintaining compatibility with Stable Diffusion 3's latent space requirements.
+### 1. Multispectral VAE Adapter
+The `AutoencoderKLMultispectralAdapter` class implements a lightweight adapter architecture that:
+- Uses pretrained SD3 VAE as backbone
+- Adds spectral attention mechanism
+- Implements Spectral Angle Mapper (SAM) loss
+- Maintains spectral fidelity while leveraging pretrained knowledge
 
 ### 2. Multispectral DataLoader
-The custom dataloader (`multispectral_dataloader.py`) provides efficient loading and preprocessing of multispectral TIFF files, including:
+The custom dataloader (`multispectral_dataloader.py`) provides:
+- Efficient loading of 5-channel multispectral data
 - Per-channel normalization
-- Automatic padding and resizing
 - Memory-efficient processing
 - GPU optimization
+- Caching for improved performance
 
-### 3. Training Script
-The training script (`train_dreambooth_sd3_multispectral.py`) implements the DreamBooth training procedure with adaptations for multispectral data.
+### 3. Training Pipeline
+The training pipeline consists of two main components:
+1. VAE Adapter Training (`train_multispectral_vae_5ch.py`)
+   - Parameter-efficient fine-tuning
+   - Spectral attention learning
+   - Spectral fidelity preservation
+2. DreamBooth Training (`train_dreambooth_sd3_multispectral.py`)
+   - Concept learning with multispectral data
+   - Integration with pretrained VAE adapter
+
+## Testing
+
+Run the test suite to verify the implementation:
+```bash
+pytest test_vae_multispectral.py test_multispectral_dataloader.py
+```
 
 ## Troubleshooting
 
-1. **ImportError for AutoencoderKLMultispectral5Ch**
+1. **ImportError for AutoencoderKLMultispectralAdapter**
    - Ensure the package is installed in development mode
    - Verify the class is properly imported in `__init__.py` files
 
@@ -124,3 +167,9 @@ The training script (`train_dreambooth_sd3_multispectral.py`) implements the Dre
    - Check TIFF file format and band count
    - Verify file permissions and paths
    - Ensure sufficient disk space and memory
+
+4. **Training Issues**
+   - Check GPU memory usage
+   - Verify batch size settings
+   - Monitor spectral attention weights
+   - Check loss term balancing

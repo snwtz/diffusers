@@ -6,18 +6,27 @@ accelerate>=0.25.0
 datasets>=2.14.0
 wandb>=0.16.0
 
-# Image processing
+# Image processing and data handling
 Pillow>=10.0.0
-rasterio>=1.3.0
+rasterio>=1.3.0 # for broader TIFF support beyond rasterio
+imageio>=2.30.0  # Optional, for general-purpose image loading
 numpy>=1.24.0
+torchvision>=0.15.0  # Required for transforms and image processing
+scipy>=1.9.0  # For Spectral Angle Mapper calculations 
+scikit-learn>=1.3.0
 
-# Development tools
+# Development and testing tools
 black>=23.0.0
 isort>=5.12.0
 flake8>=6.0.0
 pytest>=7.0.0
+pytest-cov>=4.1.0  # For test coverage reporting
 
-# Optional but recommended
+# Progress and visualization
 tqdm>=4.65.0
 matplotlib>=3.7.0
-seaborn>=0.12.0 
+seaborn>=0.12.0
+
+# Optional, for development
+jupyter>=1.0.0  # For notebook-based development
+ipython>=8.0.0  # Enhanced interactive Python shell 
