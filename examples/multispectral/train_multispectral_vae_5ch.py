@@ -128,14 +128,9 @@ import os
 import argparse
 from pathlib import Path
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
-from torchvision import transforms
-import numpy as np
-from PIL import Image
-import rasterio
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
-import json
 from datetime import datetime
 import wandb
 import shutil
@@ -144,53 +139,7 @@ from typing import Tuple
 from diffusers import AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
-from multispectral_dataloader import create_multispectral_dataloader
-from split_dataset import run_split
-
-class MultispectralDataset(Dataset):
-    """Dataset for loading 5-channel multispectral TIFF files from split file lists."""
-    
-    def __init__(self, file_list_path, transform=None):
-        """
-        Initialize the dataset.
-        
-        Args:
-            file_list_path: Path to train_files.txt or val_files.txt
-            transform: Optional transforms to apply
-        """
-        self.file_list_path = Path(file_list_path)
-        if not self.file_list_path.exists():
-            raise FileNotFoundError(f"File list not found: {file_list_path}")
-            
-        # Read file paths from the list
-        with open(self.file_list_path, 'r') as f:
-            self.tiff_files = [Path(line.strip()) for line in f.readlines()]
-            
-        # Validate all files exist
-        for file_path in self.tiff_files:
-            if not file_path.exists():
-                raise FileNotFoundError(f"TIFF file not found: {file_path}")
-                
-        self.transform = transform
-        logging.info(f"Loaded {len(self.tiff_files)} files from {file_list_path}")
-        
-    def __len__(self):
-        return len(self.tiff_files)
-    
-    def __getitem__(self, idx):
-        # Load 5-channel TIFF
-        with rasterio.open(self.tiff_files[idx]) as src:
-            # Read all 5 bands
-            image = src.read()  # Shape: (5, H, W)
-            
-            # Convert to float and normalize
-            image = image.astype(np.float32)
-            
-            # Apply transforms if any
-            if self.transform:
-                image = self.transform(image)
-            
-            return torch.from_numpy(image)
+from vae_multispectral_dataloader import create_vae_dataloaders
 
 def setup_logging(args):
     # Create logs directory
@@ -329,13 +278,30 @@ def log_parameter_counts(model, logger, wandb_log=True):
 
 def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     """
-    Prepare the dataset by using the split files created by split_dataset.py.
+    Prepare the dataset using the split files created by split_dataset.py.
     
     Args:
         args: Command line arguments
         
     Returns:
         Tuple of (train_loader, val_loader)
+        
+    Implementation Notes:
+    -------------------
+    1. File List Management:
+       - Uses split files from split_dataset.py
+       - Ensures deterministic train/val splits
+       - Maintains data consistency
+    
+    2. Dataloader Configuration:
+       - Uses VAE-specific dataloader module
+       - Optimizes for GPU training
+       - Enables efficient data loading
+    
+    3. Error Handling:
+       - Validates split files exist
+       - Provides clear error messages
+       - Ensures training stability
     """
     logger = setup_logging(args)
     
@@ -351,43 +317,57 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
             "Please run split_dataset.py first to create train_files.txt and val_files.txt"
         )
     
-    # Create datasets using the split files
-    train_dataset = MultispectralDataset(
-        file_list_path=train_list,
-        transform=None  # Add transforms if needed
-    )
-    val_dataset = MultispectralDataset(
-        file_list_path=val_list,
-        transform=None  # Add transforms if needed
-    )
-    
-    logger.info(f"Created datasets with {len(train_dataset)} training and {len(val_dataset)} validation samples")
-    
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
+    # Create dataloaders using the new VAE dataloader module
+    # This factory function ensures consistent configuration and optimal settings
+    train_loader, val_loader = create_vae_dataloaders(
+        train_list_path=str(train_list),
+        val_list_path=str(val_list),
         batch_size=args.batch_size,
-        shuffle=True,
+        resolution=512,  # Fixed resolution for VAE training
         num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None
+        use_cache=True,  # Enable caching for repeated access
+        prefetch_factor=2 if args.num_workers > 0 else None,  # Optimize data loading
+        persistent_workers=args.num_workers > 0  # Efficient worker management
     )
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        prefetch_factor=2 if args.num_workers > 0 else None
-    )
+    logger.info(f"Created dataloaders with {len(train_loader.dataset)} training and {len(val_loader.dataset)} validation samples")
     
     return train_loader, val_loader
 
 def train(args: argparse.Namespace) -> None:
-    """Main training function."""
+    """
+    Main training function.
+    
+    Implementation Notes:
+    -------------------
+    1. Model Initialization:
+       - Loads pretrained SD3 model
+       - Configures multispectral adapters
+       - Freezes backbone for efficient training
+    
+    2. Training Pipeline:
+       - Uses cosine learning rate schedule with warmup
+       - Implements EMA model averaging
+       - Applies gradient clipping
+       - Supports early stopping
+    
+    3. Loss Computation:
+       - Per-band MSE for spatial fidelity
+       - Optional SAM loss for spectral preservation
+       - Configurable loss weighting
+    
+    4. Validation Strategy:
+       - Per-epoch validation
+       - Tracks best model
+       - Implements early stopping
+       - Saves checkpoints
+    
+    5. Monitoring:
+       - Comprehensive logging
+       - Wandb integration
+       - Band importance tracking
+       - Training dynamics analysis
+    """
     
     # Initialize model with adapter configuration
     model = AutoencoderKLMultispectralAdapter.from_pretrained(
@@ -398,6 +378,7 @@ def train(args: argparse.Namespace) -> None:
     )
     
     # Freeze backbone (only adapters will be trained)
+    # This is crucial for parameter-efficient fine-tuning
     model.freeze_backbone()
     
     # Move model to device
@@ -408,19 +389,24 @@ def train(args: argparse.Namespace) -> None:
     logger = setup_logging(args)
     
     # Log parameter counts before training
+    # This helps track model complexity and training efficiency
     log_parameter_counts(model, logger)
     
     # Prepare dataset and dataloaders
+    # Uses the VAE-specific dataloader for optimal data handling
     train_loader, val_loader = prepare_dataset(args)
     
     # Initialize optimizer with trainable parameters
+    # Only adapters are trained, backbone remains frozen
     optimizer = torch.optim.AdamW(model.get_trainable_params(), lr=args.learning_rate)
     
     # Calculate total training steps for scheduler
+    # Enables proper learning rate scheduling
     total_steps = len(train_loader) * args.num_epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
     
     # Initialize scheduler
+    # Cosine schedule with warmup for stable training
     scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
@@ -428,12 +414,15 @@ def train(args: argparse.Namespace) -> None:
     )
     
     # Initialize EMA model
+    # Improves training stability and final model quality
     ema_model = EMAModel(model.parameters())
     
     # Setup wandb
+    # Enables experiment tracking and visualization
     setup_wandb(args)
     
     # Initialize early stopping
+    # Prevents overfitting and saves best model
     best_val_loss = float('inf')
     patience_counter = 0
     
@@ -455,9 +444,11 @@ def train(args: argparse.Namespace) -> None:
             reconstruction = output.sample
             
             # Get detailed losses from model
+            # Tracks both spatial and spectral fidelity
             losses = model.compute_losses(batch, reconstruction)
             
             # Calculate total loss
+            # Combines MSE and optional SAM loss
             total_loss = losses['mse']
             if args.use_sam_loss and 'sam' in losses:
                 total_loss = total_loss + args.sam_weight * losses['sam']
@@ -467,12 +458,14 @@ def train(args: argparse.Namespace) -> None:
             total_loss.backward()
             
             # Apply gradient clipping
+            # Prevents exploding gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 model.parameters(), 
                 max_norm=args.max_grad_norm
             )
             
             # Log if gradients were clipped
+            # Helps monitor training stability
             if grad_norm > args.max_grad_norm:
                 logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
                 wandb.log({
@@ -484,9 +477,11 @@ def train(args: argparse.Namespace) -> None:
             scheduler.step()
             
             # Update EMA model
+            # Improves model stability
             ema_model.step(model.parameters())
             
             # Track losses
+            # Monitors training progress
             train_losses['total_loss'] += total_loss.item()
             train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
             if args.use_sam_loss and 'sam' in losses:
@@ -509,20 +504,24 @@ def train(args: argparse.Namespace) -> None:
                 reconstruction = output.sample
                 
                 # Get detailed losses from model
+                # Evaluates model performance
                 losses = model.compute_losses(batch, reconstruction)
                 
                 # Calculate total loss
+                # Consistent with training loss computation
                 total_loss = losses['mse']
                 if args.use_sam_loss and 'sam' in losses:
                     total_loss = total_loss + args.sam_weight * losses['sam']
                 
                 # Track losses
+                # Monitors validation performance
                 val_losses['total_loss'] += total_loss.item()
                 val_losses['mse_per_channel'] += losses['mse_per_channel']
                 if args.use_sam_loss and 'sam' in losses:
                     val_losses['sam_loss'] += losses['sam'].item()
         
         # Average losses
+        # Computes epoch-level metrics
         for key in train_losses:
             if isinstance(train_losses[key], torch.Tensor):
                 train_losses[key] /= len(train_loader)
@@ -536,15 +535,18 @@ def train(args: argparse.Namespace) -> None:
                 val_losses[key] /= len(val_loader)
         
         # Get band importance if using spectral attention
+        # Analyzes model's spectral understanding
         band_importance = {}
         if args.use_spectral_attention:
             band_importance = model.input_adapter.attention.get_band_importance()
         
         # Log metrics
+        # Tracks training progress
         log_training_metrics(logger, epoch, train_losses, val_losses, band_importance)
         log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
         
         # Save checkpoint
+        # Implements model checkpointing strategy
         is_best = val_losses['total_loss'] < best_val_loss
         if is_best:
             best_val_loss = val_losses['total_loss']
@@ -556,6 +558,7 @@ def train(args: argparse.Namespace) -> None:
             save_checkpoint(model, optimizer, scheduler, epoch, val_losses['total_loss'], is_best, args)
         
         # Early stopping
+        # Prevents overfitting
         if patience_counter >= args.early_stopping_patience:
             logger.info(f"Early stopping triggered after {epoch + 1} epochs")
             break

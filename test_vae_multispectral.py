@@ -43,9 +43,7 @@ import rasterio
 from pathlib import Path
 from diffusers import AutoencoderKLMultispectralAdapter
 import matplotlib.pyplot as plt
-from torchvision.utils import make_grid
 import logging
-import argparse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

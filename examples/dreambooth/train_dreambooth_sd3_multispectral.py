@@ -272,37 +272,40 @@ Usage:
         --mixed_precision fp16
 """
 
+# Unused imports that were removed:
+# - itertools: Not used in the code
+# - math: Not used in the code
+# - random: Not used in the code
+# - shutil: Not used in the code
+# - Path from pathlib: Not used in the code
+# - torch.utils.checkpoint: Not used in the code
+# - DistributedDataParallelKwargs, ProjectConfiguration from accelerate.utils: Only set_seed is used
+# - insecure_hashlib from huggingface_hub.utils: Not used in the code
+# - Image, exif_transpose from PIL: Not used in the code
+# - Dataset from torch.utils.data: Not used in the code
+# - transforms from torchvision: Not used in the code
+# - crop from torchvision.transforms.functional: Not used in the code
+# - tqdm from tqdm.auto: Not used in the code
+# - rasterio: Not used in the code
+# - is_compiled_module from diffusers.utils.torch_utils: Not used in the code
+# - transformers: Using specific imports instead
+# - diffusers: Using specific imports instead
+
 import argparse
 import copy
-import itertools
 import logging
-import math
 import os
-import random
-import shutil
 import warnings
 from contextlib import nullcontext
-from pathlib import Path
 
 import numpy as np
 import torch
-import torch.utils.checkpoint
-import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import set_seed
 from huggingface_hub import create_repo, upload_folder
-from huggingface_hub.utils import insecure_hashlib
-from PIL import Image
-from PIL.ImageOps import exif_transpose
-from torch.utils.data import Dataset
-from torchvision import transforms
-from torchvision.transforms.functional import crop
-from tqdm.auto import tqdm
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
-import rasterio
 
-import diffusers
 from diffusers import (
     AutoencoderKLMultispectral5Ch,
     FlowMatchEulerDiscreteScheduler,
@@ -316,7 +319,6 @@ from diffusers.utils import (
     is_wandb_available,
 )
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
-from diffusers.utils.torch_utils import is_compiled_module
 
 # Import custom multispectral dataloader
 from multispectral_dataloader import create_multispectral_dataloader
