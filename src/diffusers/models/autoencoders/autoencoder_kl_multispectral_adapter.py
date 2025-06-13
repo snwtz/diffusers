@@ -170,11 +170,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ...configuration_utils import ConfigMixin, register_to_config
-from ...loaders import PeftAdapterMixin
-from ...loaders.single_file_model import FromOriginalModelMixin
 from ...utils.accelerate_utils import apply_forward_hook
 from ..modeling_outputs import AutoencoderKLOutput
-from ..modeling_utils import ModelMixin
 from .autoencoder_kl import AutoencoderKL
 
 class SpectralAttention(nn.Module):
@@ -430,11 +427,28 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     
     @apply_forward_hook
     def decode(self, z: torch.Tensor, return_dict: bool = True) -> Union[torch.Tensor, Tuple]:
-        """Decode latent representation to multispectral image."""
+        """Decode latent representation to multispectral image.
+        
+        Args:
+            z: Latent representation
+            return_dict: Whether to return a dictionary or tuple
+            
+        Returns:
+            Decoded multispectral image
+            
+        Raises:
+            ValueError: If decoding fails or returns invalid output
+        """
         # Use pretrained VAE decoder
         x = super().decode(z, return_dict=return_dict)
+        
+        # Handle tuple output from base decoder
         if isinstance(x, tuple):
+            if len(x) == 0:
+                raise ValueError("Decoding failed: empty tuple returned")
             x = x[0]
+            if x is None:
+                raise ValueError("Decoding failed: None value in tuple")
         
         if hasattr(self, 'output_adapter'):
             # Convert 3 channels back to 5 using output adapter
