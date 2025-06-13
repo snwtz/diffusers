@@ -1,7 +1,7 @@
 """
-Test script for the multispectral dataloader.
+Test script for the VAE multispectral dataloader.
 
-This script tests the key functionality of the MultispectralDataset and related classes,
+This script tests the key functionality of the VAEMultispectralDataset and related classes,
 including data loading, normalization, validation, and error handling.
 
 Test Design Decisions:
@@ -12,9 +12,9 @@ Test Design Decisions:
    - Maintains reproducibility by using fixed seed for random selection
 
 2. Error Handling Tests:
-   - Non-existent directories are tested
+   - Non-existent file lists are tested
    - Invalid band counts are tested
-   - Empty directories are tested
+   - Empty file lists are tested
 
 3. Caching Tests:
    - Performance is measured using time.time()
@@ -33,8 +33,6 @@ Test Design Decisions:
      * prefetch_factor=None
      * persistent_workers=False
    - Memory usage is monitored
-   - TODO: GPU-specific features (prefetching, persistent workers) are disabled
-     for local testing but should be enabled for GPU training
 
 6. Tolerance:
    - Tests use relaxed tolerances (rtol=1e-2, atol=1e-2) for floating-point imprecision
@@ -43,7 +41,7 @@ Test Design Decisions:
    - The test_specific_band_selection test uses the exact file as the dataloader for index 0
 
 Usage:
-    pytest test_multispectral_dataloader.py --data-dir "/Users/zina/Desktop/LDM4HSI/Project Files/Dataloader test/Output Testset Mango" -v
+    pytest test_vae_multispectral_dataloader.py --data-dir "/path/to/data" -v
 
 Note:
     For local testing, worker-intensive features are disabled to ensure
@@ -62,9 +60,9 @@ import random
 from pathlib import Path
 import rasterio
 import torch.nn.functional as F
-from multispectral_dataloader import (
-    MultispectralDataset,
-    create_multispectral_dataloader
+from examples.multispectral.vae_multispectral_dataloader import (
+    VAEMultispectralDataset,
+    create_vae_dataloaders
 )
 
 # Set random seed for reproducibility
@@ -102,26 +100,49 @@ def test_images(data_dir):
     """Get a subset of test images."""
     return get_test_images(data_dir)
 
-def test_dataset_initialization(data_dir, test_images):
+@pytest.fixture
+def file_lists(data_dir, test_images):
+    """Create temporary train and val file lists for testing."""
+    train_list = Path(data_dir) / "train_files.txt"
+    val_list = Path(data_dir) / "val_files.txt"
+    
+    # Write test files to train list
+    with open(train_list, 'w') as f:
+        for img in test_images:
+            f.write(f"{img}\n")
+    
+    # Write empty val list (we don't need it for testing)
+    with open(val_list, 'w') as f:
+        pass
+    
+    yield str(train_list), str(val_list)
+    
+    # Cleanup after tests
+    train_list.unlink(missing_ok=True)
+    val_list.unlink(missing_ok=True)
+
+def test_dataset_initialization(data_dir, test_images, file_lists):
     """Test dataset initialization with real data."""
-    dataset = MultispectralDataset(data_dir)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list)
     assert len(dataset) > 0
     assert dataset.resolution == 512
     assert dataset.use_cache is True
 
-def test_band_count_validation(data_dir, test_images):
+def test_band_count_validation(data_dir, test_images, file_lists):
     """Test validation of band count."""
-    # Test with valid data
-    dataset = MultispectralDataset(data_dir)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list)
     assert len(dataset) > 0
     
-    # Test with empty directory
+    # Test with non-existent file list
     with pytest.raises(FileNotFoundError):
-        MultispectralDataset("empty_dir")
+        VAEMultispectralDataset("non_existent_file.txt")
 
-def test_normalize_channel(data_dir, test_images):
+def test_normalize_channel(data_dir, test_images, file_lists):
     """Test channel normalization with real data."""
-    dataset = MultispectralDataset(data_dir)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list)
     
     # Load a real image
     image_path = str(test_images[0])
@@ -140,9 +161,10 @@ def test_normalize_channel(data_dir, test_images):
     assert np.all(normalized[mask] >= -1) and np.all(normalized[mask] <= 1)
     assert np.isnan(normalized[0, 0])
 
-def test_sd3_compatible_input_shape(data_dir, test_images):
+def test_sd3_compatible_input_shape(data_dir, test_images, file_lists):
     """Test that preprocessed images are compatible with SD3's VAE input requirements."""
-    dataset = MultispectralDataset(data_dir)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list)
     
     # Load and preprocess image
     image = dataset[0]
@@ -154,9 +176,10 @@ def test_sd3_compatible_input_shape(data_dir, test_images):
     # Check for [-1, 1] range
     assert torch.all(image >= -1) and torch.all(image <= 1)
 
-def test_pixel_range_normalization_for_vae(data_dir, test_images):
+def test_pixel_range_normalization_for_vae(data_dir, test_images, file_lists):
     """Test that pixel values are properly normalized for VAE input."""
-    dataset = MultispectralDataset(data_dir)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list)
     image = dataset[0]
     
     # Check normalization properties
@@ -167,9 +190,10 @@ def test_pixel_range_normalization_for_vae(data_dir, test_images):
         # For [-1, 1] normalization, min should be close to -1 or max should be close to 1
         assert torch.isclose(torch.min(channel), torch.tensor(-1.), atol=1e-2) or torch.isclose(torch.max(channel), torch.tensor(1.), atol=1e-2)
 
-def test_caching_behavior(data_dir, test_images):
+def test_caching_behavior(data_dir, test_images, file_lists):
     """Test that caching improves load time and maintains data consistency."""
-    dataset = MultispectralDataset(data_dir, use_cache=True)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list, use_cache=True)
     
     # First load
     start_time = time.time()
@@ -185,10 +209,12 @@ def test_caching_behavior(data_dir, test_images):
     assert second_load_time < first_load_time
     assert torch.allclose(first_load, second_load)
 
-def test_dataloader_creation(data_dir, test_images):
+def test_dataloader_creation(data_dir, test_images, file_lists):
     """Test dataloader creation and basic functionality."""
-    dataloader = create_multispectral_dataloader(
-        data_dir,
+    train_list, val_list = file_lists
+    train_loader, val_loader = create_vae_dataloaders(
+        train_list,
+        val_list,
         batch_size=2,
         num_workers=0,  # Use 0 for testing
         use_cache=True,
@@ -197,17 +223,19 @@ def test_dataloader_creation(data_dir, test_images):
     )
     
     # Test batch loading
-    batch = next(iter(dataloader))
+    batch = next(iter(train_loader))
     assert isinstance(batch, torch.Tensor)
     assert batch.shape[0] == 2  # batch_size
     assert batch.shape[1] == 5  # channels
     assert batch.shape[2] == 512  # height
     assert batch.shape[3] == 512  # width
 
-def test_worker_behavior(data_dir, test_images):
+def test_worker_behavior(data_dir, test_images, file_lists):
     """Test worker behavior and data loading consistency."""
-    dataloader = create_multispectral_dataloader(
-        data_dir,
+    train_list, val_list = file_lists
+    train_loader, val_loader = create_vae_dataloaders(
+        train_list,
+        val_list,
         batch_size=2,
         num_workers=0,  # Use 0 for testing
         persistent_workers=False,  # Disabled for local testing
@@ -217,7 +245,7 @@ def test_worker_behavior(data_dir, test_images):
     # Test multiple epochs
     for epoch in range(2):
         batches = []
-        for batch in dataloader:
+        for batch in train_loader:
             batches.append(batch)
         
         # Verify batch consistency
@@ -226,13 +254,14 @@ def test_worker_behavior(data_dir, test_images):
 
 def test_error_handling(data_dir):
     """Test error handling for invalid data."""
-    # Test with non-existent directory
+    # Test with non-existent file list
     with pytest.raises(FileNotFoundError):
-        MultispectralDataset("non_existent_dir")
+        VAEMultispectralDataset("non_existent_file.txt")
 
-def test_specific_band_selection(data_dir):
+def test_specific_band_selection(data_dir, test_images, file_lists):
     """Test that the dataloader correctly selects the hardcoded bands."""
-    dataset = MultispectralDataset(data_dir)
+    train_list, _ = file_lists
+    dataset = VAEMultispectralDataset(train_list)
     image = dataset[0]
 
     # Print the file path used by the dataloader for index 0
@@ -261,6 +290,24 @@ def test_specific_band_selection(data_dir):
         ).squeeze(0)
 
     assert torch.allclose(image, expected_bands, rtol=1e-2, atol=1e-2), "Dataset output does not match expected band selection"
+
+def test_train_val_separation(data_dir, test_images, file_lists):
+    """Test that train and validation dataloaders are properly separated."""
+    train_list, val_list = file_lists
+    train_loader, val_loader = create_vae_dataloaders(
+        train_list,
+        val_list,
+        batch_size=2,
+        num_workers=0,
+        use_cache=True
+    )
+    
+    # Verify train loader has data
+    train_batch = next(iter(train_loader))
+    assert train_batch.shape[0] == 2  # batch_size
+    
+    # Verify val loader is empty (since we created an empty val list)
+    assert len(list(val_loader)) == 0
 
 if __name__ == "__main__":
     # Remove the script name from sys.argv

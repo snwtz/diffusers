@@ -29,10 +29,12 @@ diffusers/
 ├── examples/
 │   └── multispectral/
 │       ├── split_dataset.py
-│       └── train_multispectral_vae_5ch.py
-├── multispectral_dataloader.py
+│       ├── train_multispectral_vae_5ch.py
+│       └── vae_multispectral_dataloader.py  # VAE-specific dataloader
+├── multispectral_dataloader.py  # MS dataloader
 ├── test_vae_multispectral.py
-├── test_multispectral_dataloader.py
+├── test_multispectral_dataloader.py  # Legacy tests
+├── test_vae_multispectral_dataloader.py  # New VAE-specific tests
 ├── setup.py
 └── requirements.txt
 ```
@@ -150,7 +152,11 @@ The training pipeline consists of two main components:
 
 Run the test suite to verify the implementation:
 ```bash
-pytest test_vae_multispectral.py test_multispectral_dataloader.py
+# Run all tests
+pytest test_vae_multispectral.py test_multispectral_dataloader.py test_vae_multispectral_dataloader.py
+
+# Run specific test file
+pytest test_vae_multispectral_dataloader.py --data-dir "/path/to/data" -v
 ```
 
 ## Troubleshooting
