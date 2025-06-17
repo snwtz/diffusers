@@ -371,7 +371,7 @@ def train(args: argparse.Namespace) -> None:
     
     # Initialize model with adapter configuration
     model = AutoencoderKLMultispectralAdapter.from_pretrained(
-        "stabilityai/stable-diffusion-3-medium-diffusers",
+        "PATH_TO_MS_VAE",
         adapter_placement=args.adapter_placement,
         use_spectral_attention=args.use_spectral_attention,
         use_sam_loss=args.use_sam_loss

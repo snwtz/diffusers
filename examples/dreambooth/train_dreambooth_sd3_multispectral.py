@@ -243,11 +243,6 @@ TODOs and Future Features:
    - [ ] Add visualization tools
    - [ ] Create evaluation pipeline
 
-4. Documentation:
-   - [ ] Add detailed API documentation
-   - [ ] Create usage examples
-   - [ ] Document best practices
-   - [ ] Add troubleshooting guide
 
 References:
 - DreamBooth paper: https://arxiv.org/abs/2208.12242
@@ -265,7 +260,7 @@ Usage:
         --pretrained_model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
         --instance_data_dir /path/to/split \
         --output_dir /path/to/save/model \
-        --instance_prompt "photo of a healthy leaf" \
+        --instance_prompt "photo of a sks leaf" \
         --num_train_epochs 100 \
         --train_batch_size 4 \
         --learning_rate 1e-4 \
