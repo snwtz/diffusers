@@ -19,7 +19,7 @@ Module Purpose and Scientific Context:
 
 2. Technical Foundation:
    - Built on pretrained Stable Diffusion 3
-   - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectral5Ch)
+   - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectralAdapter)
    - Integrates spectral attention mechanism
    - Implements spectral-aware loss functions
 
@@ -302,7 +302,7 @@ from huggingface_hub import create_repo, upload_folder
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
 
 from diffusers import (
-    AutoencoderKLMultispectral5Ch,
+    AutoencoderKLMultispectralAdapter,
     FlowMatchEulerDiscreteScheduler,
     SD3Transformer2DModel,
     StableDiffusion3Pipeline,
@@ -886,7 +886,7 @@ def main(args):
     text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
 
     # Initialize multispectral VAE
-    vae = AutoencoderKLMultispectral5Ch.from_pretrained(
+    vae = AutoencoderKLMultispectralAdapter.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,
