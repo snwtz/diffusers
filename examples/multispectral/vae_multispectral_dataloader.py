@@ -179,10 +179,11 @@ class VAEMultispectralDataset(Dataset):
                     valid_mask = ~np.isnan(data)
                     if np.any(valid_mask):  # Only check if there are valid values
                         valid_data = data[valid_mask]
-                        if not (-1 <= valid_data.min() <= valid_data.max() <= 1):
-                            raise ValueError(
-                                f"Image {path} has invalid data range [{valid_data.min()}, {valid_data.max()}] "
-                                f"in valid regions. Data must be normalized to [-1, 1] range."
+                        # Warn if the image has values outside [-1, 1], but don't raise error — normalize_channel() will handle it.
+                        if valid_data.min() < -1 or valid_data.max() > 1:
+                            logger.warning(
+                                f"Image {path} has out-of-bound data range [{valid_data.min()}, {valid_data.max()}] "
+                                f"before normalization. This will be corrected by normalize_channel()."
                             )
             except rasterio.errors.RasterioIOError as e:
                 raise ValueError(f"Failed to open image {path}: {str(e)}")

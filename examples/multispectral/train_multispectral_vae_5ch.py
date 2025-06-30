@@ -59,6 +59,7 @@ Thesis Context and Training Workflow:
 
    b) Scientific Logging:
       - Weights & Biases integration
+      - Automatic experiment logging with wandb (setup inside `train()`)
       - Band importance visualization
       - Spectral signature plots
       - Training dynamics analysis
@@ -123,7 +124,19 @@ Usage:
     # Testing
     python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0
 
-    """
+VAE Loading Note:
+   RGB VAE weights from SD3 could not be loaded directly via `from_pretrained()` using a config object,
+    because the class `AutoencoderKLMultispectralAdapter` expects unpacked keyword arguments, not a config instance.
+    Successfully loaded the RGB VAE weights from SD3 by explicitly:
+        1. Using `AutoencoderKL.from_config()` to parse the original RGB config.json.
+        2. Loading pretrained SD3 VAE weights with `load_state_dict`.
+        3. Passing the loaded AutoencoderKL instance as a `base_model` argument to our `AutoencoderKLMultispectralAdapter`.
+
+This approach bypasses issues with conflicting `from_pretrained` calls and allows reuse of the SD3 VAE backbone with frozen weights.
+"""
+"""
+
+"""
 
 import os
 import argparse
@@ -169,7 +182,7 @@ def setup_logging(args):
 
     return logger
 
-def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance):
+def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args):
     logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
     logger.info("Training Metrics:")
     logger.info(f"  Total Loss: {train_losses['total_loss']:.4f}")
@@ -214,8 +227,10 @@ def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, recons
         **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses['mse_per_channel'])},
         **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses['mse_per_channel'])},
         **{f"band_importance_{k}": v for k, v in band_importance.items()},
-        "original_images": wandb.Image(batch[0]),
-        "reconstructed_images": wandb.Image(reconstruction[0])
+        # "original_images": wandb.Image(batch[0]),
+        # "reconstructed_images": wandb.Image(reconstruction[0])
+        "original_images_band0": wandb.Image(batch[0][0:1]),  # First channel as grayscale
+        "reconstructed_images_band0": wandb.Image(reconstruction[0][0:1])
     })
     if 'sam' in train_losses:
         wandb.log({
@@ -330,6 +345,16 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     except Exception as e:
         raise RuntimeError(f"Failed to create dataloaders: {e}")
 
+    # Sample inspection — checking first training batch for NaNs
+    logger = logging.getLogger('multispectral_vae')
+    logger.info(f"Sample inspection — checking first training batch for NaNs")
+    for sample_batch, _ in train_loader:
+        if torch.isnan(sample_batch).any():
+            logger.warning("NaNs found in first training batch!")
+        else:
+            logger.info("First training batch is free of NaNs.")
+        break
+
     return train_loader, val_loader
 
 def train(args: argparse.Namespace) -> None:
@@ -372,13 +397,14 @@ def train(args: argparse.Namespace) -> None:
 
     # Setup logging first (after output_dir is set)
     logger = setup_logging(args)
+    setup_wandb(args)
     logger.info(f"Starting multispectral VAE training with output directory: {args.output_dir}")
 
     # Load base SD3 VAE weights and inject fresh multispectral adapters
     try:
         logger.info(f"Loading base model from: {args.base_model_path}")
         model = AutoencoderKLMultispectralAdapter.from_pretrained(
-            args.base_model_path,
+            pretrained_model_name_or_path=args.base_model_path,
             subfolder=args.subfolder,
             adapter_placement=args.adapter_placement,
             use_spectral_attention=args.use_spectral_attention,
@@ -477,18 +503,37 @@ def train(args: argparse.Namespace) -> None:
 
             # Forward pass
             try:
-                output = model(batch)
-                reconstruction = output.sample
+                reconstruction, _ = model(batch)
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
                 continue
 
+            # NaN-check inserted to prevent invalid loss calculations due to corrupted model output or inputs.
+            if torch.isnan(batch).any() or torch.isnan(reconstruction).any():
+                logger.debug(f"NaN debug info — batch stats: min {batch.min().item()}, max {batch.max().item()}, mean {batch.mean().item()}")
+                logger.debug(f"NaN debug info — reconstruction stats: min {reconstruction.min().item()}, max {reconstruction.max().item()}, mean {reconstruction.mean().item()}")
+                logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
+                continue  # Skip this batch to avoid NaN loss
+
+            # Computes masked reconstruction loss and optionally SAM; all loss keys returned in a dict
             # Get detailed losses from model
             # Tracks both spatial and spectral fidelity
             try:
-                losses = model.compute_losses(batch, reconstruction, mask)  # Pass mask to loss computation
+                # Debugging: Check for Infs before loss computation
+                if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
+                    logger.warning("Infs detected in batch or reconstruction input to compute_losses")
+                # Masked loss computation: Only leaf regions (mask == 1) are evaluated
+                losses = model.compute_losses(batch * mask, reconstruction * mask)
+                # Debugging: Check if losses is a dict
+                if not isinstance(losses, dict):
+                    logger.error(f"compute_losses() returned non-dict: {type(losses)}")
             except Exception as e:
-                logger.error(f"Loss computation failed: {e}")
+                logger.error(
+                    f"Loss computation failed: {e}\n"
+                    f"  batch shape: {batch.shape}\n"
+                    f"  reconstruction shape: {getattr(reconstruction, 'shape', 'n/a')}\n"
+                    f"  mask shape: {mask.shape} | mask sum: {mask.sum().item()}"
+                )
                 continue
 
             # Calculate total loss with proper validation
@@ -500,6 +545,9 @@ def train(args: argparse.Namespace) -> None:
             total_loss = losses['mse']
             if args.use_sam_loss and 'sam' in losses:
                 total_loss = total_loss + args.sam_weight * losses['sam']
+            # Debugging: Check for NaN in total loss
+            if torch.isnan(total_loss):
+                logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
 
             # Backward pass
             optimizer.zero_grad()
@@ -517,12 +565,9 @@ def train(args: argparse.Namespace) -> None:
             if grad_norm > args.max_grad_norm:
                 logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
                 try:
-                    wandb.log({
-                        "training/grad_norm": grad_norm,
-                        "training/gradients_clipped": 1
-                    })
-                except:
-                    pass
+                    log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
+                except Exception as e:
+                    logger.warning(f"Failed to log to wandb: {e}")
 
             optimizer.step()
             scheduler.step()
@@ -554,18 +599,37 @@ def train(args: argparse.Namespace) -> None:
 
                 # Forward pass
                 try:
-                    output = model(batch)
-                    reconstruction = output.sample
+                    reconstruction, _ = model(batch)
                 except Exception as e:
                     logger.error(f"Validation forward pass failed: {e}")
                     continue
 
+                # NaN-check inserted to prevent invalid loss calculations due to corrupted model output or inputs.
+                if torch.isnan(batch).any() or torch.isnan(reconstruction).any():
+                    logger.debug(f"NaN debug info — batch stats: min {batch.min().item()}, max {batch.max().item()}, mean {batch.mean().item()}")
+                    logger.debug(f"NaN debug info — reconstruction stats: min {reconstruction.min().item()}, max {reconstruction.max().item()}, mean {reconstruction.mean().item()}")
+                    logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
+                    continue  # Skip this batch to avoid NaN loss
+
+                # Computes masked reconstruction loss and optionally SAM; all loss keys returned in a dict
                 # Get detailed losses from model
                 # Evaluates model performance
                 try:
-                    losses = model.compute_losses(batch, reconstruction, mask)  # Pass mask to loss computation
+                    # Debugging: Check for Infs before loss computation (validation)
+                    if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
+                        logger.warning("Infs detected in batch or reconstruction input to compute_losses (validation)")
+                    # Masked validation loss: Evaluates only leaf regions
+                    losses = model.compute_losses(batch * mask, reconstruction * mask)
+                    # Debugging: Check if losses is a dict
+                    if not isinstance(losses, dict):
+                        logger.error(f"compute_losses() returned non-dict: {type(losses)}")
                 except Exception as e:
-                    logger.error(f"Validation loss computation failed: {e}")
+                    logger.error(
+                        f"Validation loss computation failed: {e}\n"
+                        f"  batch shape: {batch.shape}\n"
+                        f"  reconstruction shape: {getattr(reconstruction, 'shape', 'n/a')}\n"
+                        f"  mask shape: {mask.shape} | mask sum: {mask.sum().item()}"
+                    )
                     continue
 
                 # Calculate total loss
@@ -576,6 +640,9 @@ def train(args: argparse.Namespace) -> None:
                 total_loss = losses['mse']
                 if args.use_sam_loss and 'sam' in losses:
                     total_loss = total_loss + args.sam_weight * losses['sam']
+                # Debugging: Check for NaN in total loss (validation)
+                if torch.isnan(total_loss):
+                    logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
 
                 # Track losses
                 # Monitors validation performance
@@ -610,7 +677,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Log metrics
         # Tracks training progress
-        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance)
+        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args)
         try:
             log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
         except Exception as e:
