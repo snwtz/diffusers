@@ -1,3 +1,4 @@
+from .autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter
 from .autoencoder_asym_kl import AsymmetricAutoencoderKL
 from .autoencoder_dc import AutoencoderDC
 from .autoencoder_kl import AutoencoderKL
