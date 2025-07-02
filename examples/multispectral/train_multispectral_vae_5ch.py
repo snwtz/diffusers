@@ -149,6 +149,8 @@ from datetime import datetime
 import wandb
 import shutil
 from typing import Tuple
+import numpy as np  # Ensure numpy is imported
+from skimage.metrics import structural_similarity as ssim
 
 from diffusers import AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -185,17 +187,17 @@ def setup_logging(args):
 def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args):
     logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
     logger.info("Training Metrics:")
-    logger.info(f"  Total Loss: {train_losses['total_loss']:.4f}")
+    logger.info(f"  Total Loss: {train_losses.get('total_loss', float('nan')):.4f}")
     logger.info("  Per-channel MSE:")
-    for i, loss in enumerate(train_losses['mse_per_channel']):
+    for i, loss in enumerate(train_losses.get('mse_per_channel', [])):
         logger.info(f"    Band {i+1}: {loss:.4f}")
     if 'sam' in train_losses:
         logger.info(f"  SAM Loss: {train_losses['sam']:.4f}")
 
     logger.info("Validation Metrics:")
-    logger.info(f"  Total Loss: {val_losses['total_loss']:.4f}")
+    logger.info(f"  Total Loss: {val_losses.get('total_loss', float('nan')):.4f}")
     logger.info("  Per-channel MSE:")
-    for i, loss in enumerate(val_losses['mse_per_channel']):
+    for i, loss in enumerate(val_losses.get('mse_per_channel', [])):
         logger.info(f"    Band {i+1}: {loss:.4f}")
     if 'sam' in val_losses:
         logger.info(f"  SAM Loss: {val_losses['sam']:.4f}")
@@ -222,30 +224,32 @@ def setup_wandb(args):
 def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction):
     wandb.log({
         "epoch": epoch,
-        "train_total_loss": train_losses['total_loss'],
-        "val_total_loss": val_losses['total_loss'],
-        **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses['mse_per_channel'])},
-        **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses['mse_per_channel'])},
+        "train_total_loss": train_losses.get('total_loss', float('nan')),
+        "val_total_loss": val_losses.get('total_loss', float('nan')),
+        **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses.get('mse_per_channel', []))},
+        **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses.get('mse_per_channel', []))},
         **{f"band_importance_{k}": v for k, v in band_importance.items()},
         # "original_images": wandb.Image(batch[0]),
         # "reconstructed_images": wandb.Image(reconstruction[0])
         "original_images_band0": wandb.Image(batch[0][0:1]),  # First channel as grayscale
         "reconstructed_images_band0": wandb.Image(reconstruction[0][0:1])
     })
-    if 'sam' in train_losses:
+    if 'sam' in train_losses and 'sam' in val_losses:
         wandb.log({
             "train_sam_loss": train_losses['sam'],
             "val_sam_loss": val_losses['sam']
         })
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args, best_val_loss=None, patience_counter=None):
     """Save model checkpoint."""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'loss': loss
+        'loss': loss,
+        'best_val_loss': best_val_loss,
+        'patience_counter': patience_counter
     }
 
     # Save regular checkpoint
@@ -348,14 +352,65 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     # Sample inspection — checking first training batch for NaNs
     logger = logging.getLogger('multispectral_vae')
     logger.info(f"Sample inspection — checking first training batch for NaNs")
+    # New debug check: inspect for NaNs before any sanitization or clamping
     for sample_batch, _ in train_loader:
-        if torch.isnan(sample_batch).any():
-            logger.warning("NaNs found in first training batch!")
+        logger.info("Checking for NaNs/Infs in first batch (pre-sanitization)...")
+        raw_nan_check = torch.isnan(sample_batch)
+        if raw_nan_check.any():
+            logger.warning(f"NaNs detected in raw first batch before sanitization. NaN count: {raw_nan_check.sum().item()}")
+            for channel_idx in range(sample_batch.shape[1]):
+                channel_nans = raw_nan_check[:, channel_idx].sum()
+                if channel_nans > 0:
+                    logger.warning(f"  NaNs in channel {channel_idx}: {channel_nans.item()} total")
         else:
-            logger.info("First training batch is free of NaNs.")
+            logger.info("First training batch is free of NaNs (pre-sanitization).")
         break
 
     return train_loader, val_loader
+
+def load_checkpoint(checkpoint_path: str, model, optimizer, scheduler, device):
+    """
+    Load training state from a checkpoint.
+    
+    Args:
+        checkpoint_path: Path to checkpoint directory
+        model: Model to load weights into
+        optimizer: Optimizer to load state into
+        scheduler: Scheduler to load state into
+        device: Device to load tensors on
+    
+    Returns:
+        Tuple of (start_epoch, best_val_loss, patience_counter)
+    """
+    checkpoint_file = os.path.join(checkpoint_path, 'training_state.pt')
+    if not os.path.exists(checkpoint_file):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
+    
+    logger.info(f"Loading checkpoint from: {checkpoint_path}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    
+    # Load model weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    logger.info(f"Loaded model weights from epoch {checkpoint['epoch']}")
+    
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    logger.info("Loaded optimizer state")
+    
+    # Load scheduler state
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    logger.info("Loaded scheduler state")
+    
+    # Extract training state
+    start_epoch = checkpoint['epoch'] + 1  # Resume from next epoch
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    patience_counter = checkpoint.get('patience_counter', 0)
+    
+    logger.info(f"Resuming from epoch {start_epoch} with best validation loss: {best_val_loss:.6f}")
+    
+    return start_epoch, best_val_loss, patience_counter
 
 def train(args: argparse.Namespace) -> None:
     """
@@ -414,6 +469,10 @@ def train(args: argparse.Namespace) -> None:
     except Exception as e:
         logger.error(f"Failed to load base model: {e}")
         raise RuntimeError(f"Model loading failed: {e}")
+
+    # NOTE: Unlike typical SD pipelines where model inputs are passed as dictionaries with keys like "pixel_values",
+    #       this training script uses direct tensor inputs. This works because our custom model accepts tensor input directly,
+    #       but care must be taken when integrating with HuggingFace-style SD pipelines later.
 
     # Validate model has required methods
     required_methods = ['freeze_backbone', 'get_trainable_params', 'compute_losses']
@@ -486,9 +545,21 @@ def train(args: argparse.Namespace) -> None:
     # Prevents overfitting and saves best model
     best_val_loss = float('inf')
     patience_counter = 0
+    start_epoch = 0  # Default start epoch
+
+    # Load checkpoint if specified
+    if args.resume_from_checkpoint:
+        try:
+            start_epoch, best_val_loss, patience_counter = load_checkpoint(args.resume_from_checkpoint, model, optimizer, scheduler, device)
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise RuntimeError(f"Checkpoint loading failed: {e}")
 
     # Training loop
-    for epoch in range(args.num_epochs):
+    total_epochs_to_train = args.num_epochs - start_epoch
+    logger.info(f"Training for {total_epochs_to_train} epochs (from epoch {start_epoch} to {args.num_epochs-1})")
+    
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         train_losses = {
             'total_loss': 0,
@@ -500,30 +571,52 @@ def train(args: argparse.Namespace) -> None:
         for batch, mask in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training"):
             batch = batch.to(device)
             mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+            # Debugging: check raw batch for NaNs before any preprocessing
+            # (Removed excessive debug logging)
+            # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
+            batch = torch.clamp(batch, min=0.0, max=1.0)
 
-            # Forward pass
+            # Forward pass with input tensor (not a dict) — valid due to model's custom __call__ signature.
             try:
-                reconstruction, _ = model(batch)
+                # --- Begin NaN-sanitization in VAE forward ---
+                # Custom forward: expose encode() and decode() for NaN checks
+                posterior = model.encode(batch).latent_dist
+                # Check and sanitize posterior mean and logvar to prevent NaNs propagating into latent sample
+                if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+                    logger.warning("NaNs detected in posterior mean/logvar after encode")
+                posterior.mean = torch.nan_to_num(posterior.mean, nan=0.0)
+                posterior.logvar = torch.nan_to_num(posterior.logvar, nan=0.0)
+                z = posterior.sample()
+                # Check and sanitize latent z before decoding
+                if torch.isnan(z).any():
+                    logger.warning("NaNs detected in latent sample z")
+                z = torch.nan_to_num(z, nan=0.0)
+                reconstruction = model.decode(z)
+                # Check for NaNs in reconstruction and skip loss computation if corrupted
+                if torch.isnan(reconstruction).any():
+                    logger.warning("NaNs detected in reconstruction — skipping loss")
+                    continue
+                # --- End NaN-sanitization in VAE forward ---
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
                 continue
 
             # NaN-check inserted to prevent invalid loss calculations due to corrupted model output or inputs.
             if torch.isnan(batch).any() or torch.isnan(reconstruction).any():
-                logger.debug(f"NaN debug info — batch stats: min {batch.min().item()}, max {batch.max().item()}, mean {batch.mean().item()}")
-                logger.debug(f"NaN debug info — reconstruction stats: min {reconstruction.min().item()}, max {reconstruction.max().item()}, mean {reconstruction.mean().item()}")
                 logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
                 continue  # Skip this batch to avoid NaN loss
 
-            # Computes masked reconstruction loss and optionally SAM; all loss keys returned in a dict
-            # Get detailed losses from model
-            # Tracks both spatial and spectral fidelity
+            # CRITICAL: Apply mask to both original and reconstructed images before loss computation
+            # This ensures that only leaf regions (mask == 1) are evaluated, not background pixels
+            # Background pixels would artificially inflate loss scores since they're easy to reconstruct as zero
+            # Pass mask to compute_losses to enable soft background loss (10% weight)
             try:
                 # Debugging: Check for Infs before loss computation
                 if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
                     logger.warning("Infs detected in batch or reconstruction input to compute_losses")
                 # Masked loss computation: Only leaf regions (mask == 1) are evaluated
-                losses = model.compute_losses(batch * mask, reconstruction * mask)
+                losses = model.compute_losses(batch * mask, reconstruction * mask, mask=mask, background_loss_weight=0.1)
                 # Debugging: Check if losses is a dict
                 if not isinstance(losses, dict):
                     logger.error(f"compute_losses() returned non-dict: {type(losses)}")
@@ -564,10 +657,6 @@ def train(args: argparse.Namespace) -> None:
             # Helps monitor training stability
             if grad_norm > args.max_grad_norm:
                 logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
-                try:
-                    log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
-                except Exception as e:
-                    logger.warning(f"Failed to log to wandb: {e}")
 
             optimizer.step()
             scheduler.step()
@@ -593,33 +682,49 @@ def train(args: argparse.Namespace) -> None:
         }
 
         with torch.no_grad():
+            ssim_per_band = []  # To accumulate average SSIM per band over all batches
             for batch, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
                 batch = batch.to(device)
                 mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+                # (Removed debug logging for NaNs in validation batch)
+                # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
+                batch = torch.clamp(batch, min=0.0, max=1.0)
 
                 # Forward pass
                 try:
-                    reconstruction, _ = model(batch)
+                    # --- Begin NaN-sanitization in VAE forward (validation) ---
+                    posterior = model.encode(batch).latent_dist
+                    # Check and sanitize posterior mean and logvar to prevent NaNs propagating into latent sample
+                    if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+                        logger.warning("NaNs detected in posterior mean/logvar after encode")
+                    posterior.mean = torch.nan_to_num(posterior.mean, nan=0.0)
+                    posterior.logvar = torch.nan_to_num(posterior.logvar, nan=0.0)
+                    z = posterior.sample()
+                    # Check and sanitize latent z before decoding
+                    if torch.isnan(z).any():
+                        logger.warning("NaNs detected in latent sample z")
+                    z = torch.nan_to_num(z, nan=0.0)
+                    reconstruction = model.decode(z)
+                    # Check for NaNs in reconstruction and skip loss computation if corrupted
+                    if torch.isnan(reconstruction).any():
+                        logger.warning("NaNs detected in reconstruction — skipping loss")
+                        continue
+                    # --- End NaN-sanitization in VAE forward (validation) ---
                 except Exception as e:
                     logger.error(f"Validation forward pass failed: {e}")
                     continue
 
-                # NaN-check inserted to prevent invalid loss calculations due to corrupted model output or inputs.
-                if torch.isnan(batch).any() or torch.isnan(reconstruction).any():
-                    logger.debug(f"NaN debug info — batch stats: min {batch.min().item()}, max {batch.max().item()}, mean {batch.mean().item()}")
-                    logger.debug(f"NaN debug info — reconstruction stats: min {reconstruction.min().item()}, max {reconstruction.max().item()}, mean {reconstruction.mean().item()}")
-                    logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
-                    continue  # Skip this batch to avoid NaN loss
-
-                # Computes masked reconstruction loss and optionally SAM; all loss keys returned in a dict
-                # Get detailed losses from model
-                # Evaluates model performance
+                # CRITICAL: Apply mask to both original and reconstructed images before loss computation
+                # This ensures that only leaf regions (mask == 1) are evaluated, not background pixels
+                # Background pixels would artificially inflate loss scores since they're easy to reconstruct as zero
+                # Pass mask to compute_losses to enable soft background loss (10% weight)
                 try:
                     # Debugging: Check for Infs before loss computation (validation)
                     if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
                         logger.warning("Infs detected in batch or reconstruction input to compute_losses (validation)")
                     # Masked validation loss: Evaluates only leaf regions
-                    losses = model.compute_losses(batch * mask, reconstruction * mask)
+                    losses = model.compute_losses(batch * mask, reconstruction * mask, mask=mask, background_loss_weight=0.1)
                     # Debugging: Check if losses is a dict
                     if not isinstance(losses, dict):
                         logger.error(f"compute_losses() returned non-dict: {type(losses)}")
@@ -644,6 +749,61 @@ def train(args: argparse.Namespace) -> None:
                 if torch.isnan(total_loss):
                     logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
 
+                # Compute SSIM per-band (compatibility with skimage.metrics.ssim)
+                # Loop over both batch and channel dimensions using skimage.metrics.structural_similarity
+                # CRITICAL: Apply mask to both original and reconstructed images before SSIM computation
+                # This ensures we only evaluate reconstruction quality on leaf regions, not background
+
+                # NOTE: fallback of computing SSIM without mask will include background, potentially biasing results.
+                batch_np = batch.detach()
+                recon_np = reconstruction.detach()
+                mask_np = mask.detach()  # Background mask (1 for leaf, 0 for background)
+                
+                # Accumulate average SSIM per band for this batch
+                num_bands = batch_np.shape[1]
+                batch_size = batch_np.shape[0]
+                batch_ssim_per_band = []
+                for band_idx in range(num_bands):
+                    band_ssim_total = 0.0
+                    valid_samples = 0  # Count samples with valid leaf regions
+                    for sample_idx in range(batch_size):
+                        # Apply mask to isolate leaf regions only
+                        original_band = batch_np[sample_idx, band_idx].cpu().numpy()
+                        recon_band = recon_np[sample_idx, band_idx].cpu().numpy()
+                        sample_mask = mask_np[sample_idx, 0].cpu().numpy()  # (H, W)
+                        
+                        # Only compute SSIM if there are valid leaf pixels
+                        if np.sum(sample_mask) > 0:
+                            # Apply mask to both original and reconstructed bands
+                            masked_orig = original_band * sample_mask
+                            masked_recon = recon_band * sample_mask
+                            
+                            # Compute SSIM only on the masked region
+                            # Note: skimage SSIM with mask parameter requires recent version
+                            try:
+                                ssim_val = ssim(masked_orig, masked_recon, data_range=1.0, 
+                                              mask=sample_mask.astype(bool))
+                            except TypeError:
+                                # Fallback: compute SSIM on entire image but this includes background
+                                # This is less accurate but ensures compatibility
+                                logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
+                                ssim_val = ssim(original_band, recon_band, data_range=1.0)
+                            
+                            band_ssim_total += ssim_val
+                            valid_samples += 1
+                    
+                    # Average SSIM for this band across valid samples
+                    if valid_samples > 0:
+                        batch_ssim_per_band.append(band_ssim_total / valid_samples)
+                    else:
+                        batch_ssim_per_band.append(0.0)  # No valid leaf regions
+                
+                # Accumulate per-batch SSIMs for averaging after all batches
+                if len(ssim_per_band) == 0:
+                    ssim_per_band = batch_ssim_per_band
+                else:
+                    ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
+
                 # Track losses
                 # Monitors validation performance
                 val_losses['total_loss'] += total_loss.item()
@@ -651,6 +811,9 @@ def train(args: argparse.Namespace) -> None:
                     val_losses['mse_per_channel'] += losses['mse_per_channel']
                 if args.use_sam_loss and 'sam' in losses:
                     val_losses['sam_loss'] += losses['sam'].item()
+            # After validation loop, average ssim_per_band over number of batches
+            if len(val_loader) > 0:
+                ssim_per_band = [v / len(val_loader) for v in ssim_per_band]
 
         # Average losses
         # Computes epoch-level metrics
@@ -675,6 +838,10 @@ def train(args: argparse.Namespace) -> None:
             except Exception as e:
                 logger.warning(f"Failed to get band importance: {e}")
 
+        # print SSIM
+        avg_ssim = np.mean(ssim_per_band)
+        print(f"Avg SSIM: {avg_ssim:.4f} | Per-band SSIM: {[f'{v:.4f}' for v in ssim_per_band]}")
+
         # Log metrics
         # Tracks training progress
         log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args)
@@ -694,7 +861,7 @@ def train(args: argparse.Namespace) -> None:
 
         if (epoch + 1) % args.save_every == 0 or is_best:
             try:
-                save_checkpoint(model, optimizer, scheduler, epoch, val_losses['total_loss'], is_best, args)
+                save_checkpoint(model, optimizer, scheduler, epoch, val_losses['total_loss'], is_best, args, best_val_loss, patience_counter)
             except Exception as e:
                 logger.error(f"Failed to save checkpoint: {e}")
 
@@ -744,7 +911,8 @@ def main():
                       help="Number of epochs to wait for improvement before early stopping")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                       help="Maximum gradient norm for clipping")
-    parser.add_argument("--resume_from", type=str, help="Path to checkpoint to resume from")
+    parser.add_argument("--resume_from_checkpoint", type=str, help="Path to checkpoint directory to resume from")
+    
 
     args = parser.parse_args()
 

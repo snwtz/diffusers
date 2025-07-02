@@ -10,6 +10,24 @@ adapter-based multispectral autoencoder architecture built on a pretrained SD3 b
 The design enables efficient processing of 5-channel spectral plant imagery while maintaining
 compatibility with SD3's latent space requirements.
 
+NOTE ON INPUT FORMAT:
+---------------------
+This implementation expects raw tensor input of shape (B, 5, H, W) during training. In contrast,
+standard SD3 inference pipelines typically expect inputs formatted as dicts, e.g. {"sample": x}.
+This discrepancy can impact integration with SD pipelines if later applying this model in generation tasks.
+Adjustments may be required for compatibility with diffusers pipelines or script-based inference.
+
+NOTE: This version includes defensive coding for numerical stability.
+- Applies nan/inf detection after transforming inputs.
+- Replaces NaNs/Infs with default clamped values to prevent decoder failures.
+- This is necessary due to observed NaNs early in the model pipeline, traced to potential data anomalies or instability.
+
+Additional Note:
+This training script currently passes raw tensors instead of Stable Diffusions typical `dict`-style conditioning 
+input format. This divergence may affect compatibility with downstream modules in the SD pipeline, which 
+expect structured `dict` inputs (e.g., {"image": ..., "mask": ...}). Adapting this format may be 
+necessary for seamless integration later.
+
 Thesis Context and Scientific Innovation:
 ---------------------------------------
 1. Research Objective:
@@ -209,7 +227,6 @@ from ...utils.accelerate_utils import apply_forward_hook
 from ..modeling_outputs import AutoencoderKLOutput
 from .autoencoder_kl import AutoencoderKL
 
-
 #
 # Design Rationale: Spectral Attention
 # ------------------------------------
@@ -285,6 +302,8 @@ class SpectralAdapter(nn.Module):
     It includes spectral attention and a series of convolutions to learn
     the optimal transformation while preserving spectral information.
     """
+    # NOTE: We assume that background pixels in padded multispectral input are encoded as NaN.
+    # This adapter explicitly masks (zeroes out) these background pixels to avoid propagating NaNs.
 
     def __init__(
         self,
@@ -315,6 +334,15 @@ class SpectralAdapter(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply background mask: Set any NaNs to 0.0 (e.g., padding area)
+        # This prevents downstream convolutional layers from propagating invalid values
+        if torch.isnan(x).any():
+            logger.warning("[NaN DEBUG] NaNs found in adapter input, replacing with 0.0 (masked background).")
+        x = torch.nan_to_num(x, nan=0.0)
+
+        # Log adapter input stats for NaN debugging
+        logger.info(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+
         # Apply spectral attention if enabled
         if self.use_attention and hasattr(self, 'attention'):
             x = self.attention(x)
@@ -331,6 +359,38 @@ class SpectralAdapter(nn.Module):
 
         # Final channel adaptation
         x = self.conv3(x)
+
+        # Log adapter output stats for NaN debugging
+        if torch.isnan(x).any():
+            logger.warning("[NaN DEBUG] NaNs in SpectralAdapter output.")
+        logger.info(f"[NaN DEBUG] SpectralAdapter output stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+        return x
+
+# ------------------------------------------------------------
+# InputAdapter: Defensive coding for numerical stability
+# ------------------------------------------------------------
+class InputAdapter(nn.Module):
+    """
+    Adapter module for input normalization and defensive nan/inf handling.
+    This module is inserted at the input side of the multispectral VAE pipeline.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        # If you want, you can add normalization or transformation layers here
+        # For now, acts as identity unless extended
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Optionally perform normalization or transformation here
+        # For example: x = (x - x.mean(dim=[2,3], keepdim=True)) / (x.std(dim=[2,3], keepdim=True) + 1e-6)
+
+        # NaN check: early debug to track if input adapter introduces invalid values
+        if torch.isnan(x).any():
+            logger.warning("[NaN DEBUG] NaNs detected in InputAdapter output.")
+        if torch.isinf(x).any():
+            logger.warning("[NaN DEBUG] Infs detected in InputAdapter output.")
+
+        # Optionally clamp to prevent propagation of small/large values
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         return x
 
 
@@ -435,13 +495,28 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         if pretrained_model_name_or_path is None:
             raise ValueError("`pretrained_model_name_or_path` must be passed to `from_pretrained()` or stored in config.")
         # Load the base config and pass it to the parent __init__.
-        # We unpack the config as keyword arguments because AutoencoderKL doesn't expect a single 'config' kwarg.
         config = AutoencoderKL.load_config(
             pretrained_model_name_or_path,
             subfolder=subfolder,
             revision=revision,
             variant=variant,
         )
+        # Remove adapter-specific config keys before AutoencoderKL.__init__
+        # otherwise loading from pretrained config.json has base class encounter unexpected keywords 
+        adapter_keys = {
+            "pretrained_model_name_or_path",
+            "adapter_channels",
+            "adapter_placement",
+            "use_spectral_attention",
+            "use_sam_loss",
+            "in_channels",
+            "out_channels",
+            "revision",
+            "subfolder",
+            "torch_dtype",
+            "variant",
+        }
+        config = {k: v for k, v in config.items() if k not in adapter_keys}
         super().__init__(**config)
         self.load_from_pretrained(
             pretrained_model_name_or_path,
@@ -507,32 +582,53 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # - MSE ensures accurate reconstruction pixel-wise.
     # - SAM focuses on preserving spectral signatures, regardless of scale.
     # The combination allows the model to prioritize spectral realism, important in plant health analysis.
-    def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None, background_loss_weight: float = 0.1) -> Dict[str, torch.Tensor]:
         """Compute various loss terms for training.
 
         This method computes both per-channel MSE loss and Spectral Angle Mapper (SAM)
         loss to ensure both pixel-wise accuracy and spectral fidelity.
 
+        This method expects that masking has already been applied by the caller for the main loss (i.e., only leaf regions).
+        If a mask is provided, a soft background loss is also computed and added to the total loss with a configurable weight.
+
         Args:
-            original: Original multispectral image
-            reconstructed: Reconstructed multispectral image
+            original: Original multispectral image (should be pre-masked for main loss)
+            reconstructed: Reconstructed multispectral image (should be pre-masked for main loss)
+            mask: Binary mask (1 for leaf, 0 for background), shape (B, 1, H, W)
+            background_loss_weight: Weight for the soft background loss (default 0.1)
 
         Returns:
             Dictionary containing different loss terms
         """
         losses = {}
 
-        # Per-channel MSE loss for pixel-wise accuracy
+        # Per-channel MSE loss for pixel-wise accuracy (main loss, leaf only)
         mse_per_channel = F.mse_loss(reconstructed, original, reduction='none')
         mse_per_channel = mse_per_channel.mean(dim=(0, 2, 3))  # Average over batch and spatial dimensions
         losses['mse_per_channel'] = mse_per_channel
-
-        # Overall MSE loss
         losses['mse'] = mse_per_channel.mean()
 
-        # Spectral Angle Mapper loss for spectral fidelity
+        # Spectral Angle Mapper loss for spectral fidelity (leaf only)
         if self.use_sam_loss:
             losses['sam'] = compute_sam_loss(original, reconstructed)
+            if torch.isnan(losses['sam']):
+                logger.warning("[NaN DEBUG] SAM loss returned NaN")
+
+        # Soft background loss: encourage realistic background output
+        if mask is not None:
+            background_mask = 1 - mask  # 1 for background, 0 for leaf
+            # Compute background MSE only on background pixels
+            # Use original and reconstructed before masking (i.e., full tensors)
+            background_mse = F.mse_loss(
+                reconstructed * background_mask,
+                original * background_mask,
+                reduction='sum'
+            ) / (background_mask.sum() + 1e-8)
+            losses['background_mse'] = background_mse
+            # Add to total loss with configurable weight
+            losses['total_loss'] = losses['mse'] + background_loss_weight * background_mse
+        else:
+            losses['total_loss'] = losses['mse']
 
         return losses
 
@@ -611,7 +707,19 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         """
         # Input sample is adapted and encoded
         x = sample
+
+        # Log: NaNs in input
+        if torch.isnan(x).any():
+            logger.warning("[NaN DEBUG] NaNs detected in input")
+
+        # Optional: Print input stats before any adapter/encoder to diagnose anomalies in early pipeline
+        logger.info(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+
         posterior = self.encode(x).latent_dist
+
+        # Log: NaNs in posterior distribution
+        if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+            logger.warning("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
 
         # Choose whether to sample from posterior or use mode
         if sample_posterior:
@@ -619,12 +727,27 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         else:
             z = posterior.mode()
 
+        # Log: NaNs in latent z
+        if torch.isnan(z).any():
+            logger.warning("[NaN DEBUG] NaNs detected in latent z")
+
         # Decode to obtain reconstructed output
         decoded = self.decode(z)
+
+        # Log: NaNs in reconstruction
+        if torch.isnan(decoded).any():
+            logger.warning("[NaN DEBUG] NaNs detected in reconstruction")
 
         # Compute training losses if in training mode
         if self.training:
             losses = self.compute_losses(x, decoded)
+            # Log: Loss debugging for NaNs or unusual values
+            if torch.isnan(losses['mse']).any():
+                logger.warning("[NaN DEBUG] NaNs detected in MSE loss")
+            if self.use_sam_loss and 'sam' in losses and torch.isnan(losses['sam']).any():
+                logger.warning("[NaN DEBUG] NaNs detected in SAM loss")
+            if 'mse_per_channel' in losses:
+                logger.info(f"[DEBUG] Per-channel MSE stats — min: {losses['mse_per_channel'].min().item():.4f}, max: {losses['mse_per_channel'].max().item():.4f}")
             return decoded, losses
 
         # In evaluation mode, return decoded output and None for losses

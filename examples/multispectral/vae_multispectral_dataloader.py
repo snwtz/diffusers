@@ -15,7 +15,7 @@ Key Features:
 - Leaf-focused feature learning
 
 Implementation Notes:
--------------------
+--------------------
 1. Background Handling:
    - NaN values in TIFF files represent background (cut-out regions)
    - These regions are masked out during training
@@ -29,6 +29,12 @@ Implementation Notes:
    - Band 32 (650.665nm): Red - sensitive to chlorophyll content
    - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
    - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
+
+3. Input Sanitization:
+   - NaN values are preserved for background masking until final tensor conversion
+   - Just before model input, NaNs in the input tensor are replaced with 0.0
+   - This prevents NaN propagation into model layers and loss functions
+   - Maintains compatibility with SD-style pipelines that expect dense tensors
 """
 
 import os
@@ -218,6 +224,10 @@ class VAEMultispectralDataset(Dataset):
         # Create a mask for non-NaN values (leaf regions)
         valid_mask = ~np.isnan(channel_data)
 
+        # Log per-channel NaN and stats before normalization
+        if np.isnan(channel_data).any():
+            logger.warning(f"[Normalize] NaNs found before normalization — min: {np.nanmin(channel_data):.4f}, max: {np.nanmax(channel_data):.4f}, mean: {np.nanmean(channel_data):.4f}")
+
         if not np.any(valid_mask):
             logger.warning("Channel contains only NaN values (background). Returning NaN array.")
             return np.full_like(channel_data, np.nan, dtype=np.float32)
@@ -237,6 +247,22 @@ class VAEMultispectralDataset(Dataset):
         normalized[valid_mask] = 2 * normalized[valid_mask] - 1
 
         return normalized
+
+    def pad_to_square(self, img: torch.Tensor, fill_value: float = 0.0) -> torch.Tensor:
+        """
+        Pad a (C, H, W) tensor to a square shape (C, S, S) with the given fill value.
+        """
+        c, h, w = img.shape
+        size = max(h, w, self.resolution)
+        pad_h = size - h
+        pad_w = size - w
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        padding = (pad_left, pad_right, pad_top, pad_bottom)
+        img = torch.nn.functional.pad(img, padding, value=fill_value)
+        return img
 
     def preprocess_image(self, image_path: str) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -264,11 +290,17 @@ class VAEMultispectralDataset(Dataset):
            - Generates binary mask (1 for leaf, 0 for background)
            - Masks out background during training
            - Optional mask return for loss computation
+
+        Preserves aspect ratio by padding to square before resizing.
         """
         try:
             with rasterio.open(image_path) as src:
                 # Read required bands
                 image = src.read(self.REQUIRED_BANDS)  # Shape: (5, height, width)
+
+                # Log raw band values for NaN and stats
+                if np.isnan(image).any():
+                    logger.warning(f"[Preprocess] NaNs detected in raw image BEFORE normalization — shape: {image.shape}, min: {np.nanmin(image):.4f}, max: {np.nanmax(image):.4f}, mean: {np.nanmean(image):.4f}")
 
                 # Generate background mask from NaN values
                 # Use first band to create mask (all bands should have same NaN pattern)
@@ -278,25 +310,46 @@ class VAEMultispectralDataset(Dataset):
                 # Convert to float32 and normalize
                 image = image.astype(np.float32)
                 normalized_image = np.zeros_like(image)
+                # fill NaN with the mean value of each band (computed from the valid pixels in that image)
+                # makes the background more “natural” and within the data distribution, 
+                # reducing artifacts and helping the model generalize better ?
                 for i in range(5):
-                    normalized_image[i] = self.normalize_channel(image[i])
+                    band = image[i]
+                    nan_mask = np.isnan(band)
+                    mean_val = np.nanmean(band)
+                    band[nan_mask] = mean_val
+                    normalized_image[i] = self.normalize_channel(band)
 
-                # Convert to tensor and resize
+                # Convert to tensor (resizing eliminated)
                 image_tensor = torch.from_numpy(normalized_image)
-                image_tensor = F.interpolate(
-                    image_tensor.unsqueeze(0),
-                    size=(self.resolution, self.resolution),
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze(0)
+                if torch.isnan(image_tensor).any():
+                    logger.info(f"[Sanitize] Replacing NaNs in input tensor with 0.0 to avoid propagation into model.")
+                    image_tensor = torch.nan_to_num(image_tensor, nan=0.0)
 
-                # Resize mask to match image resolution
-                mask_tensor = torch.from_numpy(leaf_mask).unsqueeze(0)  # Add channel dimension
-                mask_tensor = F.interpolate(
-                    mask_tensor.unsqueeze(0),
-                    size=(self.resolution, self.resolution),
-                    mode='nearest'  # Use nearest neighbor for binary mask
-                ).squeeze(0)
+                # Pad to square before resizing
+                image_tensor = self.pad_to_square(image_tensor, fill_value=0.0)
+                # Now resize to (resolution, resolution) if needed (should be square already)
+                if image_tensor.shape[1] != self.resolution or image_tensor.shape[2] != self.resolution:
+                    image_tensor = F.interpolate(
+                        image_tensor.unsqueeze(0),
+                        size=(self.resolution, self.resolution),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(0)
+
+                # Inspect tensor for NaNs before interpolation
+                if torch.isnan(image_tensor).any():
+                    logger.warning(f"[ToTensor] NaNs detected AFTER conversion to tensor — min: {image_tensor.min().item():.4f}, max: {image_tensor.max().item():.4f}, mean: {image_tensor.mean().item():.4f}")
+
+                # Pad and resize mask
+                mask_tensor = torch.from_numpy(leaf_mask).unsqueeze(0)  # (1, H, W)
+                mask_tensor = self.pad_to_square(mask_tensor, fill_value=0.0)
+                if mask_tensor.shape[1] != self.resolution or mask_tensor.shape[2] != self.resolution:
+                    mask_tensor = F.interpolate(
+                        mask_tensor.unsqueeze(0),
+                        size=(self.resolution, self.resolution),
+                        mode='nearest'
+                    ).squeeze(0)
 
                 if self.return_mask:
                     return image_tensor, mask_tensor
