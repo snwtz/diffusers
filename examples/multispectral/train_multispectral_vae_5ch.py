@@ -6,6 +6,14 @@ a lightweight adapter-based multispectral VAE architecture. It serves as the pre
 for integrating a custom VAE into the Stable Diffusion 3 + DreamBooth pipeline for generating
 synthetic multispectral plant imagery.
 
+Data Flow Summary:
+------------------
+- Input: Preprocessed 5-channel plant images and masks (from vae_multispectral_dataloader.py)
+- Model: Adapters map 5-channel input to 3-channel HF's AutoencoderKL backbone, then back to 5-channel output
+- Output: Reconstructed 5-channel image, with losses computed for both spatial and spectral fidelity
+- Loss: Multi-objective (MSE + SAM), with mask-aware background handling
+- Logging: Per-epoch metrics, band importance, and SSIM for scientific analysis
+
 Thesis Context and Training Workflow:
 ----------------------------------
 1. Research Pipeline:
@@ -24,7 +32,8 @@ Thesis Context and Training Workflow:
 3. Background Handling:
    - NaN values in TIFF files represent background (cut-out regions)
    - Binary masks (1 for leaf, 0 for background) are generated
-   - Loss computation only considers leaf regions
+   - Loss computation primarily considers leaf regions
+   - Background contributes softly (10%) to the total loss
    - Model focuses solely on leaf features
    - No background inpainting or interpolation
 
@@ -39,7 +48,7 @@ Thesis Context and Training Workflow:
    b) Loss Computation:
       - Per-band MSE for spatial fidelity
       - SAM loss for spectral signature preservation
-      - Masked loss computation (leaf regions only)
+      - Masked loss computation: full weight on leaf, soft penalty on background (10%)
       - Configurable loss weighting
       - Band-specific loss tracking
 
@@ -134,9 +143,6 @@ VAE Loading Note:
 
 This approach bypasses issues with conflicting `from_pretrained` calls and allows reuse of the SD3 VAE backbone with frozen weights.
 """
-"""
-
-"""
 
 import os
 import argparse
@@ -158,7 +164,7 @@ from diffusers.training_utils import EMAModel
 from vae_multispectral_dataloader import create_vae_dataloaders
 
 def setup_logging(args):
-    # Create logs directory
+    # Create logs directory for experiment traceability and reproducibility
     log_dir = os.path.join(args.output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
 
@@ -185,6 +191,7 @@ def setup_logging(args):
     return logger
 
 def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args):
+    # Logs all relevant metrics for scientific reporting and experiment tracking
     logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
     logger.info("Training Metrics:")
     logger.info(f"  Total Loss: {train_losses.get('total_loss', float('nan')):.4f}")
@@ -207,6 +214,7 @@ def log_training_metrics(logger, epoch, train_losses, val_losses, band_importanc
         logger.info(f"  {band}: {importance:.4f}")
 
 def setup_wandb(args):
+    # Initializes Weights & Biases for experiment tracking and reproducibility
     wandb.init(
         project="multispectral-vae",
         config={
@@ -222,6 +230,7 @@ def setup_wandb(args):
     )
 
 def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction):
+    # Logs metrics and sample images to Weights & Biases for visualization and analysis
     wandb.log({
         "epoch": epoch,
         "train_total_loss": train_losses.get('total_loss', float('nan')),
@@ -241,7 +250,11 @@ def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, recons
         })
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args, best_val_loss=None, patience_counter=None):
-    """Save model checkpoint."""
+    """Save model checkpoint.
+ 
+    - Checkpointing ensures that the best model is preserved for downstream analysis and reproducibility.
+    - Regular checkpoints allow for recovery from interruptions and support ablation studies.
+    """
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -266,7 +279,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args, bes
         torch.save(checkpoint, os.path.join(best_model_path, 'training_state.pt'))
 
 def count_parameters(model):
-    """Count trainable and non-trainable parameters in the model."""
+    """Count trainable and non-trainable parameters in the model to report model complexity 
+    and for comparing different architectures.
+    """
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     total_params = trainable_params + non_trainable_params
@@ -309,19 +324,20 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     Implementation Notes:
     -------------------
     1. File List Management:
-       - Uses split files from split_dataset.py
-       - Ensures deterministic train/val splits
-       - Maintains data consistency
+       - Uses split files from split_dataset.py for deterministic, reproducible splits.
+       - Ensures data consistency and traceability.
 
     2. Dataloader Configuration:
-       - Uses VAE-specific dataloader module
-       - Optimizes for GPU training
-       - Enables efficient data loading
+       - Uses VAE-specific dataloader module.
+       - Optimizes for GPU training and efficient data loading.
 
-    3. Error Handling:
-       - Validates split files exist
-       - Provides clear error messages
-       - Ensures training stability
+    3. Data Quality Assurance:
+       - Inspects the first batch for NaNs/Infs to ensure data quality before training.
+       - Logs anomalies for debugging and reproducibility.
+
+    4. Error Handling:
+       - Validates split files exist and provides clear error messages.
+       - Ensures training stability and scientific rigor.
     """
     # Get split files from args
     train_list = Path(args.train_file_list)
@@ -382,6 +398,8 @@ def load_checkpoint(checkpoint_path: str, model, optimizer, scheduler, device):
     Returns:
         Tuple of (start_epoch, best_val_loss, patience_counter)
     """
+    import logging
+    logger = logging.getLogger(__name__)
     checkpoint_file = os.path.join(checkpoint_path, 'training_state.pt')
     if not os.path.exists(checkpoint_file):
         raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
@@ -419,35 +437,33 @@ def train(args: argparse.Namespace) -> None:
     Implementation Notes:
     -------------------
     1. Model Initialization:
-       - Loads pretrained SD3 model
-       - Configures multispectral adapters
-       - Freezes backbone for efficient training
+       - Loads pretrained SD3 model and configures multispectral adapters.
+       - Freezes backbone for parameter-efficient fine-tuning (only adapters are trainable).
+       - Logs parameter counts for scientific reporting.
 
     2. Training Pipeline:
-       - Uses cosine learning rate schedule with warmup
-       - Implements EMA model averaging
-       - Applies gradient clipping
-       - Supports early stopping
-       - Handles background masking
+       - Uses cosine learning rate schedule with warmup for stable convergence.
+       - Implements EMA model averaging for improved generalization.
+       - Applies gradient clipping to prevent exploding gradients.
+       - Supports early stopping and checkpointing for robust model selection.
+       - Handles background masking throughout the pipeline for leaf-focused learning.
 
     3. Loss Computation:
-       - Per-band MSE for spatial fidelity
-       - Optional SAM loss for spectral preservation
-       - Masked loss computation (leaf regions only)
-       - Configurable loss weighting
+       - Per-band MSE for spatial fidelity.
+       - Optional SAM loss for spectral signature preservation.
+       - Masked loss computation: only leaf regions (mask==1) contribute fully; background (mask==0) is softly penalized.
+       - Combination of MSE and SAM loss is critical for balancing spatial and spectral fidelity in scientific applications.
 
     4. Validation Strategy:
-       - Per-epoch validation
-       - Tracks best model
-       - Implements early stopping
-       - Saves checkpoints
-       - Evaluates only leaf regions
+       - Per-epoch validation with per-band MSE, SAM loss, and SSIM metrics.
+       - SSIM is computed per-band and only on masked (leaf) regions to ensure validity.
+       - Tracks best model and implements early stopping to prevent overfitting.
+       - Saves checkpoints for reproducibility and analysis.
 
-    5. Monitoring:
-       - Comprehensive logging
-       - Wandb integration
-       - Band importance tracking
-       - Training dynamics analysis
+    5. Monitoring and Logging:
+       - Comprehensive logging of all metrics, band importance, and training dynamics.
+       - Weights & Biases integration for experiment tracking and visualization.
+       - Logs all hyperparameters and results for scientific reproducibility.
     """
 
     # Setup logging first (after output_dir is set)
@@ -473,6 +489,7 @@ def train(args: argparse.Namespace) -> None:
     # NOTE: Unlike typical SD pipelines where model inputs are passed as dictionaries with keys like "pixel_values",
     #       this training script uses direct tensor inputs. This works because our custom model accepts tensor input directly,
     #       but care must be taken when integrating with HuggingFace-style SD pipelines later.
+    #       Direct tensor input simplifies the pipeline and ensures compatibility with custom dataloader and model, but may require adaptation for downstream SD integration.
 
     # Validate model has required methods
     required_methods = ['freeze_backbone', 'get_trainable_params', 'compute_losses']
@@ -571,9 +588,9 @@ def train(args: argparse.Namespace) -> None:
         for batch, mask in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training"):
             batch = batch.to(device)
             mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
-            # Debugging: check raw batch for NaNs before any preprocessing
-            # (Removed excessive debug logging)
             # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+            # Conceptually preserve the NaN-based primary mask for calculating masked losses!
+            # Ensures that only valid data is passed to the model, preventing NaN/infinity propagation
             batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
             batch = torch.clamp(batch, min=0.0, max=1.0)
 
@@ -607,16 +624,16 @@ def train(args: argparse.Namespace) -> None:
                 logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
                 continue  # Skip this batch to avoid NaN loss
 
-            # CRITICAL: Apply mask to both original and reconstructed images before loss computation
-            # This ensures that only leaf regions (mask == 1) are evaluated, not background pixels
-            # Background pixels would artificially inflate loss scores since they're easy to reconstruct as zero
-            # Pass mask to compute_losses to enable soft background loss (10% weight)
+            # CRITICAL: Pass the mask into compute_losses to handle background masking internally.
+            # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
+            # such as background bounding box artifacts. Background is optionally included via a soft penalty.
+            # Scientific Rationale: Mask propagation ensures that the model focuses on biologically relevant regions (leaves), supporting the scientific goal of leaf-focused learning and spectral fidelity.
             try:
                 # Debugging: Check for Infs before loss computation
                 if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
                     logger.warning("Infs detected in batch or reconstruction input to compute_losses")
-                # Masked loss computation: Only leaf regions (mask == 1) are evaluated
-                losses = model.compute_losses(batch * mask, reconstruction * mask, mask=mask, background_loss_weight=0.1)
+                # Masked loss computation: Leaf regions (mask==1) get full weight; background (mask==0) is softly penalized
+                losses = model.compute_losses(batch, reconstruction, mask=mask, background_loss_weight=0.1)
                 # Debugging: Check if losses is a dict
                 if not isinstance(losses, dict):
                     logger.error(f"compute_losses() returned non-dict: {type(losses)}")
@@ -715,16 +732,15 @@ def train(args: argparse.Namespace) -> None:
                     logger.error(f"Validation forward pass failed: {e}")
                     continue
 
-                # CRITICAL: Apply mask to both original and reconstructed images before loss computation
-                # This ensures that only leaf regions (mask == 1) are evaluated, not background pixels
-                # Background pixels would artificially inflate loss scores since they're easy to reconstruct as zero
-                # Pass mask to compute_losses to enable soft background loss (10% weight)
+                # CRITICAL: Pass the mask into compute_losses to handle background masking internally.
+                # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
+                # such as background bounding box artifacts. Background is optionally included via a soft penalty.
                 try:
                     # Debugging: Check for Infs before loss computation (validation)
                     if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
                         logger.warning("Infs detected in batch or reconstruction input to compute_losses (validation)")
-                    # Masked validation loss: Evaluates only leaf regions
-                    losses = model.compute_losses(batch * mask, reconstruction * mask, mask=mask, background_loss_weight=0.1)
+                    # Validation: Compute masked loss with soft background penalty (10%) for consistency with training
+                    losses = model.compute_losses(batch, reconstruction, mask=mask, background_loss_weight=0.1)
                     # Debugging: Check if losses is a dict
                     if not isinstance(losses, dict):
                         logger.error(f"compute_losses() returned non-dict: {type(losses)}")

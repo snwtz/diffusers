@@ -1,4 +1,6 @@
 """
+NOTE: replace NaNs with per-band mean before masking
+
 Multispectral Image Dataloader for VAE Training
 
 This module implements a specialized dataloader for multispectral TIFF images,
@@ -19,8 +21,13 @@ Implementation Notes:
 1. Background Handling:
    - NaN values in TIFF files represent background (cut-out regions)
    - These regions are masked out during training
-   - Model focuses solely on leaf features
+   - Model focuses on leaf features
    - No background inpainting or interpolation
+
+   The loss function:
+	•	Applies full loss (100%) on leaf regions (mask == 1).
+	•	Applies soft loss (10%) on background (mask == 0).
+	•	Assumption that NaN = background, preserves the gradient flow without biasing toward padded edges.
 
 2. Data Processing:
    The training pipeline handles 5 biologically relevant spectral bands:
@@ -81,6 +88,8 @@ class VAEMultispectralDataset(Dataset):
        - Optional caching for repeated access
        - Efficient worker process utilization
        - GPU memory considerations
+    5. Reproducibility:
+       - File list is expected to be pre-generated and deterministic for scientific reproducibility
     """
 
     # Define the specific bands to use (1-based indexing for rasterio.read)
@@ -143,6 +152,7 @@ class VAEMultispectralDataset(Dataset):
         self.cache = {} if use_cache else None
 
         # Validate all images on initialization
+        # This ensures that all files are valid before training starts, preventing runtime interruptions and ensuring reproducibility.
         self._validate_all_images()
         logger.info(f"Loaded {len(self.image_paths)} files from {file_list_path}")
 
@@ -154,7 +164,7 @@ class VAEMultispectralDataset(Dataset):
         Implementation Notes:
         -------------------
         1. Band Count Validation:
-           - Ensures all images have required bands
+           - Ensures all images have required bands (critical for spectral consistency)
            - Prevents runtime errors during training
            - Maintains data consistency
 
@@ -163,6 +173,7 @@ class VAEMultispectralDataset(Dataset):
            - Ignores NaN values (background)
            - Prevents training instability
            - Maintains VAE compatibility
+           - Data range warnings are not fatal; normalization will correct them, but they are logged for data quality monitoring.
 
         3. Error Handling:
            - Comprehensive error messages
@@ -214,10 +225,11 @@ class VAEMultispectralDataset(Dataset):
            - Only normalizes valid (non-NaN) regions
            - Required for VAE training stability
            - Preserves spectral relationships
+           - Normalization is done per-image, per-band, to avoid dataset-level leakage
 
         2. Background Handling:
            - NaN values represent background
-           - Preserves NaN values in output
+           - Preserves NaN values in output until after normalization (essential for correct mask generation and loss computation)
            - No background inpainting
            - Focuses on leaf features
         """
@@ -248,10 +260,22 @@ class VAEMultispectralDataset(Dataset):
 
         return normalized
 
-    def pad_to_square(self, img: torch.Tensor, fill_value: float = 0.0) -> torch.Tensor:
+        # Modified padding logic to use the same per-band mean value as the normalization baseline, 
+        # ensuring that padded background areas resemble the distribution of valid leaf surroundings
+    def pad_to_square(self, img: torch.Tensor, fill_value: float = None) -> torch.Tensor:
         """
         Pad a (C, H, W) tensor to a square shape (C, S, S) with the given fill value.
+        The fill_value should be computed from valid foreground pixels to prevent artificial edges.
+        If fill_value is None, raises an error.
+
+        Design Note:
+        ------------
+        Using the mean of valid (foreground) pixels as the fill value is a deliberate design choice to minimize 
+        artificial edges at the image border. This prevents the VAE decoder from learning spurious "bounding box" artifacts 
+        and ensures that padded regions are statistically similar to the leaf regions, supporting robust scientific analysis.
         """
+        if fill_value is None:
+            raise ValueError("Fill value for padding must be explicitly set based on foreground data.")
         c, h, w = img.shape
         size = max(h, w, self.resolution)
         pad_h = size - h
@@ -291,7 +315,13 @@ class VAEMultispectralDataset(Dataset):
            - Masks out background during training
            - Optional mask return for loss computation
 
-        Preserves aspect ratio by padding to square before resizing.
+        3. Data Flow:
+           - NaNs are preserved until after normalization for correct mask generation.
+           - Background NaNs are filled with the per-band mean to avoid introducing out-of-distribution values, which would destabilize the VAE and bias the loss.
+           - The mask is generated from the first band, assuming all bands have the same NaN pattern (safe for this dataset).
+           - Padding is performed before resizing to preserve aspect ratio.
+           - Resizing is performed after padding to ensure the final tensor matches the model's expected input size.
+           - Mask is resized with nearest-neighbor interpolation to preserve binary values (1=leaf, 0=background).
         """
         try:
             with rasterio.open(image_path) as src:
@@ -311,8 +341,7 @@ class VAEMultispectralDataset(Dataset):
                 image = image.astype(np.float32)
                 normalized_image = np.zeros_like(image)
                 # fill NaN with the mean value of each band (computed from the valid pixels in that image)
-                # makes the background more “natural” and within the data distribution, 
-                # reducing artifacts and helping the model generalize better ?
+                # This step ensures that background values are within the natural data distribution, minimizing decoder confusion and potential artifacts.
                 for i in range(5):
                     band = image[i]
                     nan_mask = np.isnan(band)
@@ -320,14 +349,26 @@ class VAEMultispectralDataset(Dataset):
                     band[nan_mask] = mean_val
                     normalized_image[i] = self.normalize_channel(band)
 
-                # Convert to tensor (resizing eliminated)
+                # Convert to tensor, resizing is performed after padding]
                 image_tensor = torch.from_numpy(normalized_image)
                 if torch.isnan(image_tensor).any():
                     logger.info(f"[Sanitize] Replacing NaNs in input tensor with 0.0 to avoid propagation into model.")
                     image_tensor = torch.nan_to_num(image_tensor, nan=0.0)
 
+                # Compute fill_value as mean of valid (foreground) pixels per band for padding
+                # This prevents artificial edges by matching the padded value to the leaf distribution
+                # (fixes "bounding box" style artifacts)
+                foreground_mask = torch.from_numpy(leaf_mask).unsqueeze(0).bool()  # shape: (1, H, W)
+                # Compute per-band mean for valid (foreground) pixels
+                per_band_means = []
+                for b in range(image_tensor.shape[0]):
+                    band_pixels = image_tensor[b][foreground_mask[0]]
+                    band_mean = band_pixels.mean().item() if band_pixels.numel() > 0 else 0.0
+                    per_band_means.append(band_mean)
+                # Always use the average of per-band means as a scalar fill value for F.pad
+                fill_value = float(np.mean(per_band_means))
                 # Pad to square before resizing
-                image_tensor = self.pad_to_square(image_tensor, fill_value=0.0)
+                image_tensor = self.pad_to_square(image_tensor, fill_value=fill_value)
                 # Now resize to (resolution, resolution) if needed (should be square already)
                 if image_tensor.shape[1] != self.resolution or image_tensor.shape[2] != self.resolution:
                     image_tensor = F.interpolate(
@@ -380,13 +421,13 @@ class VAEMultispectralDataset(Dataset):
         1. Caching Strategy:
            - Checks cache before processing
            - Stores processed images and masks
-           - Reduces computation overhead
+           - Reduces computation overhead (especially important for large datasets)
 
         2. Transform Pipeline:
            - Applies additional transforms if specified
            - Must be NaN-safe
            - Maintains data consistency
-           - Supports augmentation
+           - Supports augmentation (applied only to the image, not the mask)
         """
         image_path = str(self.image_paths[idx])
 
@@ -409,6 +450,7 @@ class VAEMultispectralDataset(Dataset):
                 image_tensor = self.transform(image_tensor)
 
         # Cache the result if caching is enabled
+        # Caching is critical for large datasets to avoid repeated disk I/O and speed up training.
         if self.use_cache:
             if self.return_mask:
                 self.cache[image_path] = (image_tensor, mask_tensor)
@@ -456,10 +498,10 @@ def create_vae_dataloaders(
        - Handles background masking
 
     2. DataLoader Configuration:
-       - pin_memory=True for faster GPU transfer
+       - pin_memory=True for faster GPU transfer (critical for large-scale VAE training)
        - persistent_workers for efficient process management
        - prefetch_factor for optimized loading
-       - drop_last=True to avoid partial batches
+       - drop_last=True to avoid partial batches (important for batchnorm and reproducibility)
 
     3. Train/Val Separation:
        - Training data is shuffled
