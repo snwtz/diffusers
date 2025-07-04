@@ -30,4 +30,8 @@ seaborn>=0.12.0
 
 # Optional, for development
 jupyter>=1.0.0  # For notebook-based development
-ipython>=8.0.0  # Enhanced interactive Python shell 
+ipython>=8.0.0  # Enhanced interactive Python shell
+
+# Additional dependencies
+scikit-image>=0.19.0  # For SSIM and other image metrics
+pytorch-msssim>=0.2.1  # For optional SSIM metric in evaluation 

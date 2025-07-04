@@ -10,10 +10,17 @@ adapter-based multispectral autoencoder architecture built on a pretrained SD3 b
 The design enables efficient processing of 5-channel spectral plant imagery while maintaining
 compatibility with SD3's latent space requirements.
 
+Data Flow Summary:
+------------------
+- Input: Preprocessed 5-channel plant images (from vae_multispectral_dataloader.py)
+- Model: Adapters map 5-channel input to 3-channel SD3 backbone, then back to 5-channel output
+- Output: Reconstructed 5-channel image, with losses computed for both spatial and spectral fidelity
+- Loss: Multi-objective (MSE + SAM), with mask-aware background handling
+
 NOTE ON INPUT FORMAT:
 ---------------------
-This implementation expects raw tensor input of shape (B, 5, H, W) during training. In contrast,
-standard SD3 inference pipelines typically expect inputs formatted as dicts, e.g. {"sample": x}.
+This training script currently expects raw tensor input of shape (B, 5, H, W) during training. In contrast,
+standard SD3 inference pipelines typically expect `dict`-style conditioning input format, e.g. {"sample": x, "mask": y}.
 This discrepancy can impact integration with SD pipelines if later applying this model in generation tasks.
 Adjustments may be required for compatibility with diffusers pipelines or script-based inference.
 
@@ -21,12 +28,6 @@ NOTE: This version includes defensive coding for numerical stability.
 - Applies nan/inf detection after transforming inputs.
 - Replaces NaNs/Infs with default clamped values to prevent decoder failures.
 - This is necessary due to observed NaNs early in the model pipeline, traced to potential data anomalies or instability.
-
-Additional Note:
-This training script currently passes raw tensors instead of Stable Diffusions typical `dict`-style conditioning 
-input format. This divergence may affect compatibility with downstream modules in the SD pipeline, which 
-expect structured `dict` inputs (e.g., {"image": ..., "mask": ...}). Adapting this format may be 
-necessary for seamless integration later.
 
 Thesis Context and Scientific Innovation:
 ---------------------------------------
@@ -240,6 +241,11 @@ class SpectralAttention(nn.Module):
     This module learns to weight the importance of each spectral band
     during the adaptation process. It helps the model focus on the most
     relevant bands for the task while maintaining spectral relationships.
+    
+    Scientific Rationale (??):
+    --------------------
+    - Enables explainable AI attention weights can be visualized and mapped to wavelengths for scientific interpretability.
+    - Supports plant science by highlighting diagnostically relevant bands.
     """
 
     def __init__(self, num_bands: int):
@@ -301,6 +307,12 @@ class SpectralAdapter(nn.Module):
     input and the 3-channel RGB-like format expected by the SD3 VAE.
     It includes spectral attention and a series of convolutions to learn
     the optimal transformation while preserving spectral information.
+    
+    Scientific Rationale:
+    --------------------
+    - Bridges the gap between 5-channel plant data and 3-channel SD3 backbone (core methodological innovation).
+    - NaN-masking is essential for preventing background artifacts from propagating through the network.
+
     """
     # NOTE: We assume that background pixels in padded multispectral input are encoded as NaN.
     # This adapter explicitly masks (zeroes out) these background pixels to avoid propagating NaNs.
@@ -373,6 +385,8 @@ class InputAdapter(nn.Module):
     """
     Adapter module for input normalization and defensive nan/inf handling.
     This module is inserted at the input side of the multispectral VAE pipeline.
+    
+    - Prevents propagation of NaNs/Infs into the model, supporting stable training and inference.
     """
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -396,6 +410,8 @@ class InputAdapter(nn.Module):
 
 # Numerically stable normalization for SAM loss
 def safe_normalize(tensor, dim=1, eps=1e-8):
+    # Numerically stable normalization for SAM loss
+    # Ensures that spectral angle calculations are robust to small values and avoid NaNs.
     norm = torch.norm(tensor, p=2, dim=dim, keepdim=True)
     norm = norm.clamp(min=eps)
     return tensor / norm
@@ -409,6 +425,9 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
         reconstructed: Reconstructed multispectral image
     Returns:
         Mean spectral angle in radians
+    
+    - SAM loss is critical for preserving spectral signatures, which is a key scientific goal in plant imaging.
+    - Invariant to scaling, so it focuses on spectral shape rather than intensity.
     """
     # Use safe normalization to avoid NaNs
     normalized_original = safe_normalize(original, dim=1)
@@ -445,8 +464,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     This implementation adapts the SD3 VAE for multispectral data by:
     1. Using pretrained SD3 VAE as backbone
     2. Adding lightweight adapter layers for 5-channel input/output
-    3. Keeping backbone frozen during training
-    4. Only training the adapter layers
+    3. Keeping backbone frozen during training (parameter-efficient fine-tuning)
+    4. Only training the adapter layers (supports rapid adaptation)
     5. Including spectral attention and specialized losses
 
     Parameters:
@@ -527,6 +546,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         )
 
     def load_from_pretrained(self, pretrained_model_name_or_path, subfolder=None, revision=None, variant=None, torch_dtype=None):
+        # This method ensures compatibility with Hugging Face's pretrained models, while allowing for custom adapter logic.
         base_model = AutoencoderKL.from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -555,7 +575,9 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # Freezing pretrained SD3 VAE ensures latent space remains aligned with pretrained distributions.
     # Prevents catastrophic forgetting and saves compute.
     def freeze_backbone(self):
-        """Freeze all parameters except adapter layers."""
+        """Freeze all parameters except adapter layers.
+        Preserves the pretrained SD3 latent space, preventing catastrophic forgetting.
+        """
         for param in self.parameters():
             param.requires_grad = False
         # Unfreeze adapter layers
@@ -599,6 +621,13 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
         Returns:
             Dictionary containing different loss terms
+        
+        --------------------
+        - Combines per-channel MSE (spatial fidelity) with optional SAM (spectral similarity).
+        - MSE ensures accurate reconstruction pixel-wise.
+        - SAM focuses on preserving spectral signatures, regardless of scale.
+        - The combination allows the model to balance spatial and spectral fidelity.
+        - The background loss is a soft penalty to encourage realistic background reconstruction without biasing the model toward padded regions.
         """
         losses = {}
 
@@ -668,7 +697,11 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
     @apply_forward_hook
     def encode(self, x: torch.Tensor, return_dict: bool = True) -> Union[AutoencoderKLOutput, Tuple]:
-        """Encode multispectral image to latent space."""
+        """Encode multispectral image to latent space.
+        
+        - Input adapter ensures compatibility with 5-channel plant data and robust handling of NaNs/Infs.
+        - Supports end-to-end scientific validity by aligning with the dataloader's mask/NaN handling.
+        """
         if hasattr(self, 'input_adapter'):
             # Convert 5 channels to 3 using input adapter
             x = self.input_adapter(x)
@@ -678,6 +711,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     @apply_forward_hook
     def decode(self, z):
         # Update: normalize handling of parent decode outputs to avoid tuple `.sample` errors
+        # Scientific Rationale: Ensures output is in the expected range and robust to intensity inversion, supporting valid interpretation.
         raw = super().decode(z, return_dict=True)
         # handle various return types from parent
         if isinstance(raw, dict):
@@ -688,6 +722,9 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             decoded = raw[0]
         else:
             decoded = raw
+        # Normalize output to [-1, 1] range to mitigate decoder inversion/intensity range mismatch
+        # Reason: inverted appearing pixel values across all bands in visual evaluation (1st testing, 1.7.)
+        decoded = torch.tanh(decoded)
         # apply adapter to raw decoded tensor for multispectral output
         return self.output_adapter(decoded)
 
@@ -704,6 +741,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         NOTE: This forward method avoids using AutoencoderKLOutput for decoding output, in compliance with Hugging Face's class definition.
         The previously encountered error ("AutoencoderKLOutput.__init__() got an unexpected keyword argument") has been resolved
         by ensuring decode() returns only raw tensors, not structured outputs.
+
+        - Logs statistics at each stage for scientific debugging and reproducibility.
         """
         # Input sample is adapted and encoded
         x = sample
