@@ -349,11 +349,11 @@ class SpectralAdapter(nn.Module):
         # Apply background mask: Set any NaNs to 0.0 (e.g., padding area)
         # This prevents downstream convolutional layers from propagating invalid values
         if torch.isnan(x).any():
-            logger.warning("[NaN DEBUG] NaNs found in adapter input, replacing with 0.0 (masked background).")
+            logger.debug("[NaN DEBUG] NaNs found in adapter input, replacing with 0.0 (masked background).")
         x = torch.nan_to_num(x, nan=0.0)
 
         # Log adapter input stats for NaN debugging
-        logger.info(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+        logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
 
         # Apply spectral attention if enabled
         if self.use_attention and hasattr(self, 'attention'):
@@ -374,8 +374,8 @@ class SpectralAdapter(nn.Module):
 
         # Log adapter output stats for NaN debugging
         if torch.isnan(x).any():
-            logger.warning("[NaN DEBUG] NaNs in SpectralAdapter output.")
-        logger.info(f"[NaN DEBUG] SpectralAdapter output stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+            logger.debug("[NaN DEBUG] NaNs in SpectralAdapter output.")
+        logger.debug(f"[NaN DEBUG] SpectralAdapter output stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
         return x
 
 # ------------------------------------------------------------
@@ -399,9 +399,9 @@ class InputAdapter(nn.Module):
 
         # NaN check: early debug to track if input adapter introduces invalid values
         if torch.isnan(x).any():
-            logger.warning("[NaN DEBUG] NaNs detected in InputAdapter output.")
+            logger.debug("[NaN DEBUG] NaNs detected in InputAdapter output.")
         if torch.isinf(x).any():
-            logger.warning("[NaN DEBUG] Infs detected in InputAdapter output.")
+            logger.debug("[NaN DEBUG] Infs detected in InputAdapter output.")
 
         # Optionally clamp to prevent propagation of small/large values
         x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -441,7 +441,7 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
     angle = torch.nan_to_num(angle, nan=0.0, posinf=0.0, neginf=0.0)
 
     if torch.isnan(angle).any():
-        logger.warning("NaNs detected in SAM angle computation.")
+        logger.debug("NaNs detected in SAM angle computation.")
 
     return angle.mean()
 
@@ -604,30 +604,26 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # - MSE ensures accurate reconstruction pixel-wise.
     # - SAM focuses on preserving spectral signatures, regardless of scale.
     # The combination allows the model to prioritize spectral realism, important in plant health analysis.
-    def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None, background_loss_weight: float = 0.1) -> Dict[str, torch.Tensor]:
-        """Compute various loss terms for training.
+    def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+        """Compute loss terms for multispectral autoencoder training.
 
-        This method computes both per-channel MSE loss and Spectral Angle Mapper (SAM)
-        loss to ensure both pixel-wise accuracy and spectral fidelity.
+        Computes per-channel MSE loss and optional Spectral Angle Mapper (SAM) loss
+        to ensure both pixel-wise accuracy and spectral fidelity.
 
-        This method expects that masking has already been applied by the caller for the main loss (i.e., only leaf regions).
-        If a mask is provided, a soft background loss is also computed and added to the total loss with a configurable weight.
+        Masking is optional and, if provided, should indicate the foreground (leaf) region only.
+        No background loss is computed.
 
         Args:
-            original: Original multispectral image (should be pre-masked for main loss)
-            reconstructed: Reconstructed multispectral image (should be pre-masked for main loss)
-            mask: Binary mask (1 for leaf, 0 for background), shape (B, 1, H, W)
-            background_loss_weight: Weight for the soft background loss (default 0.1)
+            original: Original multispectral image (should be pre-masked for main loss if desired)
+            reconstructed: Reconstructed multispectral image (should be pre-masked for main loss if desired)
+            mask: Optional binary mask (1 for leaf/foreground, 0 for background), shape (B, 1, H, W)
 
         Returns:
-            Dictionary containing different loss terms
-        
-        --------------------
-        - Combines per-channel MSE (spatial fidelity) with optional SAM (spectral similarity).
-        - MSE ensures accurate reconstruction pixel-wise.
-        - SAM focuses on preserving spectral signatures, regardless of scale.
-        - The combination allows the model to balance spatial and spectral fidelity.
-        - The background loss is a soft penalty to encourage realistic background reconstruction without biasing the model toward padded regions.
+            Dictionary containing different loss terms:
+                - 'mse_per_channel': Per-channel MSE (averaged over batch & spatial dims)
+                - 'mse': Mean MSE over all channels
+                - 'sam': (optional) Spectral Angle Mapper loss
+                - 'total_loss': Same as 'mse'
         """
         losses = {}
 
@@ -641,23 +637,10 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         if self.use_sam_loss:
             losses['sam'] = compute_sam_loss(original, reconstructed)
             if torch.isnan(losses['sam']):
-                logger.warning("[NaN DEBUG] SAM loss returned NaN")
+                logger.debug("[NaN DEBUG] SAM loss returned NaN")
 
-        # Soft background loss: encourage realistic background output
-        if mask is not None:
-            background_mask = 1 - mask  # 1 for background, 0 for leaf
-            # Compute background MSE only on background pixels
-            # Use original and reconstructed before masking (i.e., full tensors)
-            background_mse = F.mse_loss(
-                reconstructed * background_mask,
-                original * background_mask,
-                reduction='sum'
-            ) / (background_mask.sum() + 1e-8)
-            losses['background_mse'] = background_mse
-            # Add to total loss with configurable weight
-            losses['total_loss'] = losses['mse'] + background_loss_weight * background_mse
-        else:
-            losses['total_loss'] = losses['mse']
+        # No background loss; total_loss is simply mse
+        losses['total_loss'] = losses['mse']
 
         return losses
 
@@ -722,9 +705,10 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             decoded = raw[0]
         else:
             decoded = raw
-        # Normalize output to [-1, 1] range to mitigate decoder inversion/intensity range mismatch
-        # Reason: inverted appearing pixel values across all bands in visual evaluation (1st testing, 1.7.)
-        decoded = torch.tanh(decoded)
+        # Preserve [-1, 1] range for VAE compatibility - no clamping needed
+        # The decoder should naturally output in the expected range when input is properly normalized
+        # Clamping was a workaround for normalization mismatch, but proper [-1, 1] input fixes this
+        # decoded = decoded.clamp(min=-1.0, max=1.0)  # VAE expects [-1, 1] range
         # apply adapter to raw decoded tensor for multispectral output
         return self.output_adapter(decoded)
 
@@ -742,23 +726,23 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         The previously encountered error ("AutoencoderKLOutput.__init__() got an unexpected keyword argument") has been resolved
         by ensuring decode() returns only raw tensors, not structured outputs.
 
-        - Logs statistics at each stage for scientific debugging and reproducibility.
+        - Logs statistics at each stage for debugging and reproducibility.
         """
         # Input sample is adapted and encoded
         x = sample
 
         # Log: NaNs in input
         if torch.isnan(x).any():
-            logger.warning("[NaN DEBUG] NaNs detected in input")
+            logger.debug("[NaN DEBUG] NaNs detected in input")
 
         # Optional: Print input stats before any adapter/encoder to diagnose anomalies in early pipeline
-        logger.info(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+        logger.debug(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
 
         posterior = self.encode(x).latent_dist
 
         # Log: NaNs in posterior distribution
         if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
-            logger.warning("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
+            logger.debug("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
 
         # Choose whether to sample from posterior or use mode
         if sample_posterior:
@@ -768,25 +752,25 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
         # Log: NaNs in latent z
         if torch.isnan(z).any():
-            logger.warning("[NaN DEBUG] NaNs detected in latent z")
+            logger.debug("[NaN DEBUG] NaNs detected in latent z")
 
         # Decode to obtain reconstructed output
         decoded = self.decode(z)
 
         # Log: NaNs in reconstruction
         if torch.isnan(decoded).any():
-            logger.warning("[NaN DEBUG] NaNs detected in reconstruction")
+            logger.debug("[NaN DEBUG] NaNs detected in reconstruction")
 
         # Compute training losses if in training mode
         if self.training:
             losses = self.compute_losses(x, decoded)
             # Log: Loss debugging for NaNs or unusual values
             if torch.isnan(losses['mse']).any():
-                logger.warning("[NaN DEBUG] NaNs detected in MSE loss")
+                logger.debug("[NaN DEBUG] NaNs detected in MSE loss")
             if self.use_sam_loss and 'sam' in losses and torch.isnan(losses['sam']).any():
-                logger.warning("[NaN DEBUG] NaNs detected in SAM loss")
+                logger.debug("[NaN DEBUG] NaNs detected in SAM loss")
             if 'mse_per_channel' in losses:
-                logger.info(f"[DEBUG] Per-channel MSE stats — min: {losses['mse_per_channel'].min().item():.4f}, max: {losses['mse_per_channel'].max().item():.4f}")
+                logger.debug(f"[DEBUG] Per-channel MSE stats — min: {losses['mse_per_channel'].min().item():.4f}, max: {losses['mse_per_channel'].max().item():.4f}")
             return decoded, losses
 
         # In evaluation mode, return decoded output and None for losses

@@ -487,7 +487,7 @@ def train(args: argparse.Namespace) -> None:
         raise RuntimeError(f"Model loading failed: {e}")
 
     # NOTE: Unlike typical SD pipelines where model inputs are passed as dictionaries with keys like "pixel_values",
-    #       this training script uses direct tensor inputs. This works because our custom model accepts tensor input directly,
+    #       this training script uses direct tensor inputs. This works because the custom model accepts tensor input directly,
     #       but care must be taken when integrating with HuggingFace-style SD pipelines later.
     #       Direct tensor input simplifies the pipeline and ensures compatibility with custom dataloader and model, but may require adaptation for downstream SD integration.
 
@@ -588,11 +588,11 @@ def train(args: argparse.Namespace) -> None:
         for batch, mask in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training"):
             batch = batch.to(device)
             mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
-            # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+            # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
             # Conceptually preserve the NaN-based primary mask for calculating masked losses!
             # Ensures that only valid data is passed to the model, preventing NaN/infinity propagation
             batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
-            batch = torch.clamp(batch, min=0.0, max=1.0)
+            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
             # Forward pass with input tensor (not a dict) — valid due to model's custom __call__ signature.
             try:
@@ -633,7 +633,8 @@ def train(args: argparse.Namespace) -> None:
                 if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
                     logger.warning("Infs detected in batch or reconstruction input to compute_losses")
                 # Masked loss computation: Leaf regions (mask==1) get full weight; background (mask==0) is softly penalized
-                losses = model.compute_losses(batch, reconstruction, mask=mask, background_loss_weight=0.1)
+                # Pass mask only (no background_loss_weight argument to ensure compatibility with model)
+                losses = model.compute_losses(batch, reconstruction, mask=mask)
                 # Debugging: Check if losses is a dict
                 if not isinstance(losses, dict):
                     logger.error(f"compute_losses() returned non-dict: {type(losses)}")
@@ -704,9 +705,9 @@ def train(args: argparse.Namespace) -> None:
                 batch = batch.to(device)
                 mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
                 # (Removed debug logging for NaNs in validation batch)
-                # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+                # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
-                batch = torch.clamp(batch, min=0.0, max=1.0)
+                batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
                 # Forward pass
                 try:
@@ -739,8 +740,8 @@ def train(args: argparse.Namespace) -> None:
                     # Debugging: Check for Infs before loss computation (validation)
                     if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
                         logger.warning("Infs detected in batch or reconstruction input to compute_losses (validation)")
-                    # Validation: Compute masked loss with soft background penalty (10%) for consistency with training
-                    losses = model.compute_losses(batch, reconstruction, mask=mask, background_loss_weight=0.1)
+                    # Validation: Compute masked loss for consistency with training (no background_loss_weight argument)
+                    losses = model.compute_losses(batch, reconstruction, mask=mask)
                     # Debugging: Check if losses is a dict
                     if not isinstance(losses, dict):
                         logger.error(f"compute_losses() returned non-dict: {type(losses)}")
@@ -795,15 +796,14 @@ def train(args: argparse.Namespace) -> None:
                             masked_recon = recon_band * sample_mask
                             
                             # Compute SSIM only on the masked region
-                            # Note: skimage SSIM with mask parameter requires recent version
                             try:
-                                ssim_val = ssim(masked_orig, masked_recon, data_range=1.0, 
+                                ssim_val = ssim(masked_orig, masked_recon, data_range=2.0,  # [-1, 1] range = 2.0
                                               mask=sample_mask.astype(bool))
                             except TypeError:
                                 # Fallback: compute SSIM on entire image but this includes background
                                 # This is less accurate but ensures compatibility
                                 logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
-                                ssim_val = ssim(original_band, recon_band, data_range=1.0)
+                                ssim_val = ssim(original_band, recon_band, data_range=2.0)  # [-1, 1] range = 2.0
                             
                             band_ssim_total += ssim_val
                             valid_samples += 1
