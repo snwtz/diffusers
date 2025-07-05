@@ -14,8 +14,9 @@ Data Flow Summary:
 ------------------
 - Input: Preprocessed 5-channel plant images (from vae_multispectral_dataloader.py)
 - Model: Adapters map 5-channel input to 3-channel SD3 backbone, then back to 5-channel output
-- Output: Reconstructed 5-channel image, with losses computed for both spatial and spectral fidelity
-- Loss: Multi-objective (MSE + SAM), with mask-aware background handling
+- Output: Reconstructed 5-channel image with nonlinear transformations applied (unconstrained range)
+- Loss: Multi-objective (MSE + SAM), with pure leaf-focused masked loss computation
+- Output Format: Compatible with both training (raw tensor) and downstream pipelines (DecoderOutput)
 
 NOTE ON INPUT FORMAT:
 ---------------------
@@ -28,6 +29,8 @@ NOTE: This version includes defensive coding for numerical stability.
 - Applies nan/inf detection after transforming inputs.
 - Replaces NaNs/Infs with default clamped values to prevent decoder failures.
 - This is necessary due to observed NaNs early in the model pipeline, traced to potential data anomalies or instability.
+- IMPORTANT: The decoder output contains significant nonlinear transformations that may 
+produce values outside typical image ranges (range not constrained to [-1,1]).
 
 Thesis Context and Scientific Innovation:
 ---------------------------------------
@@ -40,8 +43,9 @@ Thesis Context and Scientific Innovation:
 2. Core Innovation:
    - Lightweight adapter architecture for 5-channel spectral data
    - Parameter-efficient fine-tuning strategy
-   - Spectral attention mechanism for interpretable band selection
+   - Spectral attention mechanism for interpretable band selection (nonlinear)
    - Dual loss function preserving both spatial and spectral fidelity
+   - Nonlinear transformations enabling complex spectral relationship learning
 
 3. Biological Relevance:
    The architecture processes 5 carefully selected bands from hyperspectral data:
@@ -56,13 +60,14 @@ Architectural Design Decisions:
 1. Adapter Architecture:
    a) SpectralAdapter:
       - 3×3 convolutions: Balance spatial feature modeling with efficiency
-      - GroupNorm: Stable training with small batch sizes typical in hyperspectral data
-      - SiLU activation: Gradient-friendly nonlinearity better suited than ReLU
-      - Three-layer design: Progressive feature extraction and channel adaptation
+      - GroupNorm: Stable training with small batch sizes typical in hyperspectral data (nonlinear normalization)
+      - SiLU activation: Gradient-friendly nonlinearity better suited than ReLU (nonlinear activation)
+      - Three-layer design: Progressive feature extraction and channel adaptation with nonlinear transformations
 
    b) SpectralAttention:
-      - 1×1 convolution: Learn band importance weights
-      - Sigmoid activation: Ensure interpretable [0,1] importance scores
+      - 1×1 convolution: Learn band importance weights (linear transformation)
+      - Sigmoid activation: Ensure interpretable [0,1] importance scores (nonlinear activation)
+      - Element-wise multiplication: Apply learned weights to input (nonlinear due to sigmoid weights)
       - Wavelength mapping: Enable scientific visualization of band contributions
 
 2. Loss Function Design:
@@ -73,7 +78,7 @@ Architectural Design Decisions:
 
    b) Spectral Angle Mapper (SAM) Loss:
       - Measures spectral similarity through vector angles
-      - Invariant to scaling, preserving spectral signatures
+      - Invariant to scaling, preserves spectral signatures
       - Weighted combination: loss = α * MSE + β * SAM
       - Configurable weights for balancing spatial vs. spectral fidelity
 
@@ -83,7 +88,13 @@ Architectural Design Decisions:
       - get_trainable_params(): Enable adapter-only training
       - Minimal trainable parameters (only adapter layers)
 
-   b) Flexible Configuration:
+   b) Pure Leaf-Focused Training:
+      - compute_losses(): Implements masked loss computation
+      - Excludes background regions from loss calculation
+      - Focuses training purely on biologically relevant leaf regions
+      - Provides mask coverage statistics for monitoring
+
+   c) Flexible Configuration:
       - adapter_placement: "input", "output", or "both"
       - Enables experimentation with different adaptation strategies
       - Supports ablation studies for thesis analysis
@@ -189,6 +200,10 @@ Usage:
 
     # Train only adapter layers
     optimizer = torch.optim.AdamW(vae.get_trainable_params(), lr=1e-4)
+    
+    # Note: Output range is unconstrained due to nonlinear transformations
+    # For downstream usage requiring [-1, 1] range, apply post-processing normalization
+    
 """
 
 # ------------------------------------------------------------
@@ -227,6 +242,7 @@ from ...configuration_utils import ConfigMixin, register_to_config
 from ...utils.accelerate_utils import apply_forward_hook
 from ..modeling_outputs import AutoencoderKLOutput
 from .autoencoder_kl import AutoencoderKL
+from .vae import DecoderOutput
 
 #
 # Design Rationale: Spectral Attention
@@ -242,18 +258,22 @@ class SpectralAttention(nn.Module):
     during the adaptation process. It helps the model focus on the most
     relevant bands for the task while maintaining spectral relationships.
     
-    Scientific Rationale (??):
-    --------------------
+    IMPORTANT: This module applies nonlinear transformations:
+    - 1×1 convolution (linear)
+    - Sigmoid activation (nonlinear: maps to [0,1] range)
+    - Element-wise multiplication with input (nonlinear due to sigmoid weights)
+    
     - Enables explainable AI attention weights can be visualized and mapped to wavelengths for scientific interpretability.
     - Supports plant science by highlighting diagnostically relevant bands.
+    - Nonlinear attention mechanism allows for complex band interaction modeling.
     """
 
     def __init__(self, num_bands: int):
         super().__init__()
         # Simple 1x1 convolution followed by sigmoid to learn band weights
         self.attention = nn.Sequential(
-            nn.Conv2d(num_bands, num_bands, kernel_size=1),
-            nn.Sigmoid()  # Ensure weights are between 0 and 1
+            nn.Conv2d(num_bands, num_bands, kernel_size=1),  # Linear transformation
+            nn.Sigmoid()  # Nonlinear activation: ensures weights are between 0 and 1
         )
 
         # Store wavelength information for interpretability
@@ -268,9 +288,9 @@ class SpectralAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x shape: (batch, channels, height, width)
-        # Compute attention weights for each band
+        # Compute attention weights for each band (nonlinear: conv + sigmoid)
         attention_weights = self.attention(x)
-        # Apply attention weights to input
+        # Apply attention weights to input (nonlinear: element-wise multiplication with sigmoid weights)
         return x * attention_weights
 
     def get_band_importance(self) -> Dict[float, float]:
@@ -296,9 +316,13 @@ class SpectralAttention(nn.Module):
 # format expected by the SD3 VAE. The input adapter maps 5→3 and output adapter maps 3→5.
 # We use:
 # - 3×3 convs for efficient spatial-spectral processing
-# - GroupNorm for stability with small batch sizes
-# - SiLU (Swish) activation for smoother gradients compared to ReLU
+# - GroupNorm for stability with small batch sizes (nonlinear normalization)
+# - SiLU (Swish) activation for smoother gradients compared to ReLU (nonlinear activation)
+# - Spectral attention with sigmoid for band weighting (nonlinear attention)
 # The adapters can be placed at input/output/both to allow ablation studies and flexibility.
+# 
+# IMPORTANT: The nonlinear transformations (SiLU, GroupNorm, sigmoid attention) mean that
+# the output range is not constrained to [-1, 1] and may require post-processing normalization.
 #
 class SpectralAdapter(nn.Module):
     """Adapter module for converting between 3 and 5 spectral channels.
@@ -308,10 +332,19 @@ class SpectralAdapter(nn.Module):
     It includes spectral attention and a series of convolutions to learn
     the optimal transformation while preserving spectral information.
     
+    IMPORTANT: This adapter applies significant nonlinear transformations:
+    - Spectral attention with sigmoid activation and element-wise multiplication
+    - Two convolutional blocks with SiLU activations and GroupNorm
+    - Final linear convolution without activation
+    
+    These nonlinearities mean the output range is NOT constrained and may require
+    post-processing normalization depending on downstream usage.
+    
     Scientific Rationale:
     --------------------
     - Bridges the gap between 5-channel plant data and 3-channel SD3 backbone (core methodological innovation).
     - NaN-masking is essential for preventing background artifacts from propagating through the network.
+    - Nonlinear transformations enable complex spectral relationships to be learned.
 
     """
     # NOTE: We assume that background pixels in padded multispectral input are encoded as NaN.
@@ -332,17 +365,17 @@ class SpectralAdapter(nn.Module):
             self.attention = SpectralAttention(num_bands)
 
         # Three-layer convolutional network for channel adaptation
-        # First two layers use 3x3 convolutions with group normalization
+        # First two layers use 3x3 convolutions with group normalization and nonlinear activation
         self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-        # Final layer uses 1x1 convolution for channel reduction/expansion
+        # Final layer uses 1x1 convolution for channel reduction/expansion (no activation)
         self.conv3 = nn.Conv2d(32, out_channels, kernel_size=1)
 
-        # Group normalization for better training stability
+        # Group normalization for better training stability (nonlinear normalization)
         self.norm1 = nn.GroupNorm(8, 32)
         self.norm2 = nn.GroupNorm(8, 32)
 
-        # SiLU activation (also known as Swish)
+        # SiLU activation (also known as Swish) - nonlinear activation function
         self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -355,21 +388,21 @@ class SpectralAdapter(nn.Module):
         # Log adapter input stats for NaN debugging
         logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
 
-        # Apply spectral attention if enabled
+        # Apply spectral attention if enabled (nonlinear: sigmoid + element-wise multiplication)
         if self.use_attention and hasattr(self, 'attention'):
             x = self.attention(x)
 
-        # First convolutional block
+        # First convolutional block (nonlinear: conv + GroupNorm + SiLU)
         x = self.conv1(x)
         x = self.norm1(x)
         x = self.activation(x)
 
-        # Second convolutional block
+        # Second convolutional block (nonlinear: conv + GroupNorm + SiLU)
         x = self.conv2(x)
         x = self.norm2(x)
         x = self.activation(x)
 
-        # Final channel adaptation
+        # Final channel adaptation (linear: conv only, no activation)
         x = self.conv3(x)
 
         # Log adapter output stats for NaN debugging
@@ -605,41 +638,112 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # - SAM focuses on preserving spectral signatures, regardless of scale.
     # The combination allows the model to prioritize spectral realism, important in plant health analysis.
     def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-        """Compute loss terms for multispectral autoencoder training.
+        """Compute masked loss terms for multispectral autoencoder training.
 
         Computes per-channel MSE loss and optional Spectral Angle Mapper (SAM) loss
-        to ensure both pixel-wise accuracy and spectral fidelity.
-
-        Masking is optional and, if provided, should indicate the foreground (leaf) region only.
-        No background loss is computed.
+        using binary masking to focus training purely on leaf regions, excluding background. 
+        This ensures both pixel-wise accuracy and spectral fidelity.
 
         Args:
-            original: Original multispectral image (should be pre-masked for main loss if desired)
-            reconstructed: Reconstructed multispectral image (should be pre-masked for main loss if desired)
-            mask: Optional binary mask (1 for leaf/foreground, 0 for background), shape (B, 1, H, W)
+            original: Original multispectral image, shape (B, 5, H, W)
+            reconstructed: Reconstructed multispectral image, shape (B, 5, H, W)
+            mask: Binary mask (1 for leaf/foreground, 0 for background), shape (B, 1, H, W)
+                 If None, computes loss over entire image
 
         Returns:
             Dictionary containing different loss terms:
-                - 'mse_per_channel': Per-channel MSE (averaged over batch & spatial dims)
-                - 'mse': Mean MSE over all channels
-                - 'sam': (optional) Spectral Angle Mapper loss
-                - 'total_loss': Same as 'mse'
+                - 'mse_per_channel': Per-channel MSE (masked, averaged over valid pixels)
+                - 'mse': Mean MSE over all channels (masked)
+                - 'sam': (optional) Spectral Angle Mapper loss (masked)
+                - 'total_loss': Combined loss (currently just MSE)
+                - 'mask_stats': Statistics about mask coverage for monitoring
         """
         losses = {}
+        
+        # Validate mask shape and prepare for broadcasting
+        if mask is not None:
+            # Ensure mask has correct shape for broadcasting with (B, 5, H, W)
+            if mask.shape[1] == 1:
+                # Expand mask from (B, 1, H, W) to (B, 5, H, W) for channel-wise masking
+                mask = mask.expand(-1, original.shape[1], -1, -1)
+            elif mask.shape[1] != original.shape[1]:
+                raise ValueError(f"Mask channels ({mask.shape[1]}) must be 1 or match input channels ({original.shape[1]})")
+            
+            # Ensure mask is binary (0 or 1)
+            mask = (mask > 0.5).float()
+            
+            # Log mask statistics for monitoring
+            mask_coverage = mask.mean().item()
+            losses['mask_stats'] = {
+                'coverage': mask_coverage,
+                'valid_pixels': mask.sum().item(),
+                'total_pixels': mask.numel()
+            }
+            
+            if mask_coverage < 0.01:
+                logger.warning(f"Very low mask coverage ({mask_coverage:.4f}), training may be unstable")
+            elif mask_coverage > 0.99:
+                logger.warning(f"Very high mask coverage ({mask_coverage:.4f}), consider if masking is necessary")
+        else:
+            # No mask provided - use full image (not recommended for plant data)
+            mask = torch.ones_like(original)
+            losses['mask_stats'] = {
+                'coverage': 1.0,
+                'valid_pixels': mask.numel(),
+                'total_pixels': mask.numel()
+            }
+            logger.warning("No mask provided - computing loss over entire image including background")
 
-        # Per-channel MSE loss for pixel-wise accuracy (main loss, leaf only)
-        mse_per_channel = F.mse_loss(reconstructed, original, reduction='none')
-        mse_per_channel = mse_per_channel.mean(dim=(0, 2, 3))  # Average over batch and spatial dimensions
+        # Apply mask to both original and reconstructed images
+        masked_original = original * mask
+        masked_reconstructed = reconstructed * mask
+
+        # Compute per-channel MSE loss with masking
+        # Use reduction='none' to get per-pixel losses, then apply mask
+        mse_per_pixel = F.mse_loss(masked_reconstructed, masked_original, reduction='none')
+        
+        # Average over masked regions only (excluding background)
+        if mask is not None:
+            # Sum over spatial dimensions, then divide by number of valid pixels per channel
+            mse_per_channel = (mse_per_pixel * mask).sum(dim=(0, 2, 3)) / (mask.sum(dim=(0, 2, 3)) + 1e-8)
+        else:
+            mse_per_channel = mse_per_pixel.mean(dim=(0, 2, 3))
+        
         losses['mse_per_channel'] = mse_per_channel
         losses['mse'] = mse_per_channel.mean()
 
-        # Spectral Angle Mapper loss for spectral fidelity (leaf only)
+        # Spectral Angle Mapper loss for spectral fidelity (masked)
         if self.use_sam_loss:
-            losses['sam'] = compute_sam_loss(original, reconstructed)
+            # Apply mask before computing SAM loss
+            if mask is not None:
+                # For SAM, we need to handle the case where some pixels have zero spectral magnitude
+                # after masking. We'll compute SAM only on pixels with sufficient spectral content.
+                spectral_magnitude = torch.norm(masked_original, dim=1, keepdim=True)  # (B, 1, H, W)
+                valid_spectral_mask = (spectral_magnitude > 1e-6) & (mask[:, :1, :, :] > 0.5)
+                
+                if valid_spectral_mask.sum() > 0:
+                    # Extract valid pixels for SAM computation
+                    valid_original = masked_original[valid_spectral_mask.expand_as(masked_original)]
+                    valid_reconstructed = masked_reconstructed[valid_spectral_mask.expand_as(masked_reconstructed)]
+                    
+                    # Reshape to (N, C) where N is number of valid pixels, C is channels
+                    valid_original = valid_original.view(-1, original.shape[1])
+                    valid_reconstructed = valid_reconstructed.view(-1, original.shape[1])
+                    
+                    # Compute SAM on valid pixels only
+                    losses['sam'] = compute_sam_loss(valid_original, valid_reconstructed)
+                else:
+                    # No valid spectral pixels, set SAM loss to zero
+                    losses['sam'] = torch.tensor(0.0, device=original.device, dtype=original.dtype)
+                    logger.warning("No valid spectral pixels found for SAM loss computation")
+            else:
+                # No mask provided, compute SAM on entire image
+                losses['sam'] = compute_sam_loss(original, reconstructed)
+            
             if torch.isnan(losses['sam']):
                 logger.debug("[NaN DEBUG] SAM loss returned NaN")
 
-        # No background loss; total_loss is simply mse
+        # Total loss (currently just MSE, but could be weighted combination)
         losses['total_loss'] = losses['mse']
 
         return losses
@@ -692,11 +796,60 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         return super().encode(x, return_dict=return_dict)
 
     @apply_forward_hook
-    def decode(self, z):
-        # Update: normalize handling of parent decode outputs to avoid tuple `.sample` errors
-        # Scientific Rationale: Ensures output is in the expected range and robust to intensity inversion, supporting valid interpretation.
+    def decode(self, z, return_dict: bool = True):
+        """
+    Decode latent representation to 5-channel multispectral image.
+
+    This override of `AutoencoderKL.decode` extracts the decoded tensor from the SD3 backbone 
+    before applying the output adapter. The result can be returned as either a raw tensor 
+    (for training compatibility) or a DecoderOutput object (for downstream pipeline compatibility).
+
+    RETURN_DICT VARIABILITY EXPLANATION:
+    ------------------------------------
+    The return_dict parameter enables compatibility with different usage patterns:
+    
+    1. return_dict=True (default): Returns DecoderOutput object
+       - Used by: HuggingFace pipelines, SD3 integration, downstream inference
+       - Access pattern: vae.decode(z).sample
+       - Examples: 
+         * StableDiffusionPipeline.decode_latents(): image = vae.decode(latents).sample
+         * CogVideoXSTGPipeline.decode_latents(): frames = vae.decode(latents).sample
+         * VAE roundtrip: rgb_nchw = VaeImageProcessor.denormalize(decoding_nchw.sample)
+    
+    2. return_dict=False: Returns raw tensor directly
+       - Used by: Training scripts, custom loss computation, direct tensor operations
+       - Access pattern: reconstruction = vae.decode(z, return_dict=False)
+       - Examples:
+         * Training loops: reconstruction = model.decode(z, return_dict=False)
+         * Loss computation: losses = model.compute_losses(batch, reconstruction)
+         * Legacy pipelines: image = vae.decode(latents, return_dict=False)[0]
+    
+    This dual interface ensures:
+    - Backward compatibility with existing training code
+    - Forward compatibility with HuggingFace pipeline ecosystem
+    - No breaking changes to downstream SD3 integration
+    - Consistent behavior with base AutoencoderKL.decode() method
+
+    IMPORTANT: The output adapter applies significant nonlinear transformations including:
+    - Spectral attention with sigmoid activation and element-wise multiplication
+    - Two convolutional blocks with SiLU activations and GroupNorm
+    - Final linear convolution
+    
+    These nonlinearities mean the output range is NOT constrained to [-1, 1] and may require
+    post-processing normalization depending on downstream usage.
+
+    Args:
+        z (torch.Tensor): Latent vector.
+        return_dict (bool): If True, returns DecoderOutput object. If False, returns raw tensor.
+
+    Returns:
+        Union[DecoderOutput, torch.Tensor]: Reconstructed 5-channel image with nonlinear transformations applied.
+                     Output range is not guaranteed to be [-1, 1] due to adapter nonlinearities.
+    """
+        # Get base decoder output
         raw = super().decode(z, return_dict=True)
-        # handle various return types from parent
+        
+        # Extract sample tensor
         if isinstance(raw, dict):
             decoded = raw["sample"]
         elif hasattr(raw, "sample"):
@@ -705,12 +858,17 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             decoded = raw[0]
         else:
             decoded = raw
-        # Preserve [-1, 1] range for VAE compatibility - no clamping needed
-        # The decoder should naturally output in the expected range when input is properly normalized
-        # Clamping was a workaround for normalization mismatch, but proper [-1, 1] input fixes this
-        # decoded = decoded.clamp(min=-1.0, max=1.0)  # VAE expects [-1, 1] range
-        # apply adapter to raw decoded tensor for multispectral output
-        return self.output_adapter(decoded)
+        
+        # Apply output adapter with nonlinear transformations
+        adapted_output = self.output_adapter(decoded)
+        
+        # Return format based on return_dict parameter
+        if return_dict:
+            # Return DecoderOutput for downstream pipeline compatibility
+            return DecoderOutput(sample=adapted_output)
+        else:
+            # Return raw tensor for training script compatibility
+            return adapted_output
 
     def forward(
         self,
@@ -718,15 +876,24 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         sample_posterior: bool = False,
         return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         """
-        Forward pass through the entire network.
+        Forward pass through the entire network with optional masking for leaf-focused training.
 
         NOTE: This forward method avoids using AutoencoderKLOutput for decoding output, in compliance with Hugging Face's class definition.
         The previously encountered error ("AutoencoderKLOutput.__init__() got an unexpected keyword argument") has been resolved
         by ensuring decode() returns only raw tensors, not structured outputs.
 
-        - Logs statistics at each stage for debugging and reproducibility.
+        Args:
+            sample: Input multispectral image, shape (B, 5, H, W)
+            sample_posterior: Whether to sample from posterior or use mode
+            return_dict: Whether to return structured output (for decode method)
+            generator: Random generator for sampling
+            mask: Optional binary mask for leaf regions, shape (B, 1, H, W)
+
+        Returns:
+            Tuple of (decoded_output, losses_dict) where losses_dict is None in eval mode
         """
         # Input sample is adapted and encoded
         x = sample
@@ -763,7 +930,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
         # Compute training losses if in training mode
         if self.training:
-            losses = self.compute_losses(x, decoded)
+            losses = self.compute_losses(x, decoded, mask)
             # Log: Loss debugging for NaNs or unusual values
             if torch.isnan(losses['mse']).any():
                 logger.debug("[NaN DEBUG] NaNs detected in MSE loss")
@@ -771,6 +938,12 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 logger.debug("[NaN DEBUG] NaNs detected in SAM loss")
             if 'mse_per_channel' in losses:
                 logger.debug(f"[DEBUG] Per-channel MSE stats — min: {losses['mse_per_channel'].min().item():.4f}, max: {losses['mse_per_channel'].max().item():.4f}")
+            
+            # Log mask statistics if available
+            if 'mask_stats' in losses:
+                stats = losses['mask_stats']
+                logger.debug(f"[DEBUG] Mask stats — coverage: {stats['coverage']:.4f}, valid_pixels: {stats['valid_pixels']}/{stats['total_pixels']}")
+            
             return decoded, losses
 
         # In evaluation mode, return decoded output and None for losses

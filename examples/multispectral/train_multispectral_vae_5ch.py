@@ -190,7 +190,7 @@ def setup_logging(args):
 
     return logger
 
-def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args):
+def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats=None):
     # Logs all relevant metrics for scientific reporting and experiment tracking
     logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
     logger.info("Training Metrics:")
@@ -212,6 +212,35 @@ def log_training_metrics(logger, epoch, train_losses, val_losses, band_importanc
     logger.info("Band Importance:")
     for band, importance in band_importance.items():
         logger.info(f"  {band}: {importance:.4f}")
+    
+    # Log mask statistics if available
+    if 'mask_stats' in train_losses:
+        train_mask_stats = train_losses['mask_stats']
+        logger.info("Training Mask Statistics:")
+        logger.info(f"  Coverage: {train_mask_stats['coverage']:.4f}")
+        logger.info(f"  Valid pixels: {train_mask_stats['valid_pixels']}/{train_mask_stats['total_pixels']}")
+    
+    if 'mask_stats' in val_losses:
+        val_mask_stats = val_losses['mask_stats']
+        logger.info("Validation Mask Statistics:")
+        logger.info(f"  Coverage: {val_mask_stats['coverage']:.4f}")
+        logger.info(f"  Valid pixels: {val_mask_stats['valid_pixels']}/{val_mask_stats['total_pixels']}")
+    
+    # Log output range statistics if provided
+    if output_range_stats:
+        logger.info("Output Range Statistics:")
+        logger.info(f"  Global min: {output_range_stats['global_min']:.4f}")
+        logger.info(f"  Global max: {output_range_stats['global_max']:.4f}")
+        logger.info(f"  Global mean: {output_range_stats['global_mean']:.4f}")
+        logger.info(f"  Global std: {output_range_stats['global_std']:.4f}")
+        logger.info("  Per-band ranges:")
+        for i, (min_val, max_val, mean_val, std_val) in enumerate(output_range_stats['per_band']):
+            logger.info(f"    Band {i+1}: [{min_val:.4f}, {max_val:.4f}] mean={mean_val:.4f} std={std_val:.4f}")
+        
+        # Warn if output range is significantly different from expected [-1, 1]
+        if output_range_stats['global_min'] < -2.0 or output_range_stats['global_max'] > 2.0:
+            logger.warning(f"Output range [{output_range_stats['global_min']:.4f}, {output_range_stats['global_max']:.4f}] "
+                          f"is outside expected [-1, 1] range. Consider adjusting SSIM data_range parameter.")
 
 def setup_wandb(args):
     # Initializes Weights & Biases for experiment tracking and reproducibility
@@ -229,9 +258,9 @@ def setup_wandb(args):
         }
     )
 
-def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction):
+def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, output_range_stats=None):
     # Logs metrics and sample images to Weights & Biases for visualization and analysis
-    wandb.log({
+    wandb_log_data = {
         "epoch": epoch,
         "train_total_loss": train_losses.get('total_loss', float('nan')),
         "val_total_loss": val_losses.get('total_loss', float('nan')),
@@ -242,7 +271,46 @@ def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, recons
         # "reconstructed_images": wandb.Image(reconstruction[0])
         "original_images_band0": wandb.Image(batch[0][0:1]),  # First channel as grayscale
         "reconstructed_images_band0": wandb.Image(reconstruction[0][0:1])
-    })
+    }
+    
+    # Add mask statistics if available
+    if 'mask_stats' in train_losses:
+        train_mask_stats = train_losses['mask_stats']
+        wandb_log_data.update({
+            "mask/train_coverage": train_mask_stats['coverage'],
+            "mask/train_valid_pixels": train_mask_stats['valid_pixels'],
+            "mask/train_total_pixels": train_mask_stats['total_pixels']
+        })
+    
+    if 'mask_stats' in val_losses:
+        val_mask_stats = val_losses['mask_stats']
+        wandb_log_data.update({
+            "mask/val_coverage": val_mask_stats['coverage'],
+            "mask/val_valid_pixels": val_mask_stats['valid_pixels'],
+            "mask/val_total_pixels": val_mask_stats['total_pixels']
+        })
+    
+    # Add output range statistics if available
+    if output_range_stats:
+        wandb_log_data.update({
+            "output_range/global_min": output_range_stats['global_min'],
+            "output_range/global_max": output_range_stats['global_max'],
+            "output_range/global_mean": output_range_stats['global_mean'],
+            "output_range/global_std": output_range_stats['global_std'],
+            "output_range/warning": output_range_stats['range_warning']
+        })
+        
+        # Add per-band range statistics
+        for i, (min_val, max_val, mean_val, std_val) in enumerate(output_range_stats['per_band']):
+            wandb_log_data.update({
+                f"output_range/band_{i}_min": min_val,
+                f"output_range/band_{i}_max": max_val,
+                f"output_range/band_{i}_mean": mean_val,
+                f"output_range/band_{i}_std": std_val,
+            })
+    
+    wandb.log(wandb_log_data)
+    
     if 'sam' in train_losses and 'sam' in val_losses:
         wandb.log({
             "train_sam_loss": train_losses['sam'],
@@ -310,6 +378,80 @@ def log_parameter_counts(model, logger, wandb_log=True):
             "model/total_params": param_counts['total'],
             "model/trainable_percentage": param_counts['trainable_percentage']
         })
+
+def compute_output_range_stats(reconstruction_batch: torch.Tensor) -> dict:
+    """
+    Compute comprehensive statistics about the output range of the VAE decoder.
+    
+    This function helps monitor the actual output range during training to:
+    1. Detect if outputs are within expected [-1, 1] range
+    2. Identify per-band range variations
+    3. Provide guidance for SSIM data_range parameter adjustment
+    4. Monitor for potential numerical instability
+    
+    POTENTIAL RUNTIME ISSUES AND SOLUTIONS:
+    --------------------------------------
+    1. Output Range Mismatch:
+       - Issue: Adapter nonlinearities produce outputs outside [-1, 1] range
+       - Impact: SSIM computation assumes [-1, 1] range (data_range=2.0)
+       - Solution: Monitor actual range and adjust SSIM data_range parameter
+       - Detection: This function provides range statistics and warnings
+    
+    2. Numerical Instability:
+       - Issue: Very large or small values from nonlinear transformations
+       - Impact: Loss computation, gradient explosion, training instability
+       - Solution: Monitor global min/max and add gradient clipping
+       - Detection: range_warning flag when values outside [-2, 2]
+    
+    3. Per-band Range Variations:
+       - Issue: Different spectral bands may have different output ranges
+       - Impact: Inconsistent loss scaling across bands
+       - Solution: Monitor per-band statistics and consider band-specific normalization
+       - Detection: Per-band min/max/mean/std statistics
+    
+    4. SSIM Parameter Adjustment:
+       - Issue: SSIM data_range parameter mismatch with actual output range
+       - Impact: Incorrect SSIM scores, misleading validation metrics
+       - Solution: Use actual output range to compute data_range parameter
+       - Detection: Compare actual range with assumed [-1, 1] range
+    
+    Args:
+        reconstruction_batch: Tensor of shape (B, C, H, W) from VAE decoder
+        
+    Returns:
+        Dictionary containing range statistics:
+        - global_min/max/mean/std: Overall statistics across all bands
+        - per_band: List of (min, max, mean, std) for each band
+        - range_warning: Boolean indicating if range is outside [-2, 2]
+    """
+    with torch.no_grad():
+        # Global statistics across all bands
+        global_min = reconstruction_batch.min().item()
+        global_max = reconstruction_batch.max().item()
+        global_mean = reconstruction_batch.mean().item()
+        global_std = reconstruction_batch.std().item()
+        
+        # Per-band statistics
+        per_band_stats = []
+        for band_idx in range(reconstruction_batch.shape[1]):
+            band_data = reconstruction_batch[:, band_idx]
+            band_min = band_data.min().item()
+            band_max = band_data.max().item()
+            band_mean = band_data.mean().item()
+            band_std = band_data.std().item()
+            per_band_stats.append((band_min, band_max, band_mean, band_std))
+        
+        # Check for range warnings
+        range_warning = global_min < -2.0 or global_max > 2.0
+        
+        return {
+            'global_min': global_min,
+            'global_max': global_max,
+            'global_mean': global_mean,
+            'global_std': global_std,
+            'per_band': per_band_stats,
+            'range_warning': range_warning
+        }
 
 def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     """
@@ -594,57 +736,24 @@ def train(args: argparse.Namespace) -> None:
             batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
             batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
-            # Forward pass with input tensor (not a dict) — valid due to model's custom __call__ signature.
+            # Forward pass with mask support for leaf-focused training
             try:
-                # --- Begin NaN-sanitization in VAE forward ---
-                # Custom forward: expose encode() and decode() for NaN checks
-                posterior = model.encode(batch).latent_dist
-                # Check and sanitize posterior mean and logvar to prevent NaNs propagating into latent sample
-                if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
-                    logger.warning("NaNs detected in posterior mean/logvar after encode")
-                posterior.mean = torch.nan_to_num(posterior.mean, nan=0.0)
-                posterior.logvar = torch.nan_to_num(posterior.logvar, nan=0.0)
-                z = posterior.sample()
-                # Check and sanitize latent z before decoding
-                if torch.isnan(z).any():
-                    logger.warning("NaNs detected in latent sample z")
-                z = torch.nan_to_num(z, nan=0.0)
-                reconstruction = model.decode(z)
-                # Check for NaNs in reconstruction and skip loss computation if corrupted
+                # Use the model's forward method which now supports mask parameter
+                # This automatically handles encoding, decoding, and masked loss computation
+                reconstruction, losses = model.forward(sample=batch, mask=mask)
+                
+                # Check for NaNs in reconstruction and skip if corrupted
                 if torch.isnan(reconstruction).any():
-                    logger.warning("NaNs detected in reconstruction — skipping loss")
+                    logger.warning("NaNs detected in reconstruction — skipping batch")
                     continue
-                # --- End NaN-sanitization in VAE forward ---
+                    
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
                 continue
 
-            # NaN-check inserted to prevent invalid loss calculations due to corrupted model output or inputs.
-            if torch.isnan(batch).any() or torch.isnan(reconstruction).any():
-                logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
-                continue  # Skip this batch to avoid NaN loss
-
-            # CRITICAL: Pass the mask into compute_losses to handle background masking internally.
-            # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
-            # such as background bounding box artifacts. Background is optionally included via a soft penalty.
-            # Scientific Rationale: Mask propagation ensures that the model focuses on biologically relevant regions (leaves), supporting the scientific goal of leaf-focused learning and spectral fidelity.
-            try:
-                # Debugging: Check for Infs before loss computation
-                if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
-                    logger.warning("Infs detected in batch or reconstruction input to compute_losses")
-                # Masked loss computation: Leaf regions (mask==1) get full weight; background (mask==0) is softly penalized
-                # Pass mask only (no background_loss_weight argument to ensure compatibility with model)
-                losses = model.compute_losses(batch, reconstruction, mask=mask)
-                # Debugging: Check if losses is a dict
-                if not isinstance(losses, dict):
-                    logger.error(f"compute_losses() returned non-dict: {type(losses)}")
-            except Exception as e:
-                logger.error(
-                    f"Loss computation failed: {e}\n"
-                    f"  batch shape: {batch.shape}\n"
-                    f"  reconstruction shape: {getattr(reconstruction, 'shape', 'n/a')}\n"
-                    f"  mask shape: {mask.shape} | mask sum: {mask.sum().item()}"
-                )
+            # Validate losses structure
+            if not isinstance(losses, dict):
+                logger.error(f"Model forward() returned non-dict losses: {type(losses)}")
                 continue
 
             # Calculate total loss with proper validation
@@ -683,13 +792,21 @@ def train(args: argparse.Namespace) -> None:
             # Improves model stability
             ema_model.step(model.parameters())
 
-            # Track losses
-            # Monitors training progress
+            # Track losses and mask statistics
+            # Monitors training progress and mask coverage
+            # TODO: dynamic data_range adjustment based on output_range_stats
+            # (assumes [-1, 1] range – might produce incorrect SSIM scores if output range differs)
             train_losses['total_loss'] += total_loss.item()
             if 'mse_per_channel' in losses:
                 train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
             if args.use_sam_loss and 'sam' in losses:
                 train_losses['sam_loss'] += losses['sam'].item()
+            
+            # Log mask statistics if available
+            if 'mask_stats' in losses:
+                mask_coverage = losses['mask_stats']['coverage']
+                if mask_coverage < 0.1:  # Log warning for very low coverage
+                    logger.warning(f"Low mask coverage in training batch: {mask_coverage:.4f}")
 
         # Validation phase
         model.eval()
@@ -701,6 +818,7 @@ def train(args: argparse.Namespace) -> None:
 
         with torch.no_grad():
             ssim_per_band = []  # To accumulate average SSIM per band over all batches
+            output_range_stats = None  # To collect output range statistics
             for batch, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
                 batch = batch.to(device)
                 mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
@@ -709,49 +827,27 @@ def train(args: argparse.Namespace) -> None:
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
                 batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
-                # Forward pass
+                # Forward pass with mask support for validation
                 try:
-                    # --- Begin NaN-sanitization in VAE forward (validation) ---
-                    posterior = model.encode(batch).latent_dist
-                    # Check and sanitize posterior mean and logvar to prevent NaNs propagating into latent sample
-                    if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
-                        logger.warning("NaNs detected in posterior mean/logvar after encode")
-                    posterior.mean = torch.nan_to_num(posterior.mean, nan=0.0)
-                    posterior.logvar = torch.nan_to_num(posterior.logvar, nan=0.0)
-                    z = posterior.sample()
-                    # Check and sanitize latent z before decoding
-                    if torch.isnan(z).any():
-                        logger.warning("NaNs detected in latent sample z")
-                    z = torch.nan_to_num(z, nan=0.0)
-                    reconstruction = model.decode(z)
-                    # Check for NaNs in reconstruction and skip loss computation if corrupted
+                    # Use the model's forward method which now supports mask parameter
+                    # This automatically handles encoding, decoding, and masked loss computation
+                    reconstruction, losses = model.forward(sample=batch, mask=mask)
+                    
+                    # Check for NaNs in reconstruction and skip if corrupted
                     if torch.isnan(reconstruction).any():
-                        logger.warning("NaNs detected in reconstruction — skipping loss")
+                        logger.warning("NaNs detected in reconstruction — skipping validation batch")
                         continue
-                    # --- End NaN-sanitization in VAE forward (validation) ---
+                        
                 except Exception as e:
                     logger.error(f"Validation forward pass failed: {e}")
                     continue
 
-                # CRITICAL: Pass the mask into compute_losses to handle background masking internally.
+                # Pass the mask into compute_losses to handle background masking internally.
                 # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
                 # such as background bounding box artifacts. Background is optionally included via a soft penalty.
-                try:
-                    # Debugging: Check for Infs before loss computation (validation)
-                    if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
-                        logger.warning("Infs detected in batch or reconstruction input to compute_losses (validation)")
-                    # Validation: Compute masked loss for consistency with training (no background_loss_weight argument)
-                    losses = model.compute_losses(batch, reconstruction, mask=mask)
-                    # Debugging: Check if losses is a dict
-                    if not isinstance(losses, dict):
-                        logger.error(f"compute_losses() returned non-dict: {type(losses)}")
-                except Exception as e:
-                    logger.error(
-                        f"Validation loss computation failed: {e}\n"
-                        f"  batch shape: {batch.shape}\n"
-                        f"  reconstruction shape: {getattr(reconstruction, 'shape', 'n/a')}\n"
-                        f"  mask shape: {mask.shape} | mask sum: {mask.sum().item()}"
-                    )
+                # Validate losses structure
+                if not isinstance(losses, dict):
+                    logger.error(f"Model forward() returned non-dict losses: {type(losses)}")
                     continue
 
                 # Calculate total loss
@@ -796,7 +892,12 @@ def train(args: argparse.Namespace) -> None:
                             masked_recon = recon_band * sample_mask
                             
                             # Compute SSIM only on the masked region
+                            # NOTE: SSIM computation assumes [-1, 1] range, but adapter output may be unconstrained
+                            # The data_range parameter should be adjusted based on actual output range
+                            # TODO: Consider dynamic data_range adjustment based on output_range_stats
                             try:
+                                # Use fixed data_range for now, but consider dynamic adjustment
+                                # data_range = output_range_stats['global_max'] - output_range_stats['global_min'] if output_range_stats else 2.0
                                 ssim_val = ssim(masked_orig, masked_recon, data_range=2.0,  # [-1, 1] range = 2.0
                                               mask=sample_mask.astype(bool))
                             except TypeError:
@@ -820,13 +921,24 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
 
-                # Track losses
-                # Monitors validation performance
+                # Track losses and mask statistics
+                # Monitors validation performance and mask coverage
                 val_losses['total_loss'] += total_loss.item()
                 if 'mse_per_channel' in losses:
                     val_losses['mse_per_channel'] += losses['mse_per_channel']
                 if args.use_sam_loss and 'sam' in losses:
                     val_losses['sam_loss'] += losses['sam'].item()
+                
+                # Log mask statistics if available
+                if 'mask_stats' in losses:
+                    mask_coverage = losses['mask_stats']['coverage']
+                    if mask_coverage < 0.1:  # Log warning for very low coverage
+                        logger.warning(f"Low mask coverage in validation batch: {mask_coverage:.4f}")
+                
+                # Collect output range statistics (use first batch for efficiency)
+                if output_range_stats is None:
+                    output_range_stats = compute_output_range_stats(reconstruction)
+                    
             # After validation loop, average ssim_per_band over number of batches
             if len(val_loader) > 0:
                 ssim_per_band = [v / len(val_loader) for v in ssim_per_band]
@@ -860,9 +972,9 @@ def train(args: argparse.Namespace) -> None:
 
         # Log metrics
         # Tracks training progress
-        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args)
+        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats)
         try:
-            log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
+            log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, output_range_stats)
         except Exception as e:
             logger.warning(f"Failed to log to wandb: {e}")
 

@@ -113,7 +113,7 @@ class AutoencoderKLMultispectral5ChTests(unittest.TestCase):
             self.assertEqual(z.shape, (batch_size, 4, 8, 8))
             
             # Test decode
-            reconstruction = model.decode(z).sample
+            reconstruction = model.decode(z, return_dict=True).sample
             logger.info(f"Reconstruction shape: {reconstruction.shape}")
             
             # Verify output dimensions

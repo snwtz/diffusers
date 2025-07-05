@@ -25,9 +25,8 @@ Implementation Notes:
    - No background inpainting or interpolation
 
    The loss function:
-	•	Applies full loss (100%) on leaf regions (mask == 1).
-	•	Applies soft loss (10%) on background (mask == 0).
-	•	Assumption that NaN = background, preserves the gradient flow without biasing toward padded edges.
+    • Applies full loss (100%) on leaf regions (mask == 1).
+    • Applies no loss (0%) on background (mask == 0), as cut-out images contain no true background. Padding is excluded from loss via masking.
 
 2. Data Processing:
    The training pipeline handles 5 biologically relevant spectral bands:
@@ -75,8 +74,7 @@ class VAEMultispectralDataset(Dataset):
     2. Background Handling:
        - NaN values represent background (cut-out regions)
        - Generates binary mask (1 for leaf, 0 for background)
-       - Masks out background during training
-       - Focuses model capacity on leaf features
+       - Background is excluded from loss computation (mask == 0); only leaf regions contribute to learning.
 
     3. Normalization:
        - Per-channel normalization to [-1, 1] range
@@ -229,7 +227,7 @@ class VAEMultispectralDataset(Dataset):
 
         2. Background Handling:
            - NaN values represent background
-           - Preserves NaN values in output until after normalization (essential for correct mask generation and loss computation)
+           - Preserves NaN values for accurate mask generation; background is not learned by the model.
            - No background inpainting
            - Focuses on leaf features
         """
@@ -237,8 +235,8 @@ class VAEMultispectralDataset(Dataset):
         valid_mask = ~np.isnan(channel_data)
 
         # Log per-channel NaN and stats before normalization
-        if np.isnan(channel_data).any():
-            logger.warning(f"[Normalize] NaNs found before normalization — min: {np.nanmin(channel_data):.4f}, max: {np.nanmax(channel_data):.4f}, mean: {np.nanmean(channel_data):.4f}")
+        # if np.isnan(channel_data).any():
+        #     logger.warning(f"[Normalize] NaNs found before normalization — min: {np.nanmin(channel_data):.4f}, max: {np.nanmax(channel_data):.4f}, mean: {np.nanmean(channel_data):.4f}")
 
         if not np.any(valid_mask):
             logger.warning("Channel contains only NaN values (background). Returning NaN array.")
@@ -262,6 +260,8 @@ class VAEMultispectralDataset(Dataset):
 
         # Modified padding logic to use the same per-band mean value as the normalization baseline, 
         # ensuring that padded background areas resemble the distribution of valid leaf surroundings
+        # 2.7.: bounding box artifact persists. Filling with mean should avoid bounding box artifacts as long as per_band_means is 
+        # computed only on foreground (leaf) pixels! BUT image contains very little leaf area, so maybe the mean may not be suitable
     def pad_to_square(self, img: torch.Tensor, fill_value: float = None) -> torch.Tensor:
         """
         Pad a (C, H, W) tensor to a square shape (C, S, S) with the given fill value.
@@ -312,7 +312,7 @@ class VAEMultispectralDataset(Dataset):
         2. Background Handling:
            - NaN values represent background
            - Generates binary mask (1 for leaf, 0 for background)
-           - Masks out background during training
+           - Background (cut-out or padding) excluded from training entirely; loss is masked to focus on leaf pixels only.
            - Optional mask return for loss computation
 
         3. Data Flow:
@@ -329,8 +329,8 @@ class VAEMultispectralDataset(Dataset):
                 image = src.read(self.REQUIRED_BANDS)  # Shape: (5, height, width)
 
                 # Log raw band values for NaN and stats
-                if np.isnan(image).any():
-                    logger.warning(f"[Preprocess] NaNs detected in raw image BEFORE normalization — shape: {image.shape}, min: {np.nanmin(image):.4f}, max: {np.nanmax(image):.4f}, mean: {np.nanmean(image):.4f}")
+                # if np.isnan(image).any():
+                #     logger.warning(f"[Preprocess] NaNs detected in raw image BEFORE normalization — shape: {image.shape}, min: {np.nanmin(image):.4f}, max: {np.nanmax(image):.4f}, mean: {np.nanmean(image):.4f}")
 
                 # Generate background mask from NaN values
                 # Use first band to create mask (all bands should have same NaN pattern)
@@ -391,6 +391,11 @@ class VAEMultispectralDataset(Dataset):
                         size=(self.resolution, self.resolution),
                         mode='nearest'
                     ).squeeze(0)
+
+                # All non-leaf (background) regions are zeroed out after resizing.
+                # This avoids any contribution from padding or masked areas during training, as background has zero importance.
+                # Explicitly zero out background regions (non-leaf) after resizing
+                image_tensor = image_tensor * mask_tensor
 
                 if self.return_mask:
                     return image_tensor, mask_tensor
@@ -495,7 +500,7 @@ def create_vae_dataloaders(
        - Creates both train and val dataloaders
        - Ensures consistent configuration
        - Optimizes for GPU training
-       - Handles background masking
+       - Handles background masking (background is excluded from training)
 
     2. DataLoader Configuration:
        - pin_memory=True for faster GPU transfer (critical for large-scale VAE training)
