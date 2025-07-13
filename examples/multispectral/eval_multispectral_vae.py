@@ -19,8 +19,12 @@ import seaborn as sns
 from pathlib import Path
 from tqdm import tqdm
 import json
+import warnings
+from rasterio.errors import NotGeoreferencedWarning
+warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
 
-from diffusers import AutoencoderKLMultispectralAdapter
+from diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter as AutoencoderKL
+# from diffusers import AutoencoderKLMultispectralAdapter
 from vae_multispectral_dataloader import VAEMultispectralDataset
 from torch.utils.data import DataLoader
 
@@ -434,7 +438,7 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = AutoencoderKLMultispectralAdapter.from_pretrained(args.model_dir)
+    model = AutoencoderKL.from_pretrained(args.model_dir)
     model = model.to(device)
     model.eval()
 
@@ -467,10 +471,15 @@ def main():
         mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
         
         with torch.no_grad():
-            recon, _ = model(batch)  # Model returns (reconstruction, losses), we only need reconstruction
-        
+            recon, _ = model(batch)
+            # Extract tensor from DecoderOutput
+            if hasattr(recon, "sample"):
+                decoded_tensor = recon.sample
+            else:
+                decoded_tensor = recon
+
         orig_np = batch.cpu().numpy()
-        recon_np = recon.cpu().numpy()
+        recon_np = decoded_tensor.cpu().numpy()
         mask_np = mask.cpu().numpy()
         
         # Visualize

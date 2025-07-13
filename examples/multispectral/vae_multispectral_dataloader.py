@@ -205,6 +205,7 @@ class VAEMultispectralDataset(Dataset):
             except Exception as e:
                 raise ValueError(f"Unexpected error validating {path}: {str(e)}")
 
+    # computing per-band min/max from the full band, not just from foreground-only pixels
     def normalize_channel(self, channel_data: np.ndarray) -> np.ndarray:
         """
         Per-channel normalization to [-1, 1] range for VAE compatibility.

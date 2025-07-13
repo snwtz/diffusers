@@ -6,6 +6,11 @@ a lightweight adapter-based multispectral VAE architecture. It serves as the pre
 for integrating a custom VAE into the Stable Diffusion 3 + DreamBooth pipeline for generating
 synthetic multispectral plant imagery.
 
+IMPORTANT: This script is configured to use 16 latent channels (matching AutoencoderKL/HF/SD3(??) default),
+which provides more capacity to encode multispectral information compared to the standard 4 channels.
+This is beneficial for multispectral data as it allows the model to preserve more spectral detail
+while maintaining compatibility with the SD3 transformer architecture.
+
 Data Flow Summary:
 ------------------
 - Input: Preprocessed 5-channel plant images and masks (from vae_multispectral_dataloader.py)
@@ -145,6 +150,8 @@ This approach bypasses issues with conflicting `from_pretrained` calls and allow
 """
 
 import os
+import torchvision.utils as vutils
+from PIL import Image
 import argparse
 from pathlib import Path
 import torch
@@ -612,6 +619,9 @@ def train(args: argparse.Namespace) -> None:
     logger = setup_logging(args)
     setup_wandb(args)
     logger.info(f"Starting multispectral VAE training with output directory: {args.output_dir}")
+    # Setup persistent directory for saving image samples
+    image_output_dir = os.path.join(args.output_dir, "image_samples")
+    os.makedirs(image_output_dir, exist_ok=True)
 
     # Load base SD3 VAE weights and inject fresh multispectral adapters
     try:
@@ -621,9 +631,20 @@ def train(args: argparse.Namespace) -> None:
             subfolder=args.subfolder,
             adapter_placement=args.adapter_placement,
             use_spectral_attention=args.use_spectral_attention,
-            use_sam_loss=args.use_sam_loss
+            use_sam_loss=args.use_sam_loss,
+            in_channels=5,  # Force 5 channels for multispectral input
+            out_channels=5   # Force 5 channels for multispectral output
         )
         logger.info("Successfully loaded base model")
+        
+        # Log the configuration to verify it's set correctly
+        logger.info(f"VAE Configuration:")
+        logger.info(f"  - in_channels: {model.config.in_channels}")
+        logger.info(f"  - out_channels: {model.config.out_channels}")
+        logger.info(f"  - latent_channels: {model.config.latent_channels}")
+        logger.info(f"  - adapter_placement: {model.adapter_placement}")
+        logger.info(f"  - use_spectral_attention: {model.use_spectral_attention}")
+        
     except Exception as e:
         logger.error(f"Failed to load base model: {e}")
         raise RuntimeError(f"Model loading failed: {e}")
@@ -718,6 +739,7 @@ def train(args: argparse.Namespace) -> None:
     total_epochs_to_train = args.num_epochs - start_epoch
     logger.info(f"Training for {total_epochs_to_train} epochs (from epoch {start_epoch} to {args.num_epochs-1})")
     
+    log_interval = 10  # Log every 10 steps (can make configurable)
     for epoch in range(start_epoch, args.num_epochs):
         model.train()
         train_losses = {
@@ -727,7 +749,7 @@ def train(args: argparse.Namespace) -> None:
         }
 
         # Training phase
-        for batch, mask in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training"):
+        for step, (batch, mask) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training")):
             batch = batch.to(device)
             mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
             # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
@@ -741,12 +763,12 @@ def train(args: argparse.Namespace) -> None:
                 # Use the model's forward method which now supports mask parameter
                 # This automatically handles encoding, decoding, and masked loss computation
                 reconstruction, losses = model.forward(sample=batch, mask=mask)
-                
+
                 # Check for NaNs in reconstruction and skip if corrupted
                 if torch.isnan(reconstruction).any():
                     logger.warning("NaNs detected in reconstruction — skipping batch")
                     continue
-                    
+
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
                 continue
@@ -765,9 +787,16 @@ def train(args: argparse.Namespace) -> None:
             total_loss = losses['mse']
             if args.use_sam_loss and 'sam' in losses:
                 total_loss = total_loss + args.sam_weight * losses['sam']
-            # Debugging: Check for NaN in total loss
-            if torch.isnan(total_loss):
-                logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
+            # Debugging: Check for NaN/Inf in total loss before backward
+            if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+                logger.warning("Detected NaN/Inf loss; skipping this batch.")
+                continue
+
+            # Log decoder output range every log_interval steps
+            if step % log_interval == 0:
+                min_val = reconstruction.min().item()
+                max_val = reconstruction.max().item()
+                logger.info(f"Decoder output range: min={min_val:.4f}, max={max_val:.4f}")
 
             # Backward pass
             optimizer.zero_grad()
@@ -801,7 +830,7 @@ def train(args: argparse.Namespace) -> None:
                 train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
             if args.use_sam_loss and 'sam' in losses:
                 train_losses['sam_loss'] += losses['sam'].item()
-            
+
             # Log mask statistics if available
             if 'mask_stats' in losses:
                 mask_coverage = losses['mask_stats']['coverage']
@@ -973,6 +1002,24 @@ def train(args: argparse.Namespace) -> None:
         # Log metrics
         # Tracks training progress
         log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats)
+        # Save grayscale band 0 of the first sample as PNG for local inspection
+        try:
+            orig_img = (batch[0][0].detach().cpu().numpy() + 1.0) * 127.5  # from [-1,1] to [0,255]
+            recon_img = (reconstruction[0][0].detach().cpu().numpy() + 1.0) * 127.5
+            orig_pil = Image.fromarray(orig_img.astype("uint8"))
+            recon_pil = Image.fromarray(recon_img.astype("uint8"))
+            orig_pil.save(os.path.join(image_output_dir, f"epoch_{epoch+1}_original_band0.png"))
+            recon_pil.save(os.path.join(image_output_dir, f"epoch_{epoch+1}_recon_band0.png"))
+        except Exception as e:
+            logger.warning(f"Failed to save local PNG images: {e}")
+        # Wandb image logging - save to persistent directory and log
+        try:
+            persistent_img_path = os.path.join(args.output_dir, "logging", f"reconstruction_epoch{epoch}_step{0}.png")
+            os.makedirs(os.path.dirname(persistent_img_path), exist_ok=True)
+            recon_pil.save(persistent_img_path)
+            wandb.log({"reconstruction": wandb.Image(persistent_img_path)})
+        except Exception as e:
+            logger.warning(f"Failed to log wandb image with persistent path: {e}")
         try:
             log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, output_range_stats)
         except Exception as e:

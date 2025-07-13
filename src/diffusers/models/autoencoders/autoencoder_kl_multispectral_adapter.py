@@ -202,7 +202,19 @@ Usage:
     optimizer = torch.optim.AdamW(vae.get_trainable_params(), lr=1e-4)
     
     # Note: Output range is unconstrained due to nonlinear transformations
+    # TODO nonlinearities introduce range warping, making it likely that even properly normalized 
+    # [–1, 1] input will produce non-symmetric output.
+    Fix Options:
+	•	(Recommended) Clamp output of output adapter to [–1, 1].
+	•	(Optional) Add Tanh() at the very end of SpectralAdapter.forward() (only for output adapter).
+    -> Add final Tanh activation to force [–1, 1] output
+    self.output_norm = nn.Tanh()
+
+    Then in forward()
+    x = self.output_norm(x)
+    
     # For downstream usage requiring [-1, 1] range, apply post-processing normalization
+
     
 """
 
@@ -542,6 +554,12 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.adapter_channels = adapter_channels
+        
+        # Ensure in_channels and out_channels are set to 5 for multispectral data
+        if in_channels != 5:
+            logger.warning(f"in_channels should be 5 for multispectral data, got {in_channels}")
+        if out_channels != 5:
+            logger.warning(f"out_channels should be 5 for multispectral data, got {out_channels}")
 
         # Check for required pretrained_model_name_or_path
         if pretrained_model_name_or_path is None:
@@ -570,6 +588,12 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         }
         config = {k: v for k, v in config.items() if k not in adapter_keys}
         super().__init__(**config)
+        
+        # Override the config values with our multispectral settings
+        # This ensures that in_channels and out_channels are set to 5 regardless of the base model
+        self.config.in_channels = in_channels
+        self.config.out_channels = out_channels
+        
         self.load_from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -766,10 +790,11 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         )
 
         # Step 2: Instantiate adapter model with all config + kwargs
+        # Ensure in_channels and out_channels are explicitly set to 5 for multispectral data
         model = cls(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
-            in_channels=kwargs.get("in_channels", 5),
-            out_channels=kwargs.get("out_channels", 5),
+            in_channels=kwargs.get("in_channels", 5),  # Force 5 channels for multispectral
+            out_channels=kwargs.get("out_channels", 5),  # Force 5 channels for multispectral
             adapter_channels=kwargs.get("adapter_channels", 32),
             adapter_placement=kwargs.get("adapter_placement", "both"),
             use_spectral_attention=kwargs.get("use_spectral_attention", True),
@@ -779,6 +804,12 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             variant=kwargs.get("variant", None),
             torch_dtype=kwargs.get("torch_dtype", None),
         )
+        
+        # Verify configuration was set correctly
+        if model.config.in_channels != 5:
+            logger.warning(f"in_channels was not set correctly: {model.config.in_channels} != 5")
+        if model.config.out_channels != 5:
+            logger.warning(f"out_channels was not set correctly: {model.config.out_channels} != 5")
 
         return model
 
@@ -810,7 +841,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     
     1. return_dict=True (default): Returns DecoderOutput object
        - Used by: HuggingFace pipelines, SD3 integration, downstream inference
-       - Access pattern: vae.decode(z).sample
+       - Access pattern: vae.decode(latents).sample
        - Examples: 
          * StableDiffusionPipeline.decode_latents(): image = vae.decode(latents).sample
          * CogVideoXSTGPipeline.decode_latents(): frames = vae.decode(latents).sample
@@ -923,14 +954,19 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
         # Decode to obtain reconstructed output
         decoded = self.decode(z)
+        # Ensure decoded is a tensor, not DecoderOutput
+        if isinstance(decoded, DecoderOutput):
+            decoded_tensor = decoded.sample
+        else:
+            decoded_tensor = decoded
 
         # Log: NaNs in reconstruction
-        if torch.isnan(decoded).any():
+        if torch.isnan(decoded_tensor).any():
             logger.debug("[NaN DEBUG] NaNs detected in reconstruction")
 
         # Compute training losses if in training mode
         if self.training:
-            losses = self.compute_losses(x, decoded, mask)
+            losses = self.compute_losses(x, decoded_tensor, mask)
             # Log: Loss debugging for NaNs or unusual values
             if torch.isnan(losses['mse']).any():
                 logger.debug("[NaN DEBUG] NaNs detected in MSE loss")
@@ -944,7 +980,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 stats = losses['mask_stats']
                 logger.debug(f"[DEBUG] Mask stats — coverage: {stats['coverage']:.4f}, valid_pixels: {stats['valid_pixels']}/{stats['total_pixels']}")
             
-            return decoded, losses
+            return decoded_tensor, losses
 
         # In evaluation mode, return decoded output and None for losses
-        return decoded, None
+        return decoded_tensor, None

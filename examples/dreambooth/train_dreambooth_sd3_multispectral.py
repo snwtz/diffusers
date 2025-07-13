@@ -9,6 +9,34 @@ compatibility with the original model's latent space.
 IMPORTANT: This script assumes the multispectral VAE has been pretrained and frozen.
 Only the SD3 components are trained during DreamBooth fine-tuning.
 
+CHANNEL CONFIGURATION:
+- Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
+- VAE Output: 16 latent channels (matching SD3 transformer's default expectation)
+- Transformer Input: 16 latent channels (SD3's default in_channels)
+
+Identical Core Logic with Original DreamBooth:
+Training loop structure: Matches original exactly
+Loss computation: Same flow matching loss
+Optimization: Same optimizer and scheduler logic
+Checkpointing: Same checkpoint management
+Validation: Same validation pipeline
+Multispectral Adaptations:
+Data loading: Custom multispectral dataloader
+VAE: Multispectral VAE instead of standard AutoencoderKL
+Input processing: 5-channel instead of 3-channel RGB
+Validation: Spectral-aware logging
+
+✅ Missing Elements Check:
+All critical elements from the original script are present:
+Complete argument parsing
+Model loading and setup
+Optimizer and scheduler configuration
+Training loop with all steps
+Checkpointing and resuming
+Validation and logging
+Model saving and final inference
+
+
 Module Purpose and Scientific Context:
 -----------------------------------
 1. Research Objective:
@@ -20,8 +48,8 @@ Module Purpose and Scientific Context:
 2. Technical Foundation:
    - Built on pretrained Stable Diffusion 3
    - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectralAdapter)
-   - Integrates spectral attention mechanism
-   - Implements spectral-aware loss functions
+   - Integrates spectral attention mechanism (TODO: implement)
+   - Implements spectral-aware loss functions (TODO: implement)
 
 3. Scientific/Biological Relevance:
    The training pipeline processes 5 carefully selected bands:
@@ -46,16 +74,17 @@ Implementation Decisions:
    - Enables training with limited data
 
 2. Loss Function Design:
-   - Per-band MSE: Preserves spatial structure
-   - SAM loss: Maintains spectral signatures
+   - Standard DreamBooth loss (currently implemented)
+   - TODO: Per-band MSE: Preserves spatial structure
+   - TODO: SAM loss: Maintains spectral signatures
    - Prior preservation: Retains concept learning
-   - Cross-modal alignment: Links text and spectral features
+   - TODO: Cross-modal alignment: Links text and spectral features
 
 3. Latent Space Handling:
    - log_latent_shape() validates SD3 compatibility
-   - Ensures 4-channel latent space requirements
+   - Expects 16 latent channels (SD3's default, beneficial for multispectral data)
    - Maintains generative capabilities
-   - Preserves spectral information
+   - Preserves spectral information with increased capacity
 
 Data Handling:
 ------------
@@ -64,6 +93,7 @@ Data Handling:
    - Implements efficient caching and prefetching
    - Supports multiprocessing for data loading
    - Validates channel compatibility via validate_dataloader_output()
+   - Returns dict with "pixel_values" and "mask" (mask available for future masked loss)
 
 2. Data Preprocessing:
    - Per-channel normalization to [-1, 1] range
@@ -82,14 +112,15 @@ Training Strategy:
 1. VAE Integration:
    - Pretrained and frozen multispectral VAE
    - Latent space validation via log_latent_shape()
-   - Ensures 4-channel latent space compatibility
-   - Spectral attention for band importance
+   - Expects 16 latent channels (SD3's default, optimal for multispectral data)
+   - TODO: Spectral attention for band importance
 
 2. Loss Functions:
-   - Per-band MSE for spatial fidelity
-   - Spectral Angle Mapper (SAM) for spectral signatures
+   - Standard DreamBooth loss (currently implemented)
+   - TODO: Per-band MSE for spatial fidelity
+   - TODO: Spectral Angle Mapper (SAM) for spectral signatures
    - Prior preservation loss
-   - Cross-modal alignment loss
+   - TODO: Cross-modal alignment loss
 
 3. Optimization:
    - Gradient accumulation for memory efficiency
@@ -97,13 +128,15 @@ Training Strategy:
    - Early stopping on validation plateau
    - Gradient clipping for stability
 
+
+
 Text Encoder Handling:
 -------------------
 1. Multi-Encoder Architecture:
    - CLIP: Visual-semantic alignment
    - T5: Detailed concept understanding
    - Concatenated embeddings for rich representation
-   - Spectral concept grounding
+   - TODO: Spectral concept grounding
 
 2. Encoding Functions:
    - _encode_prompt_with_clip(): Visual-semantic features
@@ -115,8 +148,8 @@ Logging and Evaluation:
 --------------------
 1. Validation Pipeline:
    - log_validation() for model assessment
-   - Spectral fidelity metrics
-   - Per-band reconstruction quality
+   - TODO: Spectral fidelity metrics
+   - TODO: Per-band reconstruction quality
    - Concept preservation evaluation
 
 2. Integration:
@@ -165,14 +198,14 @@ Thesis Discussion Points:
    a) Architecture Design:
       - Lightweight adapter approach for spectral adaptation
       - Parameter-efficient fine-tuning strategy
-      - Spectral attention mechanism
-      - Dual loss function design
+      - TODO: Spectral attention mechanism
+      - TODO: Dual loss function design
    
    b) Training Strategy:
-      - Spectral-aware optimization
-      - Cross-modal alignment
+      - TODO: Spectral-aware optimization
+      - TODO: Cross-modal alignment
       - Concept preservation
-      - Spectral fidelity maintenance
+      - TODO: Spectral fidelity maintenance
 
 2. Scientific Implications:
    a) Plant Health Analysis:
@@ -214,14 +247,14 @@ Thesis Discussion Points:
 1. Methodology Chapter:
    - Parameter-efficient design rationale
    - Band selection methodology
-   - Loss function design
-   - Text encoder integration
+   - TODO: Loss function design
+   - TODO: Text encoder integration
 
 2. Results Chapter:
-   - Spectral fidelity metrics
+   - TODO: Spectral fidelity metrics
    - Concept preservation analysis
-   - Band importance visualization
-   - Cross-modal alignment results
+   - TODO: Band importance visualization
+   - TODO: Cross-modal alignment results
 
 TODOs and Future Features:
 ------------------------
@@ -230,6 +263,7 @@ TODOs and Future Features:
    - [ ] Add spectral cross-modal loss
    - [ ] Improve spectral reconstruction metrics
    - [ ] Add per-band loss tracking
+   - [ ] Implement masked loss using background masks
 
 2. Data Handling:
    - [ ] Add support for reading train/val splits from .txt files
@@ -249,18 +283,12 @@ References:
 - SD3 paper: https://arxiv.org/pdf/2403.03206
 
 Usage:
-    # First, split the dataset:
-    python split_dataset.py \
-        --dataset_dir /path/to/multispectral/tiffs \
-        --train_ratio 0.8 \
-        --seed 42
-
-    # Then, train the model:
+    # Train the model:
     python train_dreambooth_sd3_multispectral.py \
         --pretrained_model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
-        --instance_data_dir /path/to/split \
+        --instance_data_dir /path/to/multispectral/tiffs \
         --output_dir /path/to/save/model \
-        --instance_prompt "photo of a sks leaf" \
+        --instance_prompt "sks leaf" \
         --num_train_epochs 100 \
         --train_batch_size 4 \
         --learning_rate 1e-4 \
@@ -288,8 +316,11 @@ Usage:
 
 import argparse
 import copy
+import itertools
 import logging
+import math
 import os
+import shutil
 import warnings
 from contextlib import nullcontext
 
@@ -297,8 +328,9 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
+from tqdm.auto import tqdm
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
 
 from diffusers import (
@@ -314,8 +346,12 @@ from diffusers.utils import (
     is_wandb_available,
 )
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from diffusers.utils.torch_utils import is_compiled_module
 
 # Import custom multispectral dataloader
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from multispectral_dataloader import create_multispectral_dataloader
 
 if is_wandb_available():
@@ -356,6 +392,12 @@ def parse_args(input_args=None):
         default="per_channel",
         choices=["per_channel", "global"],
         help="Strategy for normalizing multispectral data.",
+    )
+    parser.add_argument(
+        "--vae_path",
+        type=str,
+        required=True,
+        help="Path to the pretrained multispectral VAE. Required for multispectral training.",
     )
     
     # Add all other standard DreamBooth arguments
@@ -781,33 +823,47 @@ def validate_dataloader_output(dataloader, num_channels):
     """
     try:
         batch = next(iter(dataloader))
-        if batch.shape[1] != num_channels:
+        # Updated to work with dict format: batch["pixel_values"]
+        if batch["pixel_values"].shape[1] != num_channels:
             raise ValueError(
-                f"Dataloader output has {batch.shape[1]} channels, "
+                f"Dataloader output has {batch['pixel_values'].shape[1]} channels, "
                 f"but {num_channels} channels are required. "
                 f"Please check the multispectral dataloader configuration."
             )
-        logger.info(f"Validated dataloader output shape: {batch.shape}")
+        logger.info(f"Validated dataloader output shape: {batch['pixel_values'].shape}")
     except Exception as e:
         raise ValueError(f"Failed to validate dataloader output: {str(e)}")
 
 def log_latent_shape(latent_tensor, batch_size):
     """
     Log the shape of the latent tensor to verify VAE output compatibility.
-    The latent space should maintain SD3's requirements (4 channels) despite 5-channel input.
+    The latent space should maintain SD3's requirements (16 channels by default) despite 5-channel input.
     
     Args:
         latent_tensor: The latent tensor from VAE encoding
         batch_size: Current batch size for shape verification
     """
-    expected_shape = (batch_size, 4, latent_tensor.shape[2], latent_tensor.shape[3])
-    if latent_tensor.shape != expected_shape:
+    # SD3 transformer expects 16 channels by default, which is beneficial for multispectral data
+    # as it provides more capacity to encode the additional spectral information
+    logger.info(f"Latent tensor shape: {latent_tensor.shape}")
+    
+    # Check if the shape is reasonable (should be square)
+    if latent_tensor.shape[2] != latent_tensor.shape[3]:
         logger.warning(
-            f"Unexpected latent tensor shape: {latent_tensor.shape}. "
-            f"Expected: {expected_shape}"
+            f"Non-square latent spatial dimensions: {latent_tensor.shape[2]}x{latent_tensor.shape[3]}"
         )
+    
+    # Log the channel count for debugging
+    latent_channels = latent_tensor.shape[1]
+    logger.info(f"Latent channels: {latent_channels}")
+    
+    # Provide informative feedback about the channel count
+    if latent_channels == 16:
+        logger.info("✓ Using 16 latent channels - optimal for SD3 and multispectral data")
+    elif latent_channels == 4:
+        logger.info("✓ Using 4 latent channels - compatible with SD3 but may limit spectral capacity")
     else:
-        logger.info(f"Latent tensor shape verified: {latent_tensor.shape}")
+        logger.warning(f"⚠ Using {latent_channels} latent channels - verify SD3 compatibility")
 
 def adapt_visualization_for_multispectral(image_tensor):
     """
@@ -831,7 +887,7 @@ def main(args):
     This function orchestrates the training process, including:
     1. Model initialization with pretrained VAE
     2. Data loading and preprocessing
-    3. Training loop with spectral-aware losses
+    3. Training loop with spectral-aware losses (TODO: implement spectral-specific losses)
     4. Validation and logging
     
     Args:
@@ -862,10 +918,38 @@ def main(args):
         num_workers=args.dataloader_num_workers,
         use_cache=True,
         prefetch_factor=None if args.dataloader_num_workers == 0 else 2,  # Disable prefetch for local testing
-        persistent_workers=args.dataloader_num_workers > 0  # Only enable for multi-worker setup
+        persistent_workers=args.dataloader_num_workers > 0,  # Only enable for multi-worker setup
+        return_mask=True,  # Enable mask output for future masked loss
+        prompt=args.instance_prompt if hasattr(args, 'instance_prompt') else "sks leaf",  # Use provided prompt
     )
 
+    # Add warnings for potential performance issues
+    if args.dataloader_num_workers == 0:
+        logger.warning(
+            "num_workers=0 detected. Data loading will be slow for large datasets. "
+            "Consider increasing num_workers for better performance."
+        )
+    
+    # Warning for large datasets with caching enabled
+    dataset_size = len(train_dataloader.dataset)
+    if dataset_size > 1000 and args.dataloader_num_workers == 0:
+        logger.warning(
+            f"Large dataset detected ({dataset_size} images) with use_cache=True and num_workers=0. "
+            "This may cause high memory usage. Consider setting use_cache=False or increasing num_workers."
+        )
+
     # Validate dataloader output after accelerator initialization (fix Runtime error as result of loading logger before initializing accelerator)
+    # --- Validation step: log the structure and shapes of the first batch for debugging ---
+    try:
+        first_batch = next(iter(train_dataloader))
+        logger.info(f"First batch keys: {list(first_batch.keys())}")
+        logger.info(f"pixel_values shape: {first_batch['pixel_values'].shape}, dtype: {first_batch['pixel_values'].dtype}")
+        if 'mask' in first_batch:
+            logger.info(f"mask shape: {first_batch['mask'].shape}, dtype: {first_batch['mask'].dtype}")
+        logger.info(f"prompts: {first_batch['prompts']}")
+    except Exception as e:
+        logger.error(f"Error validating first batch from dataloader: {e}")
+
     validate_dataloader_output(train_dataloader, args.num_channels)
 
     # Add logging for dataloader configuration
@@ -878,6 +962,23 @@ def main(args):
         f"\n - resolution: {args.resolution}"
     )
 
+    # Load tokenizers
+    tokenizer_one = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer",
+        revision=args.revision,
+    )
+    tokenizer_two = CLIPTokenizer.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_2",
+        revision=args.revision,
+    )
+    tokenizer_three = T5TokenizerFast.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="tokenizer_3",
+        revision=args.revision,
+    )
+
     # Load scheduler and models
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler"
@@ -885,25 +986,430 @@ def main(args):
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
 
-    # Initialize multispectral VAE
-    vae = AutoencoderKLMultispectralAdapter.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="vae",
-        revision=args.revision,
-        variant=args.variant,
-    )
+    # Initialize multispectral VAE from the specific trained path
+    vae = AutoencoderKLMultispectralAdapter.from_pretrained(args.vae_path)
+    logger.info(f"Loaded multispectral VAE from: {args.vae_path}")
+    
+    # Log VAE configuration for debugging
+    logger.info(f"VAE config - latent_channels: {vae.config.latent_channels}")
+    logger.info(f"VAE config - in_channels: {vae.config.in_channels}")
+    logger.info(f"VAE config - out_channels: {vae.config.out_channels}")
+    
+    # Check for configuration mismatches
+    if vae.config.in_channels != args.num_channels:
+        logger.error(
+            f"VAE configuration mismatch! VAE expects {vae.config.in_channels} channels "
+            f"but dataloader provides {args.num_channels} channels. "
+            f"This will cause errors during training."
+        )
+        raise ValueError(
+            f"VAE in_channels ({vae.config.in_channels}) != dataloader channels ({args.num_channels})"
+        )
+    
+    # SD3 transformer expects 16 latent channels by default, which is actually beneficial for multispectral data
+    # as it provides more capacity to encode the additional spectral information
+    if vae.config.latent_channels == 16:
+        logger.info(
+            f"VAE outputs {vae.config.latent_channels} latent channels, which matches SD3's default expectation. "
+            f"This provides more capacity for encoding multispectral information."
+        )
+    elif vae.config.latent_channels != 4:
+        logger.warning(
+            f"VAE outputs {vae.config.latent_channels} latent channels. "
+            f"SD3 typically expects 16 channels (default) or 4 channels. "
+            f"Using {vae.config.latent_channels} channels may affect compatibility."
+        )
 
-    # Verify that input of shape (B, 5, 512, 512) outputs a latent tensor with shape (B, 4, latent_H, latent_W) (SD3 expects latent channels = 4)
+    # Freeze the VAE 
+    vae.requires_grad_(False)
+    logger.info("Multispectral VAE frozen for DreamBooth training")
+
+    # Verify that input of shape (B, 5, 512, 512) outputs a latent tensor with shape (B, 16, latent_H, latent_W) 
+    # SD3 transformer expects 16 latent channels by default, which provides more capacity for multispectral data
+    # This configuration is optimal for encoding the additional spectral information
     logger.info(f"Using {args.num_channels}-channel multispectral VAE for training")
 
-    latent = vae.encode(input_tensor).latent_dist.sample()
-    logger.info(f"Latent shape: {latent.shape}")
+    # Test VAE with a dummy input to verify latent shape
+    with torch.no_grad():
+        dummy_input = torch.randn(1, args.num_channels, args.resolution, args.resolution)
+        latent = vae.encode(dummy_input).latent_dist.sample()
+        logger.info(f"VAE test - Input shape: {dummy_input.shape}, Latent shape: {latent.shape}")
 
     transformer = SD3Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     )
 
-    # Training loop
+    # Set up model training states (matches original DreamBooth)
+    transformer.requires_grad_(True)
+    if args.train_text_encoder:
+        text_encoder_one.requires_grad_(True)
+        text_encoder_two.requires_grad_(True)
+        text_encoder_three.requires_grad_(True)
+    else:
+        text_encoder_one.requires_grad_(False)
+        text_encoder_two.requires_grad_(False)
+        text_encoder_three.requires_grad_(False)
+
+    # Set up weight dtype for mixed precision
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+
+    # Move models to device with appropriate dtypes
+    vae.to(accelerator.device, dtype=torch.float32)
+    transformer.to(accelerator.device, dtype=weight_dtype)
+    if not args.train_text_encoder:
+        text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+        text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+        text_encoder_three.to(accelerator.device, dtype=weight_dtype)
+
+    # Enable gradient checkpointing if requested
+    if args.gradient_checkpointing:
+        transformer.enable_gradient_checkpointing()
+        if args.train_text_encoder:
+            text_encoder_one.gradient_checkpointing_enable()
+            text_encoder_two.gradient_checkpointing_enable()
+            text_encoder_three.gradient_checkpointing_enable()
+
+    def unwrap_model(model):
+        model = accelerator.unwrap_model(model)
+        model = model._orig_mod if is_compiled_module(model) else model
+        return model
+
+    # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+    def save_model_hook(models, weights, output_dir):
+        if accelerator.is_main_process:
+            for i, model in enumerate(models):
+                if isinstance(unwrap_model(model), SD3Transformer2DModel):
+                    unwrap_model(model).save_pretrained(os.path.join(output_dir, "transformer"))
+                elif isinstance(unwrap_model(model), (CLIPTextModelWithProjection, T5EncoderModel)):
+                    if isinstance(unwrap_model(model), CLIPTextModelWithProjection):
+                        hidden_size = unwrap_model(model).config.hidden_size
+                        if hidden_size == 768:
+                            unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder"))
+                        elif hidden_size == 1280:
+                            unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder_2"))
+                    else:
+                        unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder_3"))
+                else:
+                    raise ValueError(f"Wrong model supplied: {type(model)=}.")
+
+                # make sure to pop weight so that corresponding model is not saved again
+                weights.pop()
+
+    def load_model_hook(models, input_dir):
+        for _ in range(len(models)):
+            # pop models so that they are not loaded again
+            model = models.pop()
+
+            # load diffusers style into model
+            if isinstance(unwrap_model(model), SD3Transformer2DModel):
+                load_model = SD3Transformer2DModel.from_pretrained(input_dir, subfolder="transformer")
+                model.register_to_config(**load_model.config)
+
+                model.load_state_dict(load_model.state_dict())
+            elif isinstance(unwrap_model(model), (CLIPTextModelWithProjection, T5EncoderModel)):
+                try:
+                    load_model = CLIPTextModelWithProjection.from_pretrained(input_dir, subfolder="text_encoder")
+                    model(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                except Exception:
+                    try:
+                        load_model = CLIPTextModelWithProjection.from_pretrained(input_dir, subfolder="text_encoder_2")
+                        model(**load_model.config)
+                        model.load_state_dict(load_model.state_dict())
+                    except Exception:
+                        try:
+                            load_model = T5EncoderModel.from_pretrained(input_dir, subfolder="text_encoder_3")
+                            model(**load_model.config)
+                            model.load_state_dict(load_model.state_dict())
+                        except Exception:
+                            raise ValueError(f"Couldn't load the model of type: ({type(model)}).")
+            else:
+                raise ValueError(f"Unsupported model found: {type(model)=}")
+
+            del load_model
+
+    accelerator.register_save_state_pre_hook(save_model_hook)
+    accelerator.register_load_state_pre_hook(load_model_hook)
+
+    # Enable TF32 for faster training on Ampere GPUs
+    if args.allow_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    if args.scale_lr:
+        args.learning_rate = (
+            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+        )
+
+    # Optimization parameters
+    transformer_parameters_with_lr = {"params": transformer.parameters(), "lr": args.learning_rate}
+    if args.train_text_encoder:
+        # different learning rate for text encoder and unet
+        text_parameters_one_with_lr = {
+            "params": text_encoder_one.parameters(),
+            "weight_decay": args.adam_weight_decay_text_encoder,
+            "lr": args.text_encoder_lr if args.text_encoder_lr else args.learning_rate,
+        }
+        text_parameters_two_with_lr = {
+            "params": text_encoder_two.parameters(),
+            "weight_decay": args.adam_weight_decay_text_encoder,
+            "lr": args.text_encoder_lr if args.text_encoder_lr else args.learning_rate,
+        }
+        text_parameters_three_with_lr = {
+            "params": text_encoder_three.parameters(),
+            "weight_decay": args.adam_weight_decay_text_encoder,
+            "lr": args.text_encoder_lr if args.text_encoder_lr else args.learning_rate,
+        }
+        params_to_optimize = [
+            transformer_parameters_with_lr,
+            text_parameters_one_with_lr,
+            text_parameters_two_with_lr,
+            text_parameters_three_with_lr,
+        ]
+    else:
+        params_to_optimize = [transformer_parameters_with_lr]
+
+    # Optimizer creation
+    if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
+        logger.warning(
+            f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy]."
+            "Defaulting to adamW"
+        )
+        args.optimizer = "adamw"
+
+    if args.use_8bit_adam and not args.optimizer.lower() == "adamw":
+        logger.warning(
+            f"use_8bit_adam is ignored when optimizer is not set to 'AdamW'. Optimizer was "
+            f"set to {args.optimizer.lower()}"
+        )
+
+    if args.optimizer.lower() == "adamw":
+        if args.use_8bit_adam:
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+                )
+
+            optimizer_class = bnb.optim.AdamW8bit
+        else:
+            optimizer_class = torch.optim.AdamW
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+
+    if args.optimizer.lower() == "prodigy":
+        try:
+            import prodigyopt
+        except ImportError:
+            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
+
+        optimizer_class = prodigyopt.Prodigy
+
+        if args.learning_rate <= 0.1:
+            logger.warning(
+                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
+            )
+        if args.train_text_encoder and args.text_encoder_lr:
+            logger.warning(
+                f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
+                f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
+                f"When using prodigy only learning_rate is used as the initial learning rate."
+            )
+            # changes the learning rate of text_encoder_parameters_one and text_encoder_parameters_two to be
+            # --learning_rate
+            params_to_optimize[1]["lr"] = args.learning_rate
+            params_to_optimize[2]["lr"] = args.learning_rate
+            params_to_optimize[3]["lr"] = args.learning_rate
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            betas=(args.adam_beta1, args.adam_beta2),
+            beta3=args.prodigy_beta3,
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+            decouple=args.prodigy_decouple,
+            use_bias_correction=args.prodigy_use_bias_correction,
+            safeguard_warmup=args.prodigy_safeguard_warmup,
+        )
+
+    if not args.train_text_encoder:
+        tokenizers = [tokenizer_one, tokenizer_two, tokenizer_three]
+        text_encoders = [text_encoder_one, text_encoder_two, text_encoder_three]
+
+        def compute_text_embeddings(prompt, text_encoders, tokenizers):
+            with torch.no_grad():
+                prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                    text_encoders, tokenizers, prompt, args.max_sequence_length
+                )
+                prompt_embeds = prompt_embeds.to(accelerator.device)
+                pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
+            return prompt_embeds, pooled_prompt_embeds
+
+    # For multispectral DreamBooth, we use a single prompt for all images (no custom prompts)
+    # Encode the instance prompt once to avoid redundant encoding
+    if not args.train_text_encoder:
+        instance_prompt_hidden_states, instance_pooled_prompt_embeds = compute_text_embeddings(
+            args.instance_prompt, text_encoders, tokenizers
+        )
+
+    # Handle class prompt for prior-preservation
+    if args.with_prior_preservation:
+        if not args.train_text_encoder:
+            class_prompt_hidden_states, class_pooled_prompt_embeds = compute_text_embeddings(
+                args.class_prompt, text_encoders, tokenizers
+            )
+
+    # Clear the memory here
+    if not args.train_text_encoder:
+        del tokenizers, text_encoders
+        # Explicitly delete the objects as well, otherwise only the lists are deleted and the original references remain, preventing garbage collection
+        del text_encoder_one, text_encoder_two, text_encoder_three
+        free_memory()
+
+    # Pack the statically computed variables appropriately
+    if not args.train_text_encoder:
+        prompt_embeds = instance_prompt_hidden_states
+        pooled_prompt_embeds = instance_pooled_prompt_embeds
+        if args.with_prior_preservation:
+            prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
+            pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, class_pooled_prompt_embeds], dim=0)
+    # if we're optimizing the text encoder we need to tokenize and encode the batch prompts on all training steps
+    else:
+        tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt)
+        tokens_two = tokenize_prompt(tokenizer_two, args.instance_prompt)
+        tokens_three = tokenize_prompt(tokenizer_three, args.instance_prompt)
+        if args.with_prior_preservation:
+            class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt)
+            class_tokens_two = tokenize_prompt(tokenizer_two, args.class_prompt)
+            class_tokens_three = tokenize_prompt(tokenizer_three, args.class_prompt)
+            tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
+            tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
+            tokens_three = torch.cat([tokens_three, class_tokens_three], dim=0)
+
+    # Scheduler and math around the number of training steps
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
+
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * accelerator.num_processes,
+        num_training_steps=args.max_train_steps * accelerator.num_processes,
+        num_cycles=args.lr_num_cycles,
+        power=args.lr_power,
+    )
+
+    # Prepare everything with our `accelerator`
+    if args.train_text_encoder:
+        (
+            transformer,
+            text_encoder_one,
+            text_encoder_two,
+            text_encoder_three,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        ) = accelerator.prepare(
+            transformer,
+            text_encoder_one,
+            text_encoder_two,
+            text_encoder_three,
+            optimizer,
+            train_dataloader,
+            lr_scheduler,
+        )
+    else:
+        transformer, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            transformer, optimizer, train_dataloader, lr_scheduler
+        )
+
+    # We need to recalculate our total training steps as the size of the training dataloader may have changed
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    if overrode_max_train_steps:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    # Afterwards we recalculate our number of training epochs
+    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # We need to initialize the trackers we use, and also store our configuration
+    # The trackers initializes automatically on the main process
+    if accelerator.is_main_process:
+        tracker_name = "dreambooth-sd3-multispectral"
+        accelerator.init_trackers(tracker_name, config=vars(args))
+
+    # Train!
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+
+    logger.info("***** Running multispectral DreamBooth training *****")
+    logger.info(f"  Num examples = {len(train_dataloader.dataset)}")
+    logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
+    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    global_step = 0
+    first_epoch = 0
+
+    # Potentially load in the weights and states from a previous save
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+
+        if path is None:
+            accelerator.print(
+                f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run."
+            )
+            args.resume_from_checkpoint = None
+            initial_global_step = 0
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            global_step = int(path.split("-")[1])
+
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
+
+    else:
+        initial_global_step = 0
+
+    progress_bar = tqdm(
+        range(0, args.max_train_steps),
+        initial=initial_global_step,
+        desc="Steps",
+        # Only show the progress bar once on each machine
+        disable=not accelerator.is_local_main_process,
+    )
+
+    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+        timesteps = timesteps.to(accelerator.device)
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+        sigma = sigmas[step_indices].flatten()
+        while len(sigma.shape) < n_dim:
+            sigma = sigma.unsqueeze(-1)
+        return sigma
+
+    # Main training loop
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
         if args.train_text_encoder:
@@ -911,22 +1417,19 @@ def main(args):
             text_encoder_two.train()
             text_encoder_three.train()
 
-        for step, batch in enumerate(train_dataloader):
+        for step, batch in enumerate(train_dataloader): # Access batches of dicts from dataloader
+            models_to_accumulate = [transformer]
+            if args.train_text_encoder:
+                models_to_accumulate.extend([text_encoder_one, text_encoder_two, text_encoder_three])
             with accelerator.accumulate(models_to_accumulate):
-                # Get pixel values and prompts
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 prompts = batch["prompts"]
 
                 # encode batch prompts when custom prompts are provided for each image
-                if train_dataset.custom_instance_prompts:
-                    if not args.train_text_encoder:
-                        prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
-                            prompts, text_encoders, tokenizers
-                        )
-                    else:
-                        tokens_one = tokenize_prompt(tokenizer_one, prompts)
-                        tokens_two = tokenize_prompt(tokenizer_two, prompts)
-                        tokens_three = tokenize_prompt(tokenizer_three, prompts)
+                if args.train_text_encoder:
+                    tokens_one = tokenize_prompt(tokenizer_one, prompts)
+                    tokens_two = tokenize_prompt(tokenizer_two, prompts)
+                    tokens_three = tokenize_prompt(tokenizer_three, prompts)
 
                 # Convert images to latent space using multispectral VAE
                 model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -936,28 +1439,244 @@ def main(args):
                 # Log latent tensor shape for verification
                 log_latent_shape(model_input, pixel_values.shape[0])
 
-                # Rest of the training loop code...
-                # (Copy the rest of the training loop from the original script)
+                # Sample noise that we'll add to the latents
+                noise = torch.randn_like(model_input)
+                bsz = model_input.shape[0]
 
-                # Adapt visualization for multispectral data
-                if accelerator.is_main_process and step % args.validation_steps == 0:
-                    # Convert first 3 channels to RGB for visualization (for logging purposes)
-                    rgb_tensor = adapt_visualization_for_multispectral(pixel_values)
-                    
-                    # Log to tensorboard/wandb
-                    if args.report_to == "tensorboard":
-                        accelerator.get_tracker("tensorboard").add_images(
-                            "train_samples", rgb_tensor, step
+                # Sample a random timestep for each image
+                # for weighting schemes where we sample timesteps non-uniformly
+                u = compute_density_for_timestep_sampling(
+                    weighting_scheme=args.weighting_scheme,
+                    batch_size=bsz,
+                    logit_mean=args.logit_mean,
+                    logit_std=args.logit_std,
+                    mode_scale=args.mode_scale,
+                )
+                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+
+                # Add noise according to flow matching
+                # zt = (1 - texp) * x + texp * z1
+                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+
+                # Predict the noise residual
+                if not args.train_text_encoder:
+                    model_pred = transformer(
+                        hidden_states=noisy_model_input,
+                        timestep=timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_prompt_embeds,
+                        return_dict=False,
+                    )[0]
+                else:
+                    prompt_embeds, pooled_prompt_embeds = encode_prompt(
+                        text_encoders=[text_encoder_one, text_encoder_two, text_encoder_three],
+                        tokenizers=None,
+                        prompt=None,
+                        text_input_ids_list=[tokens_one, tokens_two, tokens_three],
+                    )
+                    model_pred = transformer(
+                        hidden_states=noisy_model_input,
+                        timestep=timesteps,
+                        encoder_hidden_states=prompt_embeds,
+                        pooled_projections=pooled_prompt_embeds,
+                        return_dict=False,
+                    )[0]
+
+                # Follow: Section 5 of https://arxiv.org/abs/2206.00364
+                # Preconditioning of the model outputs
+                if args.precondition_outputs:
+                    model_pred = model_pred * (-sigmas) + noisy_model_input
+
+                # these weighting schemes use a uniform timestep sampling
+                # and instead post-weight the loss
+                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+
+                # flow matching loss
+                if args.precondition_outputs:
+                    target = model_input
+                else:
+                    target = noise - model_input
+
+                if args.with_prior_preservation:
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately
+                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+                    target, target_prior = torch.chunk(target, 2, dim=0)
+
+                    # Compute prior loss
+                    prior_loss = torch.mean(
+                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
+                            target_prior.shape[0], -1
+                        ),
+                        1,
+                    )
+                    prior_loss = prior_loss.mean()
+
+                # Compute regular loss
+                loss = torch.mean(
+                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    1,
+                )
+                loss = loss.mean()
+
+                if args.with_prior_preservation:
+                    # Add the prior loss to the instance loss
+                    loss = loss + args.prior_loss_weight * prior_loss
+
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(
+                            transformer.parameters(),
+                            text_encoder_one.parameters(),
+                            text_encoder_two.parameters(),
+                            text_encoder_three.parameters(),
                         )
-                    elif args.report_to == "wandb":
-                        accelerator.get_tracker("wandb").log(
-                            {
-                                "train_samples": [
-                                    wandb.Image(img) for img in rgb_tensor
-                                ]
-                            },
-                            step=step,
-                        )
+                        if args.train_text_encoder
+                        else transformer.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                if accelerator.is_main_process:
+                    if global_step % args.checkpointing_steps == 0:
+                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir)
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
+
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
+
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            progress_bar.set_postfix(**logs)
+            accelerator.log(logs, step=global_step)
+
+            if global_step >= args.max_train_steps:
+                break
+
+        if accelerator.is_main_process:
+            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+                # create pipeline
+                if not args.train_text_encoder:
+                    text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
+                    text_encoder_one.to(weight_dtype)
+                    text_encoder_two.to(weight_dtype)
+                    text_encoder_three.to(weight_dtype)
+                pipeline = StableDiffusion3Pipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    vae=vae,
+                    text_encoder=accelerator.unwrap_model(text_encoder_one),
+                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
+                    transformer=accelerator.unwrap_model(transformer),
+                    revision=args.revision,
+                    variant=args.variant,
+                    torch_dtype=weight_dtype,
+                )
+                pipeline_args = {"prompt": args.validation_prompt}
+                images = log_validation(
+                    pipeline=pipeline,
+                    args=args,
+                    accelerator=accelerator,
+                    pipeline_args=pipeline_args,
+                    epoch=epoch,
+                    torch_dtype=weight_dtype,
+                )
+                if not args.train_text_encoder:
+                    del text_encoder_one, text_encoder_two, text_encoder_three
+                    free_memory()
+
+    # Save the model
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        transformer = unwrap_model(transformer)
+
+        if args.train_text_encoder:
+            text_encoder_one = unwrap_model(text_encoder_one)
+            text_encoder_two = unwrap_model(text_encoder_two)
+            text_encoder_three = unwrap_model(text_encoder_three)
+            pipeline = StableDiffusion3Pipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                transformer=transformer,
+                text_encoder=text_encoder_one,
+                text_encoder_2=text_encoder_two,
+                text_encoder_3=text_encoder_three,
+            )
+        else:
+            pipeline = StableDiffusion3Pipeline.from_pretrained(
+                args.pretrained_model_name_or_path, transformer=transformer
+            )
+
+        # save the pipeline
+        pipeline.save_pretrained(args.output_dir)
+
+        # Final inference
+        # Load previous pipeline
+        pipeline = StableDiffusion3Pipeline.from_pretrained(
+            args.output_dir,
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=weight_dtype,
+        )
+
+        # run inference
+        images = []
+        if args.validation_prompt and args.num_validation_images > 0:
+            pipeline_args = {"prompt": args.validation_prompt}
+            images = log_validation(
+                pipeline=pipeline,
+                args=args,
+                accelerator=accelerator,
+                pipeline_args=pipeline_args,
+                epoch=epoch,
+                is_final_validation=True,
+                torch_dtype=weight_dtype,
+            )
+
+        if args.push_to_hub:
+            save_model_card(
+                args.hub_model_id,
+                images=images,
+                base_model=args.pretrained_model_name_or_path,
+                train_text_encoder=args.train_text_encoder,
+                instance_prompt=args.instance_prompt,
+                validation_prompt=args.validation_prompt,
+                repo_folder=args.output_dir,
+            )
+            upload_folder(
+                repo_id=args.hub_model_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
+
+    accelerator.end_training()
 
 def save_model_card(
     repo_id: str,

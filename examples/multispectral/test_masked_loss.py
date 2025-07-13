@@ -3,6 +3,17 @@ Test script for masked loss computation in multispectral VAE adapter.
 
 This script verifies that the masked loss computation correctly focuses training
 on leaf regions while excluding background areas.
+
+Purpose in detail:
+1. Verify pure leaf-focused training - ensuring the model learns only from biologically relevant leaf regions while excluding background areas
+2. Test masked loss computation - validating that the loss functions correctly focus on leaf regions using binary masks
+3. Validate SAM (Spectral Angle Mapper) loss - ensuring spectral fidelity is maintained when using masks
+4. Provide debugging and monitoring tools - helping track mask coverage and loss behavior during training
+
+Use cases:
+	•	Changing loss functions
+	•	Suspecting training problems
+	•	Comparing masked/unmasked behavior
 """
 
 import torch
@@ -21,8 +32,6 @@ from diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import (
 
 def test_masked_loss_computation():
     """Test the masked loss computation with synthetic data."""
-    
-    print("Testing masked loss computation...")
     
     # Create a simple model for testing
     model = AutoencoderKLMultispectralAdapter(
@@ -51,94 +60,45 @@ def test_masked_loss_computation():
     mask = mask.float().unsqueeze(0).unsqueeze(0)  # Add batch and channel dims
     mask = mask.expand(batch_size, 1, height, width)  # Expand to batch size
     
-    print(f"Mask shape: {mask.shape}")
-    print(f"Mask coverage: {mask.mean().item():.4f}")
-    print(f"Valid pixels: {mask.sum().item()}/{mask.numel()}")
-    
     # Create synthetic reconstruction (slightly different from original)
     reconstructed = original + torch.randn_like(original) * 0.1
     
     # Test compute_losses method
-    print("\nTesting compute_losses method...")
     losses = model.compute_losses(original, reconstructed, mask=mask)
     
-    print("Loss components:")
-    for key, value in losses.items():
-        if isinstance(value, torch.Tensor):
-            if value.dim() == 0:
-                print(f"  {key}: {value.item():.6f}")
-            else:
-                print(f"  {key}: {value.tolist()}")
-        else:
-            print(f"  {key}: {value}")
-    
     # Test without mask (should warn about computing loss over entire image)
-    print("\nTesting without mask...")
     losses_no_mask = model.compute_losses(original, reconstructed, mask=None)
     
-    print("Loss components (no mask):")
-    for key, value in losses_no_mask.items():
-        if isinstance(value, torch.Tensor):
-            if value.dim() == 0:
-                print(f"  {key}: {value.item():.6f}")
-            else:
-                print(f"  {key}: {value.tolist()}")
-        else:
-            print(f"  {key}: {value}")
-    
     # Test with very small mask coverage
-    print("\nTesting with very small mask coverage...")
     small_mask = torch.zeros_like(mask)
     small_mask[:, :, height//4:height//4+5, width//4:width//4+5] = 1.0  # Small square
     
     losses_small_mask = model.compute_losses(original, reconstructed, mask=small_mask)
     
-    print("Loss components (small mask):")
-    for key, value in losses_small_mask.items():
-        if isinstance(value, torch.Tensor):
-            if value.dim() == 0:
-                print(f"  {key}: {value.item():.6f}")
-            else:
-                print(f"  {key}: {value.tolist()}")
-        else:
-            print(f"  {key}: {value}")
-    
     # Test forward method with mask
-    print("\nTesting forward method with mask...")
     model.eval()
     with torch.no_grad():
         reconstruction, losses_forward = model.forward(sample=original, mask=mask)
     
-    print("Forward method losses:")
+    # Assert that forward method outputs have expected types and shapes
+    assert isinstance(reconstruction, torch.Tensor)
+    assert reconstruction.shape == original.shape
+    assert isinstance(losses_forward, dict)
     for key, value in losses_forward.items():
-        if isinstance(value, torch.Tensor):
-            if value.dim() == 0:
-                print(f"  {key}: {value.item():.6f}")
-            else:
-                print(f"  {key}: {value.tolist()}")
-        else:
-            print(f"  {key}: {value}")
-    
-    print("\nTest completed successfully!")
+        assert isinstance(value, torch.Tensor) or isinstance(value, float)
     
     # Verify that masked loss is different from unmasked loss
     mse_masked = losses['mse'].item()
     mse_unmasked = losses_no_mask['mse'].item()
     
-    print(f"\nLoss comparison:")
-    print(f"  Masked MSE: {mse_masked:.6f}")
-    print(f"  Unmasked MSE: {mse_unmasked:.6f}")
-    print(f"  Difference: {abs(mse_masked - mse_unmasked):.6f}")
+    assert abs(mse_masked - mse_unmasked) > 1e-6, "Masked and unmasked MSE losses are too similar"
     
-    if abs(mse_masked - mse_unmasked) > 1e-6:
-        print("✓ Masked loss computation is working correctly!")
-    else:
-        print("⚠ Warning: Masked and unmasked losses are very similar")
+    # Placeholder for loading real .tiff + mask pair in future
+    # e.g., real_image, real_mask = load_real_tiff_and_mask(...)
+    # This would be used to test masked loss on real data
 
 def test_sam_loss_with_masking():
     """Test SAM loss computation with masking."""
-    
-    print("\nTesting SAM loss with masking...")
     
     # Create synthetic data
     batch_size = 2
@@ -165,18 +125,13 @@ def test_sam_loss_with_masking():
     
     losses = model.compute_losses(original, reconstructed, mask=mask)
     
-    if 'sam' in losses:
-        print(f"SAM loss with masking: {losses['sam'].item():.6f}")
-        print("✓ SAM loss computation with masking works!")
-    else:
-        print("⚠ SAM loss not found in losses")
+    assert 'sam' in losses, "SAM loss not found in losses"
 
 if __name__ == "__main__":
     try:
         test_masked_loss_computation()
         test_sam_loss_with_masking()
-        print("\n🎉 All tests passed!")
     except Exception as e:
-        print(f"\n❌ Test failed: {e}")
         import traceback
-        traceback.print_exc() 
+        traceback.print_exc()
+        raise e
