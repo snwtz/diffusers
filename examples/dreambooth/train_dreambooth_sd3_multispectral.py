@@ -323,12 +323,13 @@ import os
 import shutil
 import warnings
 from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from tqdm.auto import tqdm
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
@@ -353,6 +354,10 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from multispectral_dataloader import create_multispectral_dataloader
+
+# Import for logging setup
+import transformers
+import diffusers
 
 if is_wandb_available():
     import wandb
@@ -899,16 +904,49 @@ def main(args):
             " Please use `huggingface-cli login` to authenticate with the Hub."
         )
 
-    # Initialize accelerator (to fix Runtime error as result of loading logger before initializing accelerator)
+    if torch.backends.mps.is_available() and args.mixed_precision == "bf16":
+        # due to pytorch#99272, MPS does not yet support bfloat16.
+        raise ValueError(
+            "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
+        )
+
+    logging_dir = Path(args.output_dir, args.logging_dir)
+
+    accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
-        project_config=ProjectConfiguration(
-            project_dir=args.output_dir,
-            logging_dir=args.logging_dir,
-        ),
+        project_config=accelerator_project_config,
+        kwargs_handlers=[kwargs],
     )
+
+    # Disable AMP for MPS.
+    if torch.backends.mps.is_available():
+        accelerator.native_amp = False
+
+    if args.report_to == "wandb":
+        if not is_wandb_available():
+            raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+
+    # Make one log on every process with the configuration for debugging.
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    logger.info(accelerator.state, main_process_only=False)
+    if accelerator.is_local_main_process:
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
+    else:
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
+    # If passed along, set the training seed now.
+    if args.seed is not None:
+        set_seed(args.seed)
 
     # Create multispectral dataloader
     train_dataloader = create_multispectral_dataloader(
@@ -1359,6 +1397,12 @@ def main(args):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Multispectral configuration:")
+    logger.info(f"    - Input channels: {args.num_channels} (bands 9, 18, 32, 42, 55)")
+    logger.info(f"    - VAE latent channels: {vae.config.latent_channels}")
+    logger.info(f"    - VAE input channels: {vae.config.in_channels}")
+    logger.info(f"    - VAE output channels: {vae.config.out_channels}")
+    logger.info(f"    - Spectral data type: Multispectral plant tissue")
     global_step = 0
     first_epoch = 0
 
@@ -1422,6 +1466,7 @@ def main(args):
             if args.train_text_encoder:
                 models_to_accumulate.extend([text_encoder_one, text_encoder_two, text_encoder_three])
             with accelerator.accumulate(models_to_accumulate):
+                # Multispectral data: 5-channel input (bands 9, 18, 32, 42, 55) instead of 3-channel RGB
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 prompts = batch["prompts"]
 
@@ -1432,6 +1477,8 @@ def main(args):
                     tokens_three = tokenize_prompt(tokenizer_three, prompts)
 
                 # Convert images to latent space using multispectral VAE
+                # Input: (B, 5, H, W) multispectral data -> Output: (B, 16, H/8, W/8) latent representation
+                # The multispectral VAE preserves spectral information in the latent space
                 model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
@@ -1574,6 +1621,15 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            
+            # Add multispectral-specific logging information
+            if global_step % 100 == 0:  # Log spectral info every 100 steps to avoid spam
+                logs.update({
+                    "multispectral_channels": args.num_channels,
+                    "latent_channels": vae.config.latent_channels,
+                    "spectral_data_type": "multispectral_5ch",
+                })
+            
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -1705,15 +1761,21 @@ def save_model_card(
             )
 
     model_description = f"""
-# {model_variant} DreamBooth - {repo_id}
+# {model_variant} Multispectral DreamBooth - {repo_id}
 
 <Gallery />
 
 ## Model description
 
-These are {repo_id} DreamBooth weights for {base_model}.
+These are {repo_id} multispectral DreamBooth weights for {base_model}.
 
-The weights were trained using [DreamBooth](https://dreambooth.github.io/) with the [SD3 diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_sd3.md).
+The weights were trained using [DreamBooth](https://dreambooth.github.io/) with the [SD3 diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_sd3.md) adapted for multispectral image generation.
+
+**Multispectral Configuration:**
+- Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
+- Spectral bands optimized for plant health monitoring
+- VAE: Custom multispectral AutoencoderKL adapter
+- Latent space: {vae.config.latent_channels} channels for enhanced spectral capacity
 
 Was the text encoder fine-tuned? {train_text_encoder}.
 
@@ -1748,6 +1810,10 @@ Please adhere to the licensing terms as described `[here]({license_url})`.
         "diffusers-training",
         "diffusers",
         "template:sd-lora",
+        "multispectral",
+        "plant-health",
+        "spectral-imaging",
+        "agriculture",
     ]
     tags += variant_tags
 
@@ -1807,8 +1873,11 @@ def log_validation(
     This function is crucial for monitoring training progress and ensuring
     both visual quality and spectral accuracy are maintained.
     
+    Note: The pipeline generates RGB images from the multispectral VAE,
+    so the validation images are compatible with standard visualization tools.
+    
     Args:
-        pipeline: The generation pipeline
+        pipeline: The generation pipeline (with multispectral VAE)
         args: Training arguments
         accelerator: Accelerator for distributed training
         pipeline_args: Pipeline configuration
@@ -1817,7 +1886,7 @@ def log_validation(
         is_final_validation: Whether this is the final validation
     """
     logger.info(
-        f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
+        f"Running multispectral validation... \n Generating {args.num_validation_images} images with prompt:"
         f" {args.validation_prompt}."
     )
     pipeline = pipeline.to(accelerator.device)

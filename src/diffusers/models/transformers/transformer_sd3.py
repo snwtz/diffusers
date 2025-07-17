@@ -122,7 +122,7 @@ class SD3Transformer2DModel(
         self,
         sample_size: int = 128,
         patch_size: int = 2,
-        in_channels: int = 16,
+        in_channels: int = 16
         num_layers: int = 18,
         attention_head_dim: int = 64,
         num_attention_heads: int = 18,

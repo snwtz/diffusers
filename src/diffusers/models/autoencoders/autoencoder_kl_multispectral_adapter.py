@@ -185,6 +185,8 @@ TODOs:
 
 
    CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
+   NOTE: enable Tanh output bounding via --force_output_tanh on the CLI.
+    -> disable during training and apply only during inference
 
 Usage:
     # Initialize with pretrained SD3 VAE
@@ -247,6 +249,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
+import numpy as np # Added for scale monitoring
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -337,27 +340,21 @@ class SpectralAttention(nn.Module):
 # the output range is not constrained to [-1, 1] and may require post-processing normalization.
 #
 class SpectralAdapter(nn.Module):
-    """Adapter module for converting between 3 and 5 spectral channels.
+    """
+    Adapter module for converting between 3 and 5 spectral channels.
 
     This module handles the conversion between the 5-channel multispectral
     input and the 3-channel RGB-like format expected by the SD3 VAE.
     It includes spectral attention and a series of convolutions to learn
     the optimal transformation while preserving spectral information.
-    
-    IMPORTANT: This adapter applies significant nonlinear transformations:
-    - Spectral attention with sigmoid activation and element-wise multiplication
-    - Two convolutional blocks with SiLU activations and GroupNorm
-    - Final linear convolution without activation
-    
-    These nonlinearities mean the output range is NOT constrained and may require
-    post-processing normalization depending on downstream usage.
-    
-    Scientific Rationale:
-    --------------------
-    - Bridges the gap between 5-channel plant data and 3-channel SD3 backbone (core methodological innovation).
-    - NaN-masking is essential for preventing background artifacts from propagating through the network.
-    - Nonlinear transformations enable complex spectral relationships to be learned.
 
+    Key design changes for spectral fidelity:
+    -----------------------------------------
+    - Tanh and adaptive normalization were removed. These nonlinearities, while useful for bounding outputs, can distort the spectral signature in ways that are difficult to interpret and may compromise scientific analysis.
+    - Instead, a single global learnable scale parameter is introduced. This provides linear, interpretable range control and preserves the relative relationships between spectral bands.
+    - torch.clamp(x, -1.0, 1.0) is applied during both training and inference for safety, ensuring no extreme values propagate, but the transformation remains linear.
+    - This approach aligns with the scientific goal of preserving spectral signature fidelity, allowing post-hoc calibration and interpretation.
+    - Global scaling is biologically plausible, as real plant reflectance spectra can vary in magnitude due to illumination, but the *shape* (ratios) is most important for analysis.
     """
     # NOTE: We assume that background pixels in padded multispectral input are encoded as NaN.
     # This adapter explicitly masks (zeroes out) these background pixels to avoid propagating NaNs.
@@ -371,6 +368,7 @@ class SpectralAdapter(nn.Module):
     ):
         super().__init__()
         self.use_attention = use_attention
+        # Tanh and adaptive normalization are removed
 
         # Initialize spectral attention if needed
         if use_attention and in_channels == num_bands:
@@ -389,6 +387,22 @@ class SpectralAdapter(nn.Module):
 
         # SiLU activation (also known as Swish) - nonlinear activation function
         self.activation = nn.SiLU()
+
+        # Single global scale parameter for linear range control
+        # This replaces both adaptive norm and Tanh, preserving linearity for spectral fidelity
+        self.global_scale = nn.Parameter(torch.tensor(1.0))
+        
+        # Global scale convergence monitoring
+        self.scale_history = []  # Track scale values during training
+        self.scale_convergence_threshold = 0.001  # Consider converged if std < threshold
+        self.scale_warning_threshold = 0.01  # Warn if scale < 0.01
+        self.scale_collapse_threshold = 0.001  # Consider collapsed if scale < 0.001
+        self.scale_explosion_threshold = 5.0  # Warn if scale > 5.0
+        self.convergence_window = 100  # Number of steps to consider for convergence
+        self.step_counter = 0  # Track training steps for logging
+        self.log_interval = 50  # Log scale info every N steps
+        self.convergence_warning_issued = False  # Track if convergence warning was issued
+        self.collapse_warning_issued = False  # Track if collapse warning was issued
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apply background mask: Set any NaNs to 0.0 (e.g., padding area)
@@ -417,11 +431,160 @@ class SpectralAdapter(nn.Module):
         # Final channel adaptation (linear: conv only, no activation)
         x = self.conv3(x)
 
+        # --- Output Range Control ---
+        # Global scaling and clamping removed for natural evolution of decoder output.
+        #
+        # If you want to enable global scaling or output clamping for safety or downstream requirements,
+        # uncomment the following lines:
+        # x = x * self.global_scale
+        # x = torch.clamp(x, -1.0, 1.0)
+
         # Log adapter output stats for NaN debugging
         if torch.isnan(x).any():
             logger.debug("[NaN DEBUG] NaNs in SpectralAdapter output.")
         logger.debug(f"[NaN DEBUG] SpectralAdapter output stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+
         return x
+
+    def monitor_global_scale_convergence(self) -> Dict[str, any]:
+        """
+        Monitor global scale convergence and provide detailed analysis.
+        
+        This method tracks the global scale parameter's behavior during training to:
+        1. Detect convergence (stability of scale values)
+        2. Identify collapse (scale approaching zero)
+        3. Detect explosion (scale becoming too large)
+        4. Provide early warnings for training issues
+        5. Track convergence metrics for scientific analysis
+        
+        Returns:
+            Dictionary containing convergence analysis:
+            - scale_value: Current scale value
+            - scale_mean: Mean of recent scale values
+            - scale_std: Standard deviation of recent scale values
+            - is_converged: Whether scale has converged (std < threshold)
+            - is_collapsed: Whether scale has collapsed (value < collapse_threshold)
+            - is_exploded: Whether scale has exploded (value > explosion_threshold)
+            - convergence_rate: Rate of change in recent steps
+            - history_length: Number of tracked values
+            - warnings: List of active warnings
+            - recommendations: Suggested actions
+        """
+        current_scale = self.global_scale.item()
+        
+        # Track scale history
+        self.scale_history.append(current_scale)
+        self.step_counter += 1
+        
+        # Keep only recent history for efficiency
+        if len(self.scale_history) > self.convergence_window:
+            self.scale_history = self.scale_history[-self.convergence_window:]
+        
+        # Compute convergence metrics
+        if len(self.scale_history) >= 10:  # Need at least 10 values for meaningful stats
+            recent_scales = self.scale_history[-min(50, len(self.scale_history)):]  # Last 50 values
+            scale_mean = np.mean(recent_scales)
+            scale_std = np.std(recent_scales)
+            
+            # Check convergence (low standard deviation)
+            is_converged = scale_std < self.scale_convergence_threshold
+            
+            # Check for collapse (scale too small)
+            is_collapsed = current_scale < self.scale_collapse_threshold
+            
+            # Check for explosion (scale too large)
+            is_exploded = current_scale > self.scale_explosion_threshold
+            
+            # Compute convergence rate (change over recent steps)
+            if len(recent_scales) >= 2:
+                convergence_rate = abs(recent_scales[-1] - recent_scales[0]) / len(recent_scales)
+            else:
+                convergence_rate = 0.0
+        else:
+            # Not enough data yet
+            scale_mean = current_scale
+            scale_std = 0.0
+            is_converged = False
+            is_collapsed = False
+            is_exploded = False
+            convergence_rate = 0.0
+        
+        # Generate warnings and recommendations
+        warnings = []
+        recommendations = []
+        
+        # Collapse warnings
+        if is_collapsed and not self.collapse_warning_issued:
+            warnings.append(f"CRITICAL: Global scale collapsed to {current_scale:.6f}")
+            recommendations.append("Consider: 1) Lower learning rate, 2) Different initialization, 3) Add scale regularization")
+            self.collapse_warning_issued = True
+        elif not is_collapsed:
+            self.collapse_warning_issued = False
+        
+        # Explosion warnings
+        if is_exploded:
+            warnings.append(f"WARNING: Global scale exploded to {current_scale:.6f}")
+            recommendations.append("Consider: 1) Lower learning rate, 2) Add gradient clipping, 3) Scale regularization")
+        
+        # Convergence warnings
+        if len(self.scale_history) >= 50 and not is_converged and not self.convergence_warning_issued:
+            warnings.append(f"WARNING: Scale not converging (std={scale_std:.6f} > {self.scale_convergence_threshold})")
+            recommendations.append("Consider: 1) Check learning rate, 2) Monitor gradients, 3) Verify data normalization")
+            self.convergence_warning_issued = True
+        elif is_converged:
+            self.convergence_warning_issued = False
+        
+        # Value range warnings
+        if current_scale < self.scale_warning_threshold:
+            warnings.append(f"WARNING: Scale {current_scale:.6f} is very small")
+            recommendations.append("Consider: 1) Check data normalization, 2) Lower learning rate")
+        
+        # Log detailed information periodically
+        if self.step_counter % self.log_interval == 0:
+            logger.info(f"[Scale Monitor] Step {self.step_counter}: scale={current_scale:.6f}, "
+                       f"mean={scale_mean:.6f}, std={scale_std:.6f}, converged={is_converged}, "
+                       f"rate={convergence_rate:.6f}, history_len={len(self.scale_history)}")
+            
+            if warnings:
+                for warning in warnings:
+                    logger.warning(f"[Scale Monitor] {warning}")
+        
+        return {
+            'scale_value': current_scale,
+            'scale_mean': scale_mean,
+            'scale_std': scale_std,
+            'is_converged': is_converged,
+            'is_collapsed': is_collapsed,
+            'is_exploded': is_exploded,
+            'convergence_rate': convergence_rate,
+            'history_length': len(self.scale_history),
+            'warnings': warnings,
+            'recommendations': recommendations,
+            'step_counter': self.step_counter
+        }
+
+    def get_scale_monitoring_info(self) -> Dict[str, any]:
+        """
+        Get comprehensive scale monitoring information for logging and analysis.
+        
+        Returns:
+            Dictionary containing all scale monitoring data
+        """
+        convergence_info = self.monitor_global_scale_convergence()
+        
+        return {
+            'global_scale': convergence_info['scale_value'],
+            'scale_mean': convergence_info['scale_mean'],
+            'scale_std': convergence_info['scale_std'],
+            'is_converged': convergence_info['is_converged'],
+            'is_collapsed': convergence_info['is_collapsed'],
+            'is_exploded': convergence_info['is_exploded'],
+            'convergence_rate': convergence_info['convergence_rate'],
+            'history_length': convergence_info['history_length'],
+            'warnings': convergence_info['warnings'],
+            'recommendations': convergence_info['recommendations'],
+            'step_counter': convergence_info['step_counter']
+        }
 
 # ------------------------------------------------------------
 # InputAdapter: Defensive coding for numerical stability
@@ -534,8 +697,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     def __init__(
         self,
         *, # forces all arguments to be keyword-only, which is expected by the Diffusers .from_pretrained() logic.
-        #CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
-        pretrained_model_name_or_path: str = None,  # TODO add default
+        pretrained_model_name_or_path: str = None, #CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
         in_channels: int = 5,
         out_channels: int = 5,
         adapter_channels: int = 32,
@@ -546,25 +708,21 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         revision: str = None,
         variant: str = None,
         torch_dtype: torch.dtype = None,
+        use_saturation_penalty: bool = False, # set use_saturation_penalty=True when initializing
     ):
-        # Set config attributes on self
+        # Adapter config: these are for the adapters only, not the backbone
         self.adapter_placement = adapter_placement
         self.use_spectral_attention = use_spectral_attention
         self.use_sam_loss = use_sam_loss
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.in_channels = in_channels  # Adapter input channels (e.g., 5 for multispectral)
+        self.out_channels = out_channels  # Adapter output channels (e.g., 5 for multispectral)
         self.adapter_channels = adapter_channels
-        
-        # Ensure in_channels and out_channels are set to 5 for multispectral data
-        if in_channels != 5:
-            logger.warning(f"in_channels should be 5 for multispectral data, got {in_channels}")
-        if out_channels != 5:
-            logger.warning(f"out_channels should be 5 for multispectral data, got {out_channels}")
+        self.use_saturation_penalty = use_saturation_penalty
 
-        # Check for required pretrained_model_name_or_path
+        # The backbone (SD3 VAE) is always 3->3 channels, regardless of adapter config
+        # This is critical: the adapters handle 5->3 and 3->5 translation
         if pretrained_model_name_or_path is None:
             raise ValueError("`pretrained_model_name_or_path` must be passed to `from_pretrained()` or stored in config.")
-        # Load the base config and pass it to the parent __init__.
         config = AutoencoderKL.load_config(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -572,28 +730,27 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             variant=variant,
         )
         # Remove adapter-specific config keys before AutoencoderKL.__init__
-        # otherwise loading from pretrained config.json has base class encounter unexpected keywords 
         adapter_keys = {
             "pretrained_model_name_or_path",
             "adapter_channels",
             "adapter_placement",
             "use_spectral_attention",
             "use_sam_loss",
-            "in_channels",
-            "out_channels",
             "revision",
             "subfolder",
             "torch_dtype",
             "variant",
+            "use_saturation_penalty",
+            "in_channels",
+            "out_channels",
         }
         config = {k: v for k, v in config.items() if k not in adapter_keys}
+        # Force backbone to always use 3 input/output channels
+        config["in_channels"] = 3
+        config["out_channels"] = 3
         super().__init__(**config)
-        
-        # Override the config values with our multispectral settings
-        # This ensures that in_channels and out_channels are set to 5 regardless of the base model
-        self.config.in_channels = in_channels
-        self.config.out_channels = out_channels
-        
+
+        # Adapters handle the translation between multispectral and RGB
         self.load_from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -603,30 +760,32 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         )
 
     def load_from_pretrained(self, pretrained_model_name_or_path, subfolder=None, revision=None, variant=None, torch_dtype=None):
-        # This method ensures compatibility with Hugging Face's pretrained models, while allowing for custom adapter logic.
+        # Load the SD3 VAE backbone with 3 input/output channels (never 5)
         base_model = AutoencoderKL.from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
             revision=revision,
             variant=variant,
             torch_dtype=torch_dtype,
+            ignore_mismatched_sizes=True,
+            low_cpu_mem_usage=False,
         )
         self.load_state_dict(base_model.state_dict(), strict=False)
 
-        # Use self.adapter_placement, self.use_spectral_attention, etc.
+        # Adapters: input_adapter (5->3), output_adapter (3->5)
         if self.adapter_placement in ["input", "both"]:
             self.input_adapter = SpectralAdapter(
-                self.in_channels, 3,
+                self.in_channels, 3,  # 5->3
                 use_attention=self.use_spectral_attention,
                 num_bands=self.in_channels
             )
         if self.adapter_placement in ["output", "both"]:
             self.output_adapter = SpectralAdapter(
-                3, self.out_channels,
+                3, self.out_channels,  # 3->5
                 use_attention=self.use_spectral_attention,
                 num_bands=self.out_channels
             )
-        # Freeze backbone by default
+        # Freeze backbone by default (adapters are trainable)
         self.freeze_backbone()
 
     # Freezing pretrained SD3 VAE ensures latent space remains aligned with pretrained distributions.
@@ -654,6 +813,63 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         if hasattr(self, 'output_adapter'):
             params.extend(self.output_adapter.parameters())
         return params
+
+    def get_scale_monitoring_info(self) -> Dict[str, any]:
+        """
+        Get comprehensive scale monitoring information from all adapters.
+        
+        Returns:
+            Dictionary containing scale monitoring data from all adapters
+        """
+        monitoring_info = {
+            'input_adapter': None,
+            'output_adapter': None,
+            'overall_status': 'unknown',
+            'combined_warnings': [],
+            'combined_recommendations': []
+        }
+        
+        # Collect monitoring info from input adapter
+        if hasattr(self, 'input_adapter') and hasattr(self.input_adapter, 'get_scale_monitoring_info'):
+            monitoring_info['input_adapter'] = self.input_adapter.get_scale_monitoring_info()
+        
+        # Collect monitoring info from output adapter
+        if hasattr(self, 'output_adapter') and hasattr(self.output_adapter, 'get_scale_monitoring_info'):
+            monitoring_info['output_adapter'] = self.output_adapter.get_scale_monitoring_info()
+        
+        # Determine overall status and collect warnings
+        input_collapsed = (monitoring_info['input_adapter'] and 
+                          monitoring_info['input_adapter'].get('is_collapsed', False))
+        output_collapsed = (monitoring_info['output_adapter'] and 
+                           monitoring_info['output_adapter'].get('is_collapsed', False))
+        input_exploded = (monitoring_info['input_adapter'] and 
+                         monitoring_info['input_adapter'].get('is_exploded', False))
+        output_exploded = (monitoring_info['output_adapter'] and 
+                          monitoring_info['output_adapter'].get('is_exploded', False))
+        
+        # Collect all warnings and recommendations
+        if monitoring_info['input_adapter']:
+            monitoring_info['combined_warnings'].extend(monitoring_info['input_adapter'].get('warnings', []))
+            monitoring_info['combined_recommendations'].extend(monitoring_info['input_adapter'].get('recommendations', []))
+        
+        if monitoring_info['output_adapter']:
+            monitoring_info['combined_warnings'].extend(monitoring_info['output_adapter'].get('warnings', []))
+            monitoring_info['combined_recommendations'].extend(monitoring_info['output_adapter'].get('recommendations', []))
+        
+        # Determine overall status
+        if input_collapsed or output_collapsed:
+            monitoring_info['overall_status'] = 'collapsed'
+        elif input_exploded or output_exploded:
+            monitoring_info['overall_status'] = 'exploded'
+        elif (monitoring_info['input_adapter'] and monitoring_info['input_adapter'].get('is_converged', False)) and \
+             (monitoring_info['output_adapter'] and monitoring_info['output_adapter'].get('is_converged', False)):
+            monitoring_info['overall_status'] = 'converged'
+        elif len(monitoring_info['combined_warnings']) > 0:
+            monitoring_info['overall_status'] = 'warning'
+        else:
+            monitoring_info['overall_status'] = 'healthy'
+        
+        return monitoring_info
 
     # Design Rationale: Multi-objective Loss
     # --------------------------------------
@@ -770,6 +986,19 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # Total loss (currently just MSE, but could be weighted combination)
         losses['total_loss'] = losses['mse']
 
+        # TODO: Add optional range regularization term to penalize outputs that deviate too far from expected [-1, 1] range.
+        # Example (to be added in future):
+        #   range_penalty = (reconstructed.max() - reconstructed.min() - 2.0).clamp(min=0.0)
+        #   losses["range_penalty"] = range_penalty
+        #   losses["total_loss"] += gamma * range_penalty
+        # Saturation penalty: softly discourages outputs from nearing ±1 extremes,
+        # which can compress spectral details important in plant stress analysis.
+        # Applies penalty only if use_saturation_penalty=True was set during model init.
+        if self.use_saturation_penalty:
+            saturation_penalty = torch.mean(F.relu(torch.abs(reconstructed) - 0.95))
+            losses["saturation_penalty"] = saturation_penalty
+            losses["total_loss"] = losses["total_loss"] + 0.05 * saturation_penalty
+
         return losses
 
     # Corrected from_pretrained logic to fully instantiate the adapter with all required arguments
@@ -790,11 +1019,11 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         )
 
         # Step 2: Instantiate adapter model with all config + kwargs
-        # Ensure in_channels and out_channels are explicitly set to 5 for multispectral data
+        # Always force in_channels=5, out_channels=5 unless explicitly overridden
         model = cls(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
-            in_channels=kwargs.get("in_channels", 5),  # Force 5 channels for multispectral
-            out_channels=kwargs.get("out_channels", 5),  # Force 5 channels for multispectral
+            in_channels=kwargs.get("in_channels", 5),
+            out_channels=kwargs.get("out_channels", 5),
             adapter_channels=kwargs.get("adapter_channels", 32),
             adapter_placement=kwargs.get("adapter_placement", "both"),
             use_spectral_attention=kwargs.get("use_spectral_attention", True),
@@ -803,15 +1032,28 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             revision=kwargs.get("revision", None),
             variant=kwargs.get("variant", None),
             torch_dtype=kwargs.get("torch_dtype", None),
+            use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
         )
-        
-        # Verify configuration was set correctly
-        if model.config.in_channels != 5:
-            logger.warning(f"in_channels was not set correctly: {model.config.in_channels} != 5")
-        if model.config.out_channels != 5:
-            logger.warning(f"out_channels was not set correctly: {model.config.out_channels} != 5")
-
+        # Post-load assertion of in & out channels for robustness
+        assert model.config.in_channels == 5, f"Config in_channels must be 5 for multispectral VAE, got {model.config.in_channels}"
+        assert model.config.out_channels == 5, f"Config out_channels must be 5 for multispectral VAE, got {model.config.out_channels}"
         return model
+
+    def save_pretrained(self, save_directory, *args, **kwargs):
+        """
+        Override to forcibly register correct config fields before saving.
+        This guarantees in_channels=5, out_channels=5 are always written to config.json.
+        """
+        self.register_to_config(
+            in_channels=5,
+            out_channels=5,
+            adapter_placement=self.adapter_placement,
+            use_spectral_attention=self.use_spectral_attention,
+            use_sam_loss=self.use_sam_loss,
+            adapter_channels=self.adapter_channels,
+            use_saturation_penalty=self.use_saturation_penalty,
+        )
+        super().save_pretrained(save_directory, *args, **kwargs)
 
     @apply_forward_hook
     def encode(self, x: torch.Tensor, return_dict: bool = True) -> Union[AutoencoderKLOutput, Tuple]:
@@ -829,54 +1071,54 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     @apply_forward_hook
     def decode(self, z, return_dict: bool = True):
         """
-    Decode latent representation to 5-channel multispectral image.
+        Decode latent representation to 5-channel multispectral image.
 
-    This override of `AutoencoderKL.decode` extracts the decoded tensor from the SD3 backbone 
-    before applying the output adapter. The result can be returned as either a raw tensor 
-    (for training compatibility) or a DecoderOutput object (for downstream pipeline compatibility).
+        This override of `AutoencoderKL.decode` extracts the decoded tensor from the SD3 backbone 
+        before applying the output adapter. The result can be returned as either a raw tensor 
+        (for training compatibility) or a DecoderOutput object (for downstream pipeline compatibility).
 
-    RETURN_DICT VARIABILITY EXPLANATION:
-    ------------------------------------
-    The return_dict parameter enables compatibility with different usage patterns:
-    
-    1. return_dict=True (default): Returns DecoderOutput object
-       - Used by: HuggingFace pipelines, SD3 integration, downstream inference
-       - Access pattern: vae.decode(latents).sample
-       - Examples: 
-         * StableDiffusionPipeline.decode_latents(): image = vae.decode(latents).sample
-         * CogVideoXSTGPipeline.decode_latents(): frames = vae.decode(latents).sample
-         * VAE roundtrip: rgb_nchw = VaeImageProcessor.denormalize(decoding_nchw.sample)
-    
-    2. return_dict=False: Returns raw tensor directly
-       - Used by: Training scripts, custom loss computation, direct tensor operations
-       - Access pattern: reconstruction = vae.decode(z, return_dict=False)
-       - Examples:
-         * Training loops: reconstruction = model.decode(z, return_dict=False)
-         * Loss computation: losses = model.compute_losses(batch, reconstruction)
-         * Legacy pipelines: image = vae.decode(latents, return_dict=False)[0]
-    
-    This dual interface ensures:
-    - Backward compatibility with existing training code
-    - Forward compatibility with HuggingFace pipeline ecosystem
-    - No breaking changes to downstream SD3 integration
-    - Consistent behavior with base AutoencoderKL.decode() method
+        RETURN_DICT VARIABILITY EXPLANATION:
+        ------------------------------------
+        The return_dict parameter enables compatibility with different usage patterns:
+        
+        1. return_dict=True (default): Returns DecoderOutput object
+           - Used by: HuggingFace pipelines, SD3 integration, downstream inference
+           - Access pattern: vae.decode(latents).sample
+           - Examples: 
+             * StableDiffusionPipeline.decode_latents(): image = vae.decode(latents).sample
+             * CogVideoXSTGPipeline.decode_latents(): frames = vae.decode(latents).sample
+             * VAE roundtrip: rgb_nchw = VaeImageProcessor.denormalize(decoding_nchw.sample)
+        
+        2. return_dict=False: Returns raw tensor directly
+           - Used by: Training scripts, custom loss computation, direct tensor operations
+           - Access pattern: reconstruction = vae.decode(z, return_dict=False)
+           - Examples:
+             * Training loops: reconstruction = model.decode(z, return_dict=False)
+             * Loss computation: losses = model.compute_losses(batch, reconstruction)
+             * Legacy pipelines: image = vae.decode(latents, return_dict=False)[0]
+        
+        This dual interface ensures:
+        - Backward compatibility with existing training code
+        - Forward compatibility with HuggingFace pipeline ecosystem
+        - No breaking changes to downstream SD3 integration
+        - Consistent behavior with base AutoencoderKL.decode() method
 
-    IMPORTANT: The output adapter applies significant nonlinear transformations including:
-    - Spectral attention with sigmoid activation and element-wise multiplication
-    - Two convolutional blocks with SiLU activations and GroupNorm
-    - Final linear convolution
-    
-    These nonlinearities mean the output range is NOT constrained to [-1, 1] and may require
-    post-processing normalization depending on downstream usage.
+        IMPORTANT: The output adapter applies significant nonlinear transformations including:
+        - Spectral attention with sigmoid activation and element-wise multiplication
+        - Two convolutional blocks with SiLU activations and GroupNorm
+        - Final linear convolution
+        
+        These nonlinearities mean the output range is NOT constrained to [-1, 1] and may require
+        post-processing normalization depending on downstream usage.
 
-    Args:
-        z (torch.Tensor): Latent vector.
-        return_dict (bool): If True, returns DecoderOutput object. If False, returns raw tensor.
+        Args:
+            z (torch.Tensor): Latent vector.
+            return_dict (bool): If True, returns DecoderOutput object. If False, returns raw tensor.
 
-    Returns:
-        Union[DecoderOutput, torch.Tensor]: Reconstructed 5-channel image with nonlinear transformations applied.
-                     Output range is not guaranteed to be [-1, 1] due to adapter nonlinearities.
-    """
+        Returns:
+            Union[DecoderOutput, torch.Tensor]: Reconstructed 5-channel image with nonlinear transformations applied.
+                         Output range is not guaranteed to be [-1, 1] due to adapter nonlinearities.
+        """
         # Get base decoder output
         raw = super().decode(z, return_dict=True)
         
@@ -979,8 +1221,34 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             if 'mask_stats' in losses:
                 stats = losses['mask_stats']
                 logger.debug(f"[DEBUG] Mask stats — coverage: {stats['coverage']:.4f}, valid_pixels: {stats['valid_pixels']}/{stats['total_pixels']}")
+
+            # Global scale monitoring: logs the learned scalar after each forward pass during training.
+            # This is critical for ensuring the output magnitude remains biologically meaningful.
+            # A scale too small (<0.1) or too large (>3.0) can indicate loss of spectral fidelity.
+            # Log and check global scale if output_adapter exists
+            if hasattr(self, "output_adapter"):
+                global_scale_val = self.output_adapter.global_scale.item()
+                logger.info(f"[Monitor] Global scale: {global_scale_val:.4f}")
+                if global_scale_val < 0.1 or global_scale_val > 3.0:
+                    logger.warning(f"[Monitor] Global scale {global_scale_val:.4f} is outside recommended bounds [0.1, 3.0].")
             
             return decoded_tensor, losses
 
-        # In evaluation mode, return decoded output and None for losses
-        return decoded_tensor, None
+        # In evaluation mode, still compute losses for validation tracking
+        losses = self.compute_losses(x, decoded_tensor, mask)
+        
+        # Global scale convergence monitoring (both training and eval modes)
+        # This provides comprehensive tracking of scale behavior for scientific analysis
+        if hasattr(self, "output_adapter") and hasattr(self.output_adapter, "monitor_global_scale_convergence"):
+            scale_info = self.output_adapter.monitor_global_scale_convergence()
+            
+            # Log critical issues immediately
+            if scale_info['is_collapsed']:
+                logger.error(f"[Scale Monitor] CRITICAL: Output scale collapsed to {scale_info['scale_value']:.6f}")
+            elif scale_info['is_exploded']:
+                logger.error(f"[Scale Monitor] CRITICAL: Output scale exploded to {scale_info['scale_value']:.6f}")
+            
+            # Add scale monitoring info to losses for external logging
+            losses['scale_monitoring'] = scale_info
+        
+        return decoded_tensor, losses

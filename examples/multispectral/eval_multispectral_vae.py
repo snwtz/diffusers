@@ -37,6 +37,96 @@ try:
 except ImportError:
     torch_ssim = None
 
+def plot_pseudo_rgb(original, reconstructed, outdir, idx):
+    """
+    Create pseudo-RGB visualization of multispectral images.
+    
+    Maps the 5 spectral bands to RGB channels for human visualization:
+    - Band 1 (474.73nm - Blue) -> Blue channel
+    - Band 2 (538.71nm - Green) -> Green channel  
+    - Band 3 (650.665nm - Red) -> Red channel
+    - Band 4 (730.635nm - Red-edge) -> Additional red contribution
+    - Band 5 (850.59nm - NIR) -> Additional green contribution
+    
+    This mapping follows the biological relevance of each band for plant health analysis.
+    """
+    os.makedirs(outdir, exist_ok=True)
+    
+    # Create pseudo-RGB mapping based on spectral characteristics
+    # Band 1 (Blue 474.73nm) -> Blue channel
+    # Band 2 (Green 538.71nm) -> Green channel
+    # Band 3 (Red 650.665nm) -> Red channel
+    # Band 4 (Red-edge 730.635nm) -> Additional red contribution (stress detection)
+    # Band 5 (NIR 850.59nm) -> Additional green contribution (health indicator)
+    
+    def create_pseudo_rgb(bands):
+        # Normalize from [-1, 1] to [0, 1] for RGB visualization
+        bands_norm = (bands + 1) / 2
+        
+        # Create RGB channels with spectral mapping
+        r = bands_norm[2] * 0.7 + bands_norm[3] * 0.3  # Red + Red-edge
+        g = bands_norm[1] * 0.6 + bands_norm[4] * 0.4  # Green + NIR
+        b = bands_norm[0]  # Blue
+        
+        # Stack channels and ensure proper range
+        rgb = np.stack([r, g, b], axis=0)
+        rgb = np.clip(rgb, 0, 1)
+        return rgb
+    
+    # Create pseudo-RGB for original and reconstructed
+    orig_rgb = create_pseudo_rgb(original)
+    recon_rgb = create_pseudo_rgb(reconstructed)
+    
+    # Create visualization
+    fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+    
+    # Original pseudo-RGB
+    axes[0].imshow(orig_rgb.transpose(1, 2, 0))
+    axes[0].set_title('Original Pseudo-RGB\n(B1→B, B2→G, B3→R, B4→R+, B5→G+)')
+    axes[0].axis('off')
+    
+    # Reconstructed pseudo-RGB
+    axes[1].imshow(recon_rgb.transpose(1, 2, 0))
+    axes[1].set_title('Reconstructed Pseudo-RGB\n(B1→B, B2→G, B3→R, B4→R+, B5→G+)')
+    axes[1].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f'sample_{idx}_pseudo_rgb.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    
+    # Also save individual RGB channels for detailed analysis
+    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+    
+    # Original channels
+    axes[0, 0].imshow(orig_rgb[0], cmap='Blues', vmin=0, vmax=1)
+    axes[0, 0].set_title('Original - Blue (B1: 474.73nm)')
+    axes[0, 0].axis('off')
+    
+    axes[0, 1].imshow(orig_rgb[1], cmap='Greens', vmin=0, vmax=1)
+    axes[0, 1].set_title('Original - Green (B2: 538.71nm + B5: 850.59nm)')
+    axes[0, 1].axis('off')
+    
+    axes[0, 2].imshow(orig_rgb[2], cmap='Reds', vmin=0, vmax=1)
+    axes[0, 2].set_title('Original - Red (B3: 650.665nm + B4: 730.635nm)')
+    axes[0, 2].axis('off')
+    
+    # Reconstructed channels
+    axes[1, 0].imshow(recon_rgb[0], cmap='Blues', vmin=0, vmax=1)
+    axes[1, 0].set_title('Reconstructed - Blue (B1: 474.73nm)')
+    axes[1, 0].axis('off')
+    
+    axes[1, 1].imshow(recon_rgb[1], cmap='Greens', vmin=0, vmax=1)
+    axes[1, 1].set_title('Reconstructed - Green (B2: 538.71nm + B5: 850.59nm)')
+    axes[1, 1].axis('off')
+    
+    axes[1, 2].imshow(recon_rgb[2], cmap='Reds', vmin=0, vmax=1)
+    axes[1, 2].set_title('Reconstructed - Red (B3: 650.665nm + B4: 730.635nm)')
+    axes[1, 2].axis('off')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(outdir, f'sample_{idx}_pseudo_rgb_channels.png'), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
 def plot_bands(original, reconstructed, outdir, idx):
     """Save side-by-side plots of all 5 bands for original and reconstructed images."""
     os.makedirs(outdir, exist_ok=True)
@@ -438,7 +528,18 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = AutoencoderKL.from_pretrained(args.model_dir)
+    model = AutoencoderKL.from_pretrained(
+        args.model_dir,
+        in_channels=5,  # for adapters
+        out_channels=5,  # for adapters
+        latent_channels=16,
+        adapter_placement="both",
+        use_spectral_attention=True,
+        use_sam_loss=True,
+        use_saturation_penalty=True,
+        ignore_mismatched_sizes=True,
+        low_cpu_mem_usage=False,
+    )
     model = model.to(device)
     model.eval()
 
@@ -468,7 +569,9 @@ def main():
         if isinstance(batch, (tuple, list)):
             batch = batch[0]
         batch = batch.to(device)
-        mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+        mask = mask.to(device)
+        if mask is None:
+            print(f"[MASK WARNING] No mask provided for evaluation batch {idx}!")
         
         with torch.no_grad():
             recon, _ = model(batch)
@@ -478,6 +581,30 @@ def main():
             else:
                 decoded_tensor = recon
 
+        # --- TEMP DEBUG: Check if model output is inverted relative to input ---
+        # Find one valid pixel within the mask (foreground/leaf)
+        mask_np_batch = mask.cpu().numpy()[0, 0]  # shape: (H, W)
+        yx = np.argwhere(mask_np_batch > 0)
+        if len(yx) > 0:
+            y, x = yx[len(yx) // 2]  # select middle leaf pixel
+        else:
+            y, x = 25, 25  # fallback
+
+        orig_pixel = batch[0, :, y, x].detach().cpu().numpy()
+        recon_pixel = decoded_tensor[0, :, y, x].detach().cpu().numpy()
+
+        print(f"[DEBUG] Spectral curve at pixel ({y},{x}):")
+        print("Original (normalized):", np.round(orig_pixel, 3))
+        print("Reconstructed (normalized):", np.round(recon_pixel, 3))
+
+        corr = np.corrcoef(orig_pixel, recon_pixel)[0, 1]
+        print(f"[DEBUG] Correlation between original and reconstruction: {corr:.3f}")
+
+        if corr < -0.5:
+            print("[WARNING] Strong negative correlation detected — potential spectral inversion.")
+
+        # NOTE: Comment or remove this block once inversion issue is resolved.
+
         orig_np = batch.cpu().numpy()
         recon_np = decoded_tensor.cpu().numpy()
         mask_np = mask.cpu().numpy()
@@ -485,6 +612,7 @@ def main():
         # Visualize
         if idx < args.num_samples:
             plot_bands(orig_np[0], recon_np[0], args.output_dir, idx)
+            plot_pseudo_rgb(orig_np[0], recon_np[0], args.output_dir, idx)
             points = plot_spectral_signature(orig_np[0], recon_np[0], mask_np, args.output_dir, idx)
             plot_error_maps(orig_np[0], recon_np[0], mask_np[0], args.output_dir, idx, points)
             # Check for normalization consistency and potential inversions

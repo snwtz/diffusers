@@ -19,6 +19,17 @@ Data Flow Summary:
 - Loss: Multi-objective (MSE + SAM), with mask-aware background handling
 - Logging: Per-epoch metrics, band importance, and SSIM for scientific analysis
 
+Training Strategy:
+The model should naturally learn to produce outputs in the [-1, 1] range because:
+Input data is normalized to [-1, 1]
+Loss function penalizes reconstruction error
+The model will learn to match the input distribution
+
+However:
+- The nonlinear processes (spectral attention, SiLU) contain important spectral information
+- spectral relationships learned by the attention mechanism need to be preserved (no hard clamping or tanh activation to force data range [-1/1])
+- 
+
 Thesis Context and Training Workflow:
 ----------------------------------
 1. Research Pipeline:
@@ -133,10 +144,11 @@ Usage:
 
 
     # Then, train the VAE:
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0 --use_saturation_penalty
+NOTE: add to your CLI call: --use_saturation_penalty
 
     # Testing
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0 --use_saturation_penalty
 
 VAE Loading Note:
    RGB VAE weights from SD3 could not be loaded directly via `from_pretrained()` using a config object,
@@ -164,11 +176,13 @@ import shutil
 from typing import Tuple
 import numpy as np  # Ensure numpy is imported
 from skimage.metrics import structural_similarity as ssim
+import time # Added for timing
 
 from diffusers import AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
 from vae_multispectral_dataloader import create_vae_dataloaders
+from training_logger import create_training_logger
 
 def setup_logging(args):
     # Create logs directory for experiment traceability and reproducibility
@@ -233,6 +247,35 @@ def log_training_metrics(logger, epoch, train_losses, val_losses, band_importanc
         logger.info(f"  Coverage: {val_mask_stats['coverage']:.4f}")
         logger.info(f"  Valid pixels: {val_mask_stats['valid_pixels']}/{val_mask_stats['total_pixels']}")
     
+    # Log scale monitoring information if available
+    if 'scale_monitoring' in train_losses:
+        scale_info = train_losses['scale_monitoring']
+        logger.info("Scale Monitoring (Training):")
+        logger.info(f"  Global Scale: {scale_info['scale_value']:.6f}")
+        logger.info(f"  Scale Mean: {scale_info['scale_mean']:.6f}")
+        logger.info(f"  Scale Std: {scale_info['scale_std']:.6f}")
+        logger.info(f"  Is Converged: {scale_info['is_converged']}")
+        logger.info(f"  Convergence Rate: {scale_info['convergence_rate']:.6f}")
+        logger.info(f"  History Length: {scale_info['history_length']}")
+        if scale_info['warnings']:
+            logger.warning("  Scale Warnings:")
+            for warning in scale_info['warnings']:
+                logger.warning(f"    {warning}")
+        if scale_info['recommendations']:
+            logger.info("  Scale Recommendations:")
+            for rec in scale_info['recommendations']:
+                logger.info(f"    {rec}")
+    
+    if 'scale_monitoring' in val_losses:
+        scale_info = val_losses['scale_monitoring']
+        logger.info("Scale Monitoring (Validation):")
+        logger.info(f"  Global Scale: {scale_info['scale_value']:.6f}")
+        logger.info(f"  Scale Mean: {scale_info['scale_mean']:.6f}")
+        logger.info(f"  Scale Std: {scale_info['scale_std']:.6f}")
+        logger.info(f"  Is Converged: {scale_info['is_converged']}")
+        logger.info(f"  Convergence Rate: {scale_info['convergence_rate']:.6f}")
+        logger.info(f"  History Length: {scale_info['history_length']}")
+    
     # Log output range statistics if provided
     if output_range_stats:
         logger.info("Output Range Statistics:")
@@ -250,79 +293,198 @@ def log_training_metrics(logger, epoch, train_losses, val_losses, band_importanc
                           f"is outside expected [-1, 1] range. Consider adjusting SSIM data_range parameter.")
 
 def setup_wandb(args):
-    # Initializes Weights & Biases for experiment tracking and reproducibility
-    wandb.init(
-        project="multispectral-vae",
-        config={
-            "learning_rate": args.learning_rate,
-            "batch_size": args.batch_size,
-            "num_epochs": args.num_epochs,
-            "adapter_placement": args.adapter_placement,
-            "use_spectral_attention": args.use_spectral_attention,
-            "use_sam_loss": args.use_sam_loss,
-            "warmup_ratio": args.warmup_ratio,
-            "early_stopping_patience": args.early_stopping_patience
-        }
-    )
-
-def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, output_range_stats=None):
-    # Logs metrics and sample images to Weights & Biases for visualization and analysis
-    wandb_log_data = {
-        "epoch": epoch,
-        "train_total_loss": train_losses.get('total_loss', float('nan')),
-        "val_total_loss": val_losses.get('total_loss', float('nan')),
-        **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses.get('mse_per_channel', []))},
-        **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses.get('mse_per_channel', []))},
-        **{f"band_importance_{k}": v for k, v in band_importance.items()},
-        # "original_images": wandb.Image(batch[0]),
-        # "reconstructed_images": wandb.Image(reconstruction[0])
-        "original_images_band0": wandb.Image(batch[0][0:1]),  # First channel as grayscale
-        "reconstructed_images_band0": wandb.Image(reconstruction[0][0:1])
-    }
-    
-    # Add mask statistics if available
-    if 'mask_stats' in train_losses:
-        train_mask_stats = train_losses['mask_stats']
-        wandb_log_data.update({
-            "mask/train_coverage": train_mask_stats['coverage'],
-            "mask/train_valid_pixels": train_mask_stats['valid_pixels'],
-            "mask/train_total_pixels": train_mask_stats['total_pixels']
-        })
-    
-    if 'mask_stats' in val_losses:
-        val_mask_stats = val_losses['mask_stats']
-        wandb_log_data.update({
-            "mask/val_coverage": val_mask_stats['coverage'],
-            "mask/val_valid_pixels": val_mask_stats['valid_pixels'],
-            "mask/val_total_pixels": val_mask_stats['total_pixels']
-        })
-    
-    # Add output range statistics if available
-    if output_range_stats:
-        wandb_log_data.update({
-            "output_range/global_min": output_range_stats['global_min'],
-            "output_range/global_max": output_range_stats['global_max'],
-            "output_range/global_mean": output_range_stats['global_mean'],
-            "output_range/global_std": output_range_stats['global_std'],
-            "output_range/warning": output_range_stats['range_warning']
-        })
+    """Initializes Weights & Biases for experiment tracking and reproducibility."""
+    try:
+        # Create a descriptive run name
+        run_name = f"multispectral_vae_{args.adapter_placement}"
+        if args.use_spectral_attention:
+            run_name += "_spectral_attn"
+        if args.use_sam_loss:
+            run_name += "_sam"
+        run_name += f"_lr{args.learning_rate}_bs{args.batch_size}"
         
-        # Add per-band range statistics
-        for i, (min_val, max_val, mean_val, std_val) in enumerate(output_range_stats['per_band']):
+        wandb.init(
+            project="multispectral-vae",
+            name=run_name,
+            config={
+                "learning_rate": args.learning_rate,
+                "batch_size": args.batch_size,
+                "num_epochs": args.num_epochs,
+                "adapter_placement": args.adapter_placement,
+                "use_spectral_attention": args.use_spectral_attention,
+                "use_sam_loss": args.use_sam_loss,
+                "sam_weight": args.sam_weight,
+                "warmup_ratio": args.warmup_ratio,
+                "early_stopping_patience": args.early_stopping_patience,
+                "max_grad_norm": args.max_grad_norm,
+                "base_model_path": args.base_model_path,
+                "num_workers": args.num_workers,
+                "save_every": args.save_every,
+                "model_type": "multispectral_vae_adapter",
+                "input_channels": 5,
+                "output_channels": 5,
+                "latent_channels": 16,  # SD3 default
+            },
+            tags=["multispectral", "vae", "plant-health", "spectral-imaging"]
+        )
+        return True
+    except Exception as e:
+        # Use logger if available, otherwise print
+        try:
+            logger = logging.getLogger('multispectral_vae')
+            logger.warning(f"Failed to initialize wandb: {e}")
+        except:
+            print(f"Warning: Failed to initialize wandb: {e}")
+        return False
+
+def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats=None, ssim_per_band=None, current_lr=None, grad_norm=None):
+    """Logs metrics and sample images to Weights & Biases for visualization and analysis."""
+    # Check if wandb is initialized
+    if not wandb.run:
+        return
+    
+    try:
+        # Prepare metrics data
+        wandb_log_data = {
+            "epoch": epoch,
+            "train_total_loss": train_losses.get('total_loss', float('nan')),
+            "val_total_loss": val_losses.get('total_loss', float('nan')),
+            **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses.get('mse_per_channel', []))},
+            **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses.get('mse_per_channel', []))},
+            **{f"band_importance_{k}": v for k, v in band_importance.items()},
+        }
+        
+        # Add SSIM metrics if available
+        if ssim_per_band is not None:
             wandb_log_data.update({
-                f"output_range/band_{i}_min": min_val,
-                f"output_range/band_{i}_max": max_val,
-                f"output_range/band_{i}_mean": mean_val,
-                f"output_range/band_{i}_std": std_val,
+                "avg_ssim": np.mean(ssim_per_band),
+                **{f"ssim_band_{i}": ssim_val for i, ssim_val in enumerate(ssim_per_band)}
             })
-    
-    wandb.log(wandb_log_data)
-    
-    if 'sam' in train_losses and 'sam' in val_losses:
-        wandb.log({
-            "train_sam_loss": train_losses['sam'],
-            "val_sam_loss": val_losses['sam']
-        })
+        
+        # Add learning rate if available
+        if current_lr is not None:
+            wandb_log_data["learning_rate"] = current_lr
+        
+        # Add gradient norm if available
+        if grad_norm is not None:
+            wandb_log_data["gradient_norm"] = grad_norm
+        
+        # Add SAM loss if available
+        if 'sam' in train_losses and 'sam' in val_losses:
+            wandb_log_data.update({
+                "train_sam_loss": train_losses['sam'],
+                "val_sam_loss": val_losses['sam']
+            })
+        
+        # Add mask statistics if available
+        if 'mask_stats' in train_losses:
+            train_mask_stats = train_losses['mask_stats']
+            wandb_log_data.update({
+                "mask/train_coverage": train_mask_stats['coverage'],
+                "mask/train_valid_pixels": train_mask_stats['valid_pixels'],
+                "mask/train_total_pixels": train_mask_stats['total_pixels']
+            })
+        
+        if 'mask_stats' in val_losses:
+            val_mask_stats = val_losses['mask_stats']
+            wandb_log_data.update({
+                "mask/val_coverage": val_mask_stats['coverage'],
+                "mask/val_valid_pixels": val_mask_stats['valid_pixels'],
+                "mask/val_total_pixels": val_mask_stats['total_pixels']
+            })
+        
+        # Add scale monitoring metrics if available
+        if 'scale_monitoring' in train_losses:
+            scale_info = train_losses['scale_monitoring']
+            wandb_log_data.update({
+                "scale/train_global_scale": scale_info['scale_value'],
+                "scale/train_scale_mean": scale_info['scale_mean'],
+                "scale/train_scale_std": scale_info['scale_std'],
+                "scale/train_is_converged": scale_info['is_converged'],
+                "scale/train_convergence_rate": scale_info['convergence_rate'],
+                "scale/train_history_length": scale_info['history_length'],
+                "scale/train_is_collapsed": scale_info['is_collapsed'],
+                "scale/train_is_exploded": scale_info['is_exploded']
+            })
+        
+        if 'scale_monitoring' in val_losses:
+            scale_info = val_losses['scale_monitoring']
+            wandb_log_data.update({
+                "scale/val_global_scale": scale_info['scale_value'],
+                "scale/val_scale_mean": scale_info['scale_mean'],
+                "scale/val_scale_std": scale_info['scale_std'],
+                "scale/val_is_converged": scale_info['is_converged'],
+                "scale/val_convergence_rate": scale_info['convergence_rate'],
+                "scale/val_history_length": scale_info['history_length'],
+                "scale/val_is_collapsed": scale_info['is_collapsed'],
+                "scale/val_is_exploded": scale_info['is_exploded']
+            })
+        
+        # Add output range statistics if available
+        if output_range_stats:
+            wandb_log_data.update({
+                "output_range/global_min": output_range_stats['global_min'],
+                "output_range/global_max": output_range_stats['global_max'],
+                "output_range/global_mean": output_range_stats['global_mean'],
+                "output_range/global_std": output_range_stats['global_std'],
+                "output_range/warning": output_range_stats['range_warning']
+            })
+            
+            # Add per-band range statistics
+            for i, (min_val, max_val, mean_val, std_val) in enumerate(output_range_stats['per_band']):
+                wandb_log_data.update({
+                    f"output_range/band_{i}_min": min_val,
+                    f"output_range/band_{i}_max": max_val,
+                    f"output_range/band_{i}_mean": mean_val,
+                    f"output_range/band_{i}_std": std_val,
+                })
+
+        # Log learnable output scaling parameters (if available)
+        if hasattr(model.output_adapter, 'output_scale'):
+            wandb_log_data["output_adapter/output_scale"] = model.output_adapter.output_scale.item()
+        if hasattr(model.output_adapter, 'output_bias'):
+            wandb_log_data["output_adapter/output_bias"] = model.output_adapter.output_bias.item()
+        
+        # Log metrics
+        wandb.log(wandb_log_data)
+        
+        # Log sample images (first sample, first band as grayscale)
+        if batch is not None and reconstruction is not None:
+            try:
+                # Convert tensors to PIL images for wandb logging
+                # Normalize from [-1, 1] to [0, 255] range
+                orig_band0 = (batch[0, 0].detach().cpu().numpy() + 1.0) * 127.5
+                recon_band0 = (reconstruction[0, 0].detach().cpu().numpy() + 1.0) * 127.5
+                
+                # Ensure values are in valid range
+                orig_band0 = np.clip(orig_band0, 0, 255).astype(np.uint8)
+                recon_band0 = np.clip(recon_band0, 0, 255).astype(np.uint8)
+                
+                # Convert to PIL images
+                orig_pil = Image.fromarray(orig_band0, mode='L')  # Grayscale
+                recon_pil = Image.fromarray(recon_band0, mode='L')  # Grayscale
+                
+                # Log images to wandb
+                wandb.log({
+                    "images/original_band0": wandb.Image(orig_pil, caption=f"Original Band 0 - Epoch {epoch+1}"),
+                    "images/reconstructed_band0": wandb.Image(recon_pil, caption=f"Reconstructed Band 0 - Epoch {epoch+1}")
+                })
+            except Exception as img_error:
+                # Use logger if available, otherwise print
+                try:
+                    logger = logging.getLogger('multispectral_vae')
+                    logger.warning(f"Failed to log images to wandb: {img_error}")
+                except:
+                    print(f"Warning: Failed to log images to wandb: {img_error}")
+            
+    except Exception as e:
+        # Log error but don't crash training
+        try:
+            logger = logging.getLogger('multispectral_vae')
+            logger.warning(f"Failed to log to wandb: {e}")
+        except:
+            print(f"Warning: Failed to log to wandb: {e}")
+        # You could also use logger.warning here if logger is available
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args, best_val_loss=None, patience_counter=None):
     """Save model checkpoint.
@@ -378,13 +540,16 @@ def log_parameter_counts(model, logger, wandb_log=True):
     logger.info(f"  Total parameters: {param_counts['total']:,}")
     logger.info(f"  Trainable percentage: {param_counts['trainable_percentage']:.2f}%")
 
-    if wandb_log:
-        wandb.log({
-            "model/trainable_params": param_counts['trainable'],
-            "model/non_trainable_params": param_counts['non_trainable'],
-            "model/total_params": param_counts['total'],
-            "model/trainable_percentage": param_counts['trainable_percentage']
-        })
+    if wandb_log and wandb.run:
+        try:
+            wandb.log({
+                "model/trainable_params": param_counts['trainable'],
+                "model/non_trainable_params": param_counts['non_trainable'],
+                "model/total_params": param_counts['total'],
+                "model/trainable_percentage": param_counts['trainable_percentage']
+            })
+        except Exception as e:
+            logger.warning(f"Failed to log parameter counts to wandb: {e}")
 
 def compute_output_range_stats(reconstruction_batch: torch.Tensor) -> dict:
     """
@@ -514,11 +679,12 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     except Exception as e:
         raise RuntimeError(f"Failed to create dataloaders: {e}")
 
+    """
     # Sample inspection — checking first training batch for NaNs
     logger = logging.getLogger('multispectral_vae')
     logger.info(f"Sample inspection — checking first training batch for NaNs")
     # New debug check: inspect for NaNs before any sanitization or clamping
-    for sample_batch, _ in train_loader:
+    for sample_batch, mask in train_loader:
         logger.info("Checking for NaNs/Infs in first batch (pre-sanitization)...")
         raw_nan_check = torch.isnan(sample_batch)
         if raw_nan_check.any():
@@ -530,9 +696,10 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
         else:
             logger.info("First training batch is free of NaNs (pre-sanitization).")
         break
-
+    """
     return train_loader, val_loader
 
+    
 def load_checkpoint(checkpoint_path: str, model, optimizer, scheduler, device):
     """
     Load training state from a checkpoint.
@@ -579,6 +746,22 @@ def load_checkpoint(checkpoint_path: str, model, optimizer, scheduler, device):
     
     return start_epoch, best_val_loss, patience_counter
 
+def log_training_progress_to_wandb(step, total_loss, current_lr, grad_norm=None, log_interval=10):
+    """Log training progress to wandb during training loop."""
+    if wandb.run and step % log_interval == 0:
+        try:
+            log_data = {
+                "train_step": step,
+                "train_loss": total_loss.item() if hasattr(total_loss, 'item') else total_loss,
+                "learning_rate": current_lr
+            }
+            if grad_norm is not None:
+                log_data["gradient_norm"] = grad_norm
+            wandb.log(log_data)
+        except Exception as e:
+            # Silently fail to avoid disrupting training
+            pass
+
 def train(args: argparse.Namespace) -> None:
     """
     Main training function.
@@ -617,11 +800,43 @@ def train(args: argparse.Namespace) -> None:
 
     # Setup logging first (after output_dir is set)
     logger = setup_logging(args)
-    setup_wandb(args)
     logger.info(f"Starting multispectral VAE training with output directory: {args.output_dir}")
+    
+    # Setup training logger for compressed metrics
+    training_logger = create_training_logger(args.output_dir, "multispectral_vae_adapter")
+    
+    # Log training configuration
+    config = {
+        "base_model_path": args.base_model_path,
+        "num_epochs": args.num_epochs,
+        "batch_size": args.batch_size,
+        "learning_rate": args.learning_rate,
+        "adapter_placement": args.adapter_placement,
+        "use_spectral_attention": args.use_spectral_attention,
+        "use_sam_loss": args.use_sam_loss,
+        "sam_weight": args.sam_weight,
+        "use_saturation_penalty": args.use_saturation_penalty,
+        "warmup_ratio": args.warmup_ratio,
+        "early_stopping_patience": args.early_stopping_patience,
+        "max_grad_norm": args.max_grad_norm,
+        "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
+    training_logger.log_config(config)
+    
     # Setup persistent directory for saving image samples
     image_output_dir = os.path.join(args.output_dir, "image_samples")
     os.makedirs(image_output_dir, exist_ok=True)
+
+    # Setup wandb early to avoid UnboundLocalError
+    wandb_initialized = False
+    if not args.disable_wandb:
+        wandb_initialized = setup_wandb(args)
+        if wandb_initialized:
+            logger.info("Wandb initialized successfully")
+        else:
+            logger.warning("Wandb initialization failed - continuing without wandb logging")
+    else:
+        logger.info("Wandb logging disabled by user")
 
     # Load base SD3 VAE weights and inject fresh multispectral adapters
     try:
@@ -633,7 +848,8 @@ def train(args: argparse.Namespace) -> None:
             use_spectral_attention=args.use_spectral_attention,
             use_sam_loss=args.use_sam_loss,
             in_channels=5,  # Force 5 channels for multispectral input
-            out_channels=5   # Force 5 channels for multispectral output
+            out_channels=5,   # Force 5 channels for multispectral output
+            use_saturation_penalty=args.use_saturation_penalty,
         )
         logger.info("Successfully loaded base model")
         
@@ -644,15 +860,13 @@ def train(args: argparse.Namespace) -> None:
         logger.info(f"  - latent_channels: {model.config.latent_channels}")
         logger.info(f"  - adapter_placement: {model.adapter_placement}")
         logger.info(f"  - use_spectral_attention: {model.use_spectral_attention}")
-        
+        # Explicit assertion and log for input/output adapter channels (safer)
+        assert model.input_adapter.in_channels == 5, f"Input adapter expects {model.input_adapter.in_channels} channels, expected 5!"
+        assert model.output_adapter.out_channels == 5, f"Output adapter produces {model.output_adapter.out_channels} channels, expected 5!"
+        logger.info(f"[CHECK] Adapter input/output channels: {model.input_adapter.in_channels} → {model.output_adapter.out_channels}")
     except Exception as e:
         logger.error(f"Failed to load base model: {e}")
         raise RuntimeError(f"Model loading failed: {e}")
-
-    # NOTE: Unlike typical SD pipelines where model inputs are passed as dictionaries with keys like "pixel_values",
-    #       this training script uses direct tensor inputs. This works because the custom model accepts tensor input directly,
-    #       but care must be taken when integrating with HuggingFace-style SD pipelines later.
-    #       Direct tensor input simplifies the pipeline and ensures compatibility with custom dataloader and model, but may require adaptation for downstream SD integration.
 
     # Validate model has required methods
     required_methods = ['freeze_backbone', 'get_trainable_params', 'compute_losses']
@@ -675,7 +889,7 @@ def train(args: argparse.Namespace) -> None:
 
     # Log parameter counts before training
     # This helps track model complexity and training efficiency
-    log_parameter_counts(model, logger)
+    log_parameter_counts(model, logger, wandb_log=wandb_initialized)
 
     # Prepare dataset and dataloaders
     # Uses the VAE-specific dataloader for optimal data handling
@@ -713,14 +927,6 @@ def train(args: argparse.Namespace) -> None:
     # Improves training stability and final model quality
     ema_model = EMAModel(model.parameters())
 
-    # Setup wandb
-    # Enables experiment tracking and visualization
-    try:
-        setup_wandb(args)
-        logger.info("Wandb initialized successfully")
-    except Exception as e:
-        logger.warning(f"Failed to initialize wandb: {e}")
-
     # Initialize early stopping
     # Prevents overfitting and saves best model
     best_val_loss = float('inf')
@@ -740,7 +946,11 @@ def train(args: argparse.Namespace) -> None:
     logger.info(f"Training for {total_epochs_to_train} epochs (from epoch {start_epoch} to {args.num_epochs-1})")
     
     log_interval = 10  # Log every 10 steps (can make configurable)
+    current_grad_norm = None  # Track gradient norm for wandb logging
+    training_start_time = time.time()
+    
     for epoch in range(start_epoch, args.num_epochs):
+        epoch_start_time = time.time()
         model.train()
         train_losses = {
             'total_loss': 0,
@@ -751,7 +961,9 @@ def train(args: argparse.Namespace) -> None:
         # Training phase
         for step, (batch, mask) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training")):
             batch = batch.to(device)
-            mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+            mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
+            if mask is None:
+                logger.warning(f"[MASK WARNING] No mask provided for training batch at step {step}!")
             # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
             # Conceptually preserve the NaN-based primary mask for calculating masked losses!
             # Ensures that only valid data is passed to the model, preventing NaN/infinity propagation
@@ -787,16 +999,29 @@ def train(args: argparse.Namespace) -> None:
             total_loss = losses['mse']
             if args.use_sam_loss and 'sam' in losses:
                 total_loss = total_loss + args.sam_weight * losses['sam']
+            # Saturation penalty encourages outputs to remain well within the [-1, 1] range.
+            # Penalizing values close to ±1 avoids saturating activations which can destroy fine spectral distinctions.
+            # This term is optional and controlled by --use_saturation_penalty.
+            if 'saturation_penalty' in losses:
+                total_loss += losses['saturation_penalty']
             # Debugging: Check for NaN/Inf in total loss before backward
             if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
                 logger.warning("Detected NaN/Inf loss; skipping this batch.")
                 continue
 
             # Log decoder output range every log_interval steps
+            # NOTE: Tanh() is applied because "if not self.training" in eval mode!!
             if step % log_interval == 0:
                 min_val = reconstruction.min().item()
                 max_val = reconstruction.max().item()
                 logger.info(f"Decoder output range: min={min_val:.4f}, max={max_val:.4f}")
+                # Compute and log per-batch output range stats
+                batch_output_stats = compute_output_range_stats(reconstruction)
+                logger.info(f"Batch Output Range Stats: "
+                            f"min={batch_output_stats['global_min']:.4f}, "
+                            f"max={batch_output_stats['global_max']:.4f}, "
+                            f"mean={batch_output_stats['global_mean']:.4f}, "
+                            f"std={batch_output_stats['global_std']:.4f}")
 
             # Backward pass
             optimizer.zero_grad()
@@ -808,6 +1033,9 @@ def train(args: argparse.Namespace) -> None:
                 model.parameters(),
                 max_norm=args.max_grad_norm
             )
+            
+            # Track gradient norm for wandb logging
+            current_grad_norm = grad_norm.item()
 
             # Log if gradients were clipped
             # Helps monitor training stability
@@ -820,6 +1048,10 @@ def train(args: argparse.Namespace) -> None:
             # Update EMA model
             # Improves model stability
             ema_model.step(model.parameters())
+            
+            # Log training progress to wandb
+            if wandb_initialized:
+                log_training_progress_to_wandb(step, total_loss, scheduler.get_last_lr()[0], current_grad_norm, log_interval)
 
             # Track losses and mask statistics
             # Monitors training progress and mask coverage
@@ -830,12 +1062,6 @@ def train(args: argparse.Namespace) -> None:
                 train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
             if args.use_sam_loss and 'sam' in losses:
                 train_losses['sam_loss'] += losses['sam'].item()
-
-            # Log mask statistics if available
-            if 'mask_stats' in losses:
-                mask_coverage = losses['mask_stats']['coverage']
-                if mask_coverage < 0.1:  # Log warning for very low coverage
-                    logger.warning(f"Low mask coverage in training batch: {mask_coverage:.4f}")
 
         # Validation phase
         model.eval()
@@ -850,7 +1076,9 @@ def train(args: argparse.Namespace) -> None:
             output_range_stats = None  # To collect output range statistics
             for batch, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
                 batch = batch.to(device)
-                mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+                mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
+                if mask is None:
+                    logger.warning(f"[MASK WARNING] No mask provided for validation batch!")
                 # (Removed debug logging for NaNs in validation batch)
                 # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -958,12 +1186,6 @@ def train(args: argparse.Namespace) -> None:
                 if args.use_sam_loss and 'sam' in losses:
                     val_losses['sam_loss'] += losses['sam'].item()
                 
-                # Log mask statistics if available
-                if 'mask_stats' in losses:
-                    mask_coverage = losses['mask_stats']['coverage']
-                    if mask_coverage < 0.1:  # Log warning for very low coverage
-                        logger.warning(f"Low mask coverage in validation batch: {mask_coverage:.4f}")
-                
                 # Collect output range statistics (use first batch for efficiency)
                 if output_range_stats is None:
                     output_range_stats = compute_output_range_stats(reconstruction)
@@ -995,35 +1217,71 @@ def train(args: argparse.Namespace) -> None:
             except Exception as e:
                 logger.warning(f"Failed to get band importance: {e}")
 
+        # Global scale monitoring:
+        # The model applies a learnable scalar multiplier (global_scale) to preserve spectral shape across bands.
+        # Log its value every epoch to monitor for convergence stability.
+        # Biological interpretability and SD3 compatibility are preserved when scale remains in [0.1, 3.0].
+        if hasattr(model.output_adapter, 'global_scale'):
+            current_scale = model.output_adapter.global_scale.item()
+            logger.info(f"[Epoch {epoch+1}] Global output scale: {current_scale:.4f}")
+            if current_scale < 0.1 or current_scale > 3.0:
+                logger.warning(f"Global scale {current_scale:.4f} out of expected range (0.1–3.0)")
+
         # print SSIM
         avg_ssim = np.mean(ssim_per_band)
         print(f"Avg SSIM: {avg_ssim:.4f} | Per-band SSIM: {[f'{v:.4f}' for v in ssim_per_band]}")
 
+        # Calculate epoch time
+        epoch_time = time.time() - epoch_start_time
+        
+        # Log to training logger
+        training_logger.log_epoch(
+            epoch=epoch,
+            train_losses={k: v.item() if isinstance(v, torch.Tensor) else v for k, v in train_losses.items()},
+            val_losses={k: v.item() if isinstance(v, torch.Tensor) else v for k, v in val_losses.items()},
+            band_importance=band_importance,
+            ssim_per_band=ssim_per_band,
+            global_scale=current_scale,
+            learning_rate=scheduler.get_last_lr()[0],
+            grad_norm=current_grad_norm,
+            epoch_time=epoch_time,
+            output_range_stats=output_range_stats,
+            mask_coverage=val_losses.get('mask_stats', {}).get('coverage', None) if 'mask_stats' in val_losses else None
+        )
+        
+        # Log model health periodically
+        if epoch % 5 == 0:  # Every 5 epochs
+            health_data = {
+                "global_scale": current_scale,
+                "memory_usage_gb": torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0,
+                "grad_norm": current_grad_norm,
+                "learning_rate": scheduler.get_last_lr()[0]
+            }
+            training_logger.log_model_health(health_data)
+
         # Log metrics
         # Tracks training progress
         log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats)
+        
         # Save grayscale band 0 of the first sample as PNG for local inspection
         try:
             orig_img = (batch[0][0].detach().cpu().numpy() + 1.0) * 127.5  # from [-1,1] to [0,255]
             recon_img = (reconstruction[0][0].detach().cpu().numpy() + 1.0) * 127.5
-            orig_pil = Image.fromarray(orig_img.astype("uint8"))
-            recon_pil = Image.fromarray(recon_img.astype("uint8"))
+            orig_img = np.clip(orig_img, 0, 255).astype(np.uint8)
+            recon_img = np.clip(recon_img, 0, 255).astype(np.uint8)
+            orig_pil = Image.fromarray(orig_img, mode='L')
+            recon_pil = Image.fromarray(recon_img, mode='L')
             orig_pil.save(os.path.join(image_output_dir, f"epoch_{epoch+1}_original_band0.png"))
             recon_pil.save(os.path.join(image_output_dir, f"epoch_{epoch+1}_recon_band0.png"))
         except Exception as e:
             logger.warning(f"Failed to save local PNG images: {e}")
-        # Wandb image logging - save to persistent directory and log
-        try:
-            persistent_img_path = os.path.join(args.output_dir, "logging", f"reconstruction_epoch{epoch}_step{0}.png")
-            os.makedirs(os.path.dirname(persistent_img_path), exist_ok=True)
-            recon_pil.save(persistent_img_path)
-            wandb.log({"reconstruction": wandb.Image(persistent_img_path)})
-        except Exception as e:
-            logger.warning(f"Failed to log wandb image with persistent path: {e}")
-        try:
-            log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, output_range_stats)
-        except Exception as e:
-            logger.warning(f"Failed to log to wandb: {e}")
+        
+        # Log to wandb (includes both metrics and images)
+        if wandb_initialized:
+            try:
+                log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats, ssim_per_band, scheduler.get_last_lr()[0], current_grad_norm)
+            except Exception as e:
+                logger.warning(f"Failed to log to wandb: {e}")
 
         # Save checkpoint
         # Implements model checkpointing strategy
@@ -1054,6 +1312,20 @@ def train(args: argparse.Namespace) -> None:
     except Exception as e:
         logger.error(f"Failed to save final model: {e}")
 
+    # Log final training summary
+    total_training_time = time.time() - training_start_time
+    training_logger.log_final_summary(
+        total_epochs=epoch + 1,
+        total_time=total_training_time,
+        final_train_loss=train_losses['total_loss'].item() if isinstance(train_losses['total_loss'], torch.Tensor) else train_losses['total_loss'],
+        final_val_loss=val_losses['total_loss'].item() if isinstance(val_losses['total_loss'], torch.Tensor) else val_losses['total_loss'],
+        model_path=final_model_path
+    )
+
+    # Finish wandb run
+    if wandb_initialized and wandb.run:
+        wandb.finish()
+
     logger.info("Training completed successfully!")
 
 def main():
@@ -1068,7 +1340,7 @@ def main():
                       help="Path to base SD3 model or local VAE checkpoint")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--save_every", type=int, default=10, help="Save checkpoint every N epochs")
     parser.add_argument("--adapter_placement", type=str, default="both",
@@ -1087,7 +1359,9 @@ def main():
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                       help="Maximum gradient norm for clipping")
     parser.add_argument("--resume_from_checkpoint", type=str, help="Path to checkpoint directory to resume from")
-    
+    parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging")
+    parser.add_argument("--use_saturation_penalty", action="store_true",
+                        help="Enable saturation penalty for outputs nearing [-1, 1] boundaries")
 
     args = parser.parse_args()
 
@@ -1101,4 +1375,4 @@ def main():
     train(args)
 
 if __name__ == "__main__":
-    main() 
+    main()
