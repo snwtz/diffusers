@@ -711,13 +711,16 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     #HuggingFace's from_pretrained first loads config.json and then calls __init__ method via from_config.
     # __init__ must be compatible with keyword-based instantiation — not positional-only
 
+    # Refactor: Use explicit adapter and backbone channel config fields for clarity
     @register_to_config
     def __init__(
         self,
-        *, # forces all arguments to be keyword-only, which is expected by the Diffusers .from_pretrained() logic.
-        pretrained_model_name_or_path: str = None, #CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
-        in_channels: int = 5,
-        out_channels: int = 5,
+        *,
+        pretrained_model_name_or_path: str = None,
+        adapter_in_channels: int = 5,  # Refactored: adapter input channels
+        adapter_out_channels: int = 5, # Refactored: adapter output channels
+        backbone_in_channels: int = 3, # Refactored: backbone input channels
+        backbone_out_channels: int = 3, # Refactored: backbone output channels
         adapter_channels: int = 32,
         adapter_placement: str = "both",
         use_spectral_attention: bool = True,
@@ -726,19 +729,19 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         revision: str = None,
         variant: str = None,
         torch_dtype: torch.dtype = None,
-        use_saturation_penalty: bool = False, # set use_saturation_penalty=True when initializing
+        use_saturation_penalty: bool = False,
     ):
         # Adapter config: these are for the adapters only, not the backbone
         self.adapter_placement = adapter_placement
         self.use_spectral_attention = use_spectral_attention
         self.use_sam_loss = use_sam_loss
-        self.in_channels = in_channels  # Adapter input channels (e.g., 5 for multispectral)
-        self.out_channels = out_channels  # Adapter output channels (e.g., 5 for multispectral)
+        self.adapter_in_channels = adapter_in_channels  # Refactored: adapter input channels
+        self.adapter_out_channels = adapter_out_channels  # Refactored: adapter output channels
         self.adapter_channels = adapter_channels
         self.use_saturation_penalty = use_saturation_penalty
-
+        self.backbone_in_channels = backbone_in_channels  # Refactored: backbone input channels
+        self.backbone_out_channels = backbone_out_channels  # Refactored: backbone output channels
         # The backbone (SD3 VAE) is always 3->3 channels, regardless of adapter config
-        # This is critical: the adapters handle 5->3 and 3->5 translation
         if pretrained_model_name_or_path is None:
             raise ValueError("`pretrained_model_name_or_path` must be passed to `from_pretrained()` or stored in config.")
         config = AutoencoderKL.load_config(
@@ -747,7 +750,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             revision=revision,
             variant=variant,
         )
-        # Remove adapter-specific config keys before AutoencoderKL.__init__
         adapter_keys = {
             "pretrained_model_name_or_path",
             "adapter_channels",
@@ -759,16 +761,16 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             "torch_dtype",
             "variant",
             "use_saturation_penalty",
-            "in_channels",
-            "out_channels",
+            "adapter_in_channels",
+            "adapter_out_channels",
+            "backbone_in_channels",
+            "backbone_out_channels",
         }
         config = {k: v for k, v in config.items() if k not in adapter_keys}
-        # Force backbone to always use 3 input/output channels
-        config["in_channels"] = 3
-        config["out_channels"] = 3
+        # Refactored: Use explicit backbone channel config
+        config["in_channels"] = self.backbone_in_channels
+        config["out_channels"] = self.backbone_out_channels
         super().__init__(**config)
-
-        # Adapters handle the translation between multispectral and RGB
         self.load_from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -778,7 +780,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         )
 
     def load_from_pretrained(self, pretrained_model_name_or_path, subfolder=None, revision=None, variant=None, torch_dtype=None):
-        # Load the SD3 VAE backbone with 3 input/output channels (never 5)
+        # Refactored: Use explicit adapter channel config for adapters
         base_model = AutoencoderKL.from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -789,21 +791,18 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             low_cpu_mem_usage=False,
         )
         self.load_state_dict(base_model.state_dict(), strict=False)
-
-        # Adapters: input_adapter (5->3), output_adapter (3->5)
         if self.adapter_placement in ["input", "both"]:
             self.input_adapter = SpectralAdapter(
-                self.in_channels, 3,  # 5->3
+                self.adapter_in_channels, self.backbone_in_channels,  # Refactored: adapter_in_channels -> backbone_in_channels
                 use_attention=self.use_spectral_attention,
-                num_bands=self.in_channels
+                num_bands=self.adapter_in_channels
             )
         if self.adapter_placement in ["output", "both"]:
             self.output_adapter = SpectralAdapter(
-                3, self.out_channels,  # 3->5
+                self.backbone_out_channels, self.adapter_out_channels,  # Refactored: backbone_out_channels -> adapter_out_channels
                 use_attention=self.use_spectral_attention,
-                num_bands=self.out_channels
+                num_bands=self.adapter_out_channels
             )
-        # Freeze backbone by default (adapters are trainable)
         self.freeze_backbone()
 
     # Freezing pretrained SD3 VAE ensures latent space remains aligned with pretrained distributions.
@@ -1007,9 +1006,9 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # Saturation penalty: softly discourages outputs from nearing ±1 extremes,
         # which can compress spectral details important in plant stress analysis.
         # Applies penalty only if use_saturation_penalty=True was set during model init.
-        # v12saturation_penalty immediately reduced output range from
-        # Decoder output range: min=-9.581=90.3622
-        # Decoder output range: min=-30.4364max=5.2877
+        # v12: saturation_penalty immediately reduced output range from
+        # Decoder output range: min=-9.5801, max=9.3622 to
+        # Decoder output range: min=-3.4364, max=5.2877
         #
         # ARCHITECTURAL DESIGN RATIONALE: Why Saturation Penalty is in Model Code
         # ----------------------------------------------------------------------
@@ -1042,25 +1041,19 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # based on Hugging Face config and user-provided overrides.
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        """
-        Custom `from_pretrained` to load weights into AutoencoderKLMultispectralAdapter
-        from base AutoencoderKL weights (e.g., SD3 RGB VAE). This avoids issues with
-        Hugging Face's internal handling of pretrained_model_name_or_path being passed twice.
-        """
-        # Step 1: Load base model config
+        # Refactored: Use explicit adapter and backbone channel config
         config = AutoencoderKL.load_config(
             pretrained_model_name_or_path,
             subfolder=kwargs.get("subfolder", "vae"),
             revision=kwargs.get("revision", None),
             variant=kwargs.get("variant", None),
         )
-
-        # Step 2: Instantiate adapter model with all config + kwargs
-        # Always force in_channels=5, out_channels=5 unless explicitly overridden
         model = cls(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
-            in_channels=kwargs.get("in_channels", 5),
-            out_channels=kwargs.get("out_channels", 5),
+            adapter_in_channels=kwargs.get("adapter_in_channels", 5),
+            adapter_out_channels=kwargs.get("adapter_out_channels", 5),
+            backbone_in_channels=kwargs.get("backbone_in_channels", 3),
+            backbone_out_channels=kwargs.get("backbone_out_channels", 3),
             adapter_channels=kwargs.get("adapter_channels", 32),
             adapter_placement=kwargs.get("adapter_placement", "both"),
             use_spectral_attention=kwargs.get("use_spectral_attention", True),
@@ -1071,32 +1064,30 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             torch_dtype=kwargs.get("torch_dtype", None),
             use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
         )
-        # Post-load assertion: check adapter-level input/output consistency
-        # The config reflects backbone (RGB) channels, but adapter channels are stored in instance variables
-        if model.in_channels != 5:
+        # Refactored: Post-load assertion for adapter channels
+        if model.adapter_in_channels != 5:
             raise AssertionError(
-                f"Adapter expected in_channels=5, got {model.in_channels}.\n"
+                f"Adapter expected adapter_in_channels=5, got {model.adapter_in_channels}.\n"
                 f"Note: model.config.in_channels is {model.config.in_channels} (backbone, always 3).\n"
                 f"If you are loading from a pretrained RGB VAE, this is expected for the backbone, but the adapter must use 5 channels.\n"
-                f"Check that you are passing in_channels=5 to from_pretrained and that your config is correct."
+                f"Check that you are passing adapter_in_channels=5 to from_pretrained and that your config is correct."
             )
-        if model.out_channels != 5:
+        if model.adapter_out_channels != 5:
             raise AssertionError(
-                f"Adapter expected out_channels=5, got {model.out_channels}.\n"
+                f"Adapter expected adapter_out_channels=5, got {model.adapter_out_channels}.\n"
                 f"Note: model.config.out_channels is {model.config.out_channels} (backbone, always 3).\n"
                 f"If you are loading from a pretrained RGB VAE, this is expected for the backbone, but the adapter must use 5 channels.\n"
-                f"Check that you are passing out_channels=5 to from_pretrained and that your config is correct."
+                f"Check that you are passing adapter_out_channels=5 to from_pretrained and that your config is correct."
             )
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):
-        """
-        Override to forcibly register correct config fields before saving.
-        This guarantees in_channels=5, out_channels=5 are always written to config.json.
-        """
+        # Refactored: Save explicit adapter and backbone channel config fields
         self.register_to_config(
-            in_channels=5,
-            out_channels=5,
+            adapter_in_channels=self.adapter_in_channels,
+            adapter_out_channels=self.adapter_out_channels,
+            backbone_in_channels=self.backbone_in_channels,
+            backbone_out_channels=self.backbone_out_channels,
             adapter_placement=self.adapter_placement,
             use_spectral_attention=self.use_spectral_attention,
             use_sam_loss=self.use_sam_loss,

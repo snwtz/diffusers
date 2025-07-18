@@ -841,14 +841,17 @@ def train(args: argparse.Namespace) -> None:
     # Load base SD3 VAE weights and inject fresh multispectral adapters
     try:
         logger.info(f"Loading base model from: {args.base_model_path}")
+        # Refactored: Use explicit adapter and backbone channel config fields for clarity
         model = AutoencoderKLMultispectralAdapter.from_pretrained(
             pretrained_model_name_or_path=args.base_model_path,
             subfolder=args.subfolder,
             adapter_placement=args.adapter_placement,
             use_spectral_attention=args.use_spectral_attention,
             use_sam_loss=args.use_sam_loss,
-            in_channels=5,  # Force 5 channels for multispectral input
-            out_channels=5,   # Force 5 channels for multispectral output
+            adapter_in_channels=5,  # Refactored: adapter input channels
+            adapter_out_channels=5, # Refactored: adapter output channels
+            backbone_in_channels=3, # Refactored: backbone input channels
+            backbone_out_channels=3, # Refactored: backbone output channels
             use_saturation_penalty=args.use_saturation_penalty,
         )
         logger.info("Successfully loaded base model")

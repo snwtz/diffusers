@@ -8,6 +8,9 @@ python examples/multispectral/eval_multispectral_vae.py \
 
 Note: This evaluation script now properly handles [-1, 1] normalized data throughout the pipeline.
 The dataloader normalizes to [-1, 1], the model expects [-1, 1], and visualization converts to [0, 1] for display.
+
+AutoencoderKL is not imported or defined anywhere. All evaluated configs are from adapters only 
+-> inference checks MS VAE model.
 """
 
 import os
@@ -53,11 +56,6 @@ def plot_pseudo_rgb(original, reconstructed, outdir, idx):
     os.makedirs(outdir, exist_ok=True)
     
     # Create pseudo-RGB mapping based on spectral characteristics
-    # Band 1 (Blue 474.73nm) -> Blue channel
-    # Band 2 (Green 538.71nm) -> Green channel
-    # Band 3 (Red 650.665nm) -> Red channel
-    # Band 4 (Red-edge 730.635nm) -> Additional red contribution (stress detection)
-    # Band 5 (NIR 850.59nm) -> Additional green contribution (health indicator)
     
     def create_pseudo_rgb(bands):
         # Normalize from [-1, 1] to [0, 1] for RGB visualization
@@ -528,12 +526,15 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Refactored: Use explicit adapter and backbone channel config fields for clarity
     model = AutoencoderKL.from_pretrained(
         args.model_dir,
-        in_channels=5,  # for adapters
-        out_channels=5,  # for adapters
+        adapter_in_channels=5,  # Refactored: adapter input channels
+        adapter_out_channels=5, # Refactored: adapter output channels
+        backbone_in_channels=3, # Refactored: backbone input channels
+        backbone_out_channels=3, # Refactored: backbone output channels
         latent_channels=16,
-        adapter_placement="both",
+        adapter_placement="both", # match training
         use_spectral_attention=True,
         use_sam_loss=True,
         use_saturation_penalty=True,
@@ -574,7 +575,7 @@ def main():
             print(f"[MASK WARNING] No mask provided for evaluation batch {idx}!")
         
         with torch.no_grad():
-            recon, _ = model(batch)
+            recon, _ = model(batch, mask=mask) #add mask=mask for debug
             # Extract tensor from DecoderOutput
             if hasattr(recon, "sample"):
                 decoded_tensor = recon.sample
