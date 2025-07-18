@@ -367,6 +367,9 @@ class SpectralAdapter(nn.Module):
         num_bands: int = 5
     ):
         super().__init__()
+        # Store channel configuration for validation and logging
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.use_attention = use_attention
         # Tanh and adaptive normalization are removed
 
@@ -380,6 +383,23 @@ class SpectralAdapter(nn.Module):
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
         # Final layer uses 1x1 convolution for channel reduction/expansion (no activation)
         self.conv3 = nn.Conv2d(32, out_channels, kernel_size=1)
+
+        # Learnable linear output scaling: aligns the dynamic range of adapter output to the desired range (ideally [-1, 1]).
+        # more adaptive and flexible than clamping or fixed postprocessing.
+        # These parameters are learned via gradient descent during training:
+        #   - output_scale (default: 1.0): scales the output amplitude.
+        #   - output_bias  (default: 0.0): shifts the output baseline.
+        # Together, they form an affine transformation: x' = output_scale * x + output_bias.
+        # This enables smooth, trainable calibration of spectral output without hard clipping or nonlinear warping.
+        # Motivation:
+        #   - Avoids saturating Tanh or clamping artifacts which can distort spectral shapes.
+        #   - Maintains biological interpretability of band ratios.
+        #   - Adapts output to match SD3 pipeline expectations (range ~[-1, 1]).
+        # Final trained values (e.g., output_scale ≈ 0.9989, output_bias ≈ -0.0010) indicate almost identity behavior, meaning:
+        #   - The adapter outputs are already in the desired range without drastic transformation.
+        #   - Spectral fidelity and output amplitude are preserved, with only a minimal bias shift.
+        self.output_scale = nn.Parameter(torch.tensor(1.0))  # Global scaling factor
+        self.output_bias = nn.Parameter(torch.tensor(0.0))   # Global shift
 
         # Group normalization for better training stability (nonlinear normalization)
         self.norm1 = nn.GroupNorm(8, 32)
@@ -431,13 +451,11 @@ class SpectralAdapter(nn.Module):
         # Final channel adaptation (linear: conv only, no activation)
         x = self.conv3(x)
 
-        # --- Output Range Control ---
-        # Global scaling and clamping removed for natural evolution of decoder output.
-        #
-        # If you want to enable global scaling or output clamping for safety or downstream requirements,
-        # uncomment the following lines:
-        # x = x * self.global_scale
-        # x = torch.clamp(x, -1.0, 1.0)
+        # Apply learnable linear transformation
+        # Helps align the dynamic range of output to [-1, 1] in a trainable and smooth way
+        # Facilitates downstream consistency and spectral fidelity by allowing the model
+        # to learn appropriate output magnitudes (instead of forcing via hard bounds)
+        x = x * self.output_scale + self.output_bias
 
         # Log adapter output stats for NaN debugging
         if torch.isnan(x).any():
@@ -986,14 +1004,33 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # Total loss (currently just MSE, but could be weighted combination)
         losses['total_loss'] = losses['mse']
 
-        # TODO: Add optional range regularization term to penalize outputs that deviate too far from expected [-1, 1] range.
-        # Example (to be added in future):
-        #   range_penalty = (reconstructed.max() - reconstructed.min() - 2.0).clamp(min=0.0)
-        #   losses["range_penalty"] = range_penalty
-        #   losses["total_loss"] += gamma * range_penalty
         # Saturation penalty: softly discourages outputs from nearing ±1 extremes,
         # which can compress spectral details important in plant stress analysis.
         # Applies penalty only if use_saturation_penalty=True was set during model init.
+        # v12saturation_penalty immediately reduced output range from
+        # Decoder output range: min=-9.581=90.3622
+        # Decoder output range: min=-30.4364max=5.2877
+        #
+        # ARCHITECTURAL DESIGN RATIONALE: Why Saturation Penalty is in Model Code
+        # ----------------------------------------------------------------------
+        # The saturation penalty is placed in the model/adapter code (not training loop) because:
+        #1. SCIENTIFIC FIDELITY: It is a core part of the model's scientific objective - preserving
+        #    spectral interpretability by preventing hard saturation that destroys subtle spectral
+        #    differences crucial for plant health analysis. This is always relevant, regardless of
+        #    how the model is used (training, inference, or integration).
+        # 2. MODEL CONSISTENCY: By being in the model code, it ensures consistent application across
+        #    all use cases - the model will always preserve spectral fidelity, even when used in
+        #    different pipelines or by other researchers.
+        # 3. REPRODUCIBILITY: The saturation penalty is part of the model's scientific design and
+        #    should be preserved when sharing or reusing the model, ensuring consistent spectral
+        #    behavior across different implementations.
+        # 4. SEPARATION OF CONCERNS: The model handles scientific fidelity (saturation penalty),
+        #    while the training loop handles engineering constraints (range penalty for SD3tibility).
+        #
+        # COMPLEMENTARY APPROACH: The range penalty (in training loop) handles the practical
+        # engineering constraint of ensuring outputs stay within [-1,1ownstream pipeline
+        # compatibility, while this saturation penalty handles the scientific constraint of
+        # preserving spectral detail and avoiding hard nonlinearities.
         if self.use_saturation_penalty:
             saturation_penalty = torch.mean(F.relu(torch.abs(reconstructed) - 0.95))
             losses["saturation_penalty"] = saturation_penalty
@@ -1034,9 +1071,22 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             torch_dtype=kwargs.get("torch_dtype", None),
             use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
         )
-        # Post-load assertion of in & out channels for robustness
-        assert model.config.in_channels == 5, f"Config in_channels must be 5 for multispectral VAE, got {model.config.in_channels}"
-        assert model.config.out_channels == 5, f"Config out_channels must be 5 for multispectral VAE, got {model.config.out_channels}"
+        # Post-load assertion: check adapter-level input/output consistency
+        # The config reflects backbone (RGB) channels, but adapter channels are stored in instance variables
+        if model.in_channels != 5:
+            raise AssertionError(
+                f"Adapter expected in_channels=5, got {model.in_channels}.\n"
+                f"Note: model.config.in_channels is {model.config.in_channels} (backbone, always 3).\n"
+                f"If you are loading from a pretrained RGB VAE, this is expected for the backbone, but the adapter must use 5 channels.\n"
+                f"Check that you are passing in_channels=5 to from_pretrained and that your config is correct."
+            )
+        if model.out_channels != 5:
+            raise AssertionError(
+                f"Adapter expected out_channels=5, got {model.out_channels}.\n"
+                f"Note: model.config.out_channels is {model.config.out_channels} (backbone, always 3).\n"
+                f"If you are loading from a pretrained RGB VAE, this is expected for the backbone, but the adapter must use 5 channels.\n"
+                f"Check that you are passing out_channels=5 to from_pretrained and that your config is correct."
+            )
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):

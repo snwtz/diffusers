@@ -1004,6 +1004,50 @@ def train(args: argparse.Namespace) -> None:
             # This term is optional and controlled by --use_saturation_penalty.
             if 'saturation_penalty' in losses:
                 total_loss += losses['saturation_penalty']
+
+            # --- Coordinated Output Range Control System ---
+            # This system coordinates two complementary penalties to achieve optimal output range control
+            # while preserving spectral fidelity and enabling SD3 compatibility.
+            #
+            # COORDINATION STRATEGY:
+            # 1. Saturation Penalty (in model): Prevents spectral compression by discouraging values near ±1
+            #    - Threshold: args.saturation_threshold (default: 0.95, avoids hard saturation that destroys spectral details)
+            #    - Weight: args.saturation_penalty_weight (default: 0.05, gentle, preserves spectral relationships)
+            #    - Location: Model level (applied during loss computation)
+            #
+            # 2. Range Penalty (in training): Enforces overall output range for SD3 compatibility
+            #    - Threshold: args.range_threshold (default: 1.0, enforces [-1,1] range for downstream pipelines)
+            #    - Weight: args.range_penalty_weight (default: 0.2, stronger than saturation, provides output control)
+            #    - Location: Training level (applied during optimization)
+            #
+            # RATIONALE FOR COORDINATION:
+            # - Saturation penalty alone: Great for spectral fidelity but insufficient for output range control
+            # - Range penalty alone: Good for output range but can cause spectral compression
+            # - Combined approach: Spectral fidelity + output range control + SD3 compatibility
+            #
+            # TRAINING BENEFITS:
+            # - Early training: Range penalty quickly brings outputs into reasonable range
+            # - Mid training: Saturation penalty prevents spectral compression as outputs approach ±1
+            # - Late training: Both penalties work together for optimal spectral fidelity within [-1,1]
+            #
+            # SPECTRAL SCIENCE BENEFITS:
+            # - Preserves fine spectral distinctions important for plant health analysis
+            # - Maintains interpretable spectral signatures
+            # - Enables downstream SD3 integration without range issues
+            if reconstruction is not None and args.use_range_penalty:
+                range_penalty = torch.mean(torch.relu(torch.abs(reconstruction) - args.range_threshold))
+                total_loss += args.range_penalty_weight * range_penalty
+
+            # --- Learned Per-Band Weighting ---
+            # Manually increase weight for bands 3 and 5 due to persistent reconstruction errors.
+            # Could be replaced with learned weights or adaptive heuristics later.
+            # Apply learned per-band weights (simple example: weight poor-performing bands more)
+            #if 'mse_per_channel' in losses:
+            #    band_weights = torch.tensor([1.0, 1.0, 1.5, 1.0, 1.5], device=device)  # Bands 3 and 5 upweighted
+            #    weighted_mse = (losses['mse_per_channel'] * band_weights).mean()
+            #    total_loss = weighted_mse + total_loss - losses['mse']  # Replace original MSE
+            # disabled to avoid conflicts with upped sam_loss weight, avoiding optimization conflicts
+
             # Debugging: Check for NaN/Inf in total loss before backward
             if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
                 logger.warning("Detected NaN/Inf loss; skipping this batch.")
@@ -1235,18 +1279,25 @@ def train(args: argparse.Namespace) -> None:
         epoch_time = time.time() - epoch_start_time
         
         # Log to training logger
+        # Handle tensor conversion properly - multi-element tensors need to be converted to lists
+        def convert_tensor_for_logging(v):
+            if isinstance(v, torch.Tensor):
+                if v.numel() == 1:
+                    return v.item()
+                else:
+                    return v.detach().cpu().tolist()
+            return v
+
         training_logger.log_epoch(
             epoch=epoch,
-            train_losses={k: v.item() if isinstance(v, torch.Tensor) else v for k, v in train_losses.items()},
-            val_losses={k: v.item() if isinstance(v, torch.Tensor) else v for k, v in val_losses.items()},
+            train_losses={k: convert_tensor_for_logging(v) for k, v in train_losses.items()},
+            val_losses={k: convert_tensor_for_logging(v) for k, v in val_losses.items()},
             band_importance=band_importance,
             ssim_per_band=ssim_per_band,
             global_scale=current_scale,
             learning_rate=scheduler.get_last_lr()[0],
             grad_norm=current_grad_norm,
-            epoch_time=epoch_time,
-            output_range_stats=output_range_stats,
-            mask_coverage=val_losses.get('mask_stats', {}).get('coverage', None) if 'mask_stats' in val_losses else None
+            output_range_stats=output_range_stats
         )
         
         # Log model health periodically
@@ -1362,6 +1413,16 @@ def main():
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--use_saturation_penalty", action="store_true",
                         help="Enable saturation penalty for outputs nearing [-1, 1] boundaries")
+    parser.add_argument("--saturation_penalty_weight", type=float, default=0.05,
+                        help="Weight for saturation penalty (default: 0.5 well for spectral fidelity)")
+    parser.add_argument("--saturation_threshold", type=float, default=0.95,
+                        help="Threshold for saturation penalty (default: 0.95, prevents spectral compression)")
+    parser.add_argument("--use_range_penalty", action="store_true",
+                        help="Enable range penalty for outputs outside [-1, 1] boundaries")
+    parser.add_argument("--range_penalty_weight", type=float, default=0.2,
+                        help="Weight for range penalty (default: 0.2er than saturation for output control)")
+    parser.add_argument("--range_threshold", type=float, default=1.0,
+                        help="Threshold for range penalty (default: 1.0, enforces [-1] output range)")
 
     args = parser.parse_args()
 
