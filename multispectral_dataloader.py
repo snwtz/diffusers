@@ -193,250 +193,165 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- Shared utility for NaN/mask logic between DreamBooth and VAE dataloaders ---
+def preprocess_multispectral_image(
+    image_path: str,
+    required_bands: list,
+    resolution: int = 512,
+    logger=None
+):
+    """
+    Shared preprocessing for multispectral TIFFs:
+    - Band selection
+    - NaN (background) handling
+    - Per-band normalization
+    - Per-band mean fill for NaNs
+    - Padding to square
+    - Resizing
+    - Mask generation (1=leaf, 0=background)
+    Returns:
+        image_tensor: (5, resolution, resolution) float32, no NaNs
+        mask_tensor: (1, resolution, resolution) float32, 1=leaf, 0=background
+    """
+    import rasterio
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    try:
+        with rasterio.open(image_path) as src:
+            image = src.read(required_bands)  # (5, H, W)
+            background_mask = np.isnan(image[0]).astype(np.float32)
+            leaf_mask = 1 - background_mask  # 1=leaf, 0=background
+            image = image.astype(np.float32)
+            normalized_image = np.zeros_like(image)
+            for i in range(image.shape[0]):
+                band = image[i]
+                nan_mask = np.isnan(band)
+                mean_val = np.nanmean(band)
+                band[nan_mask] = mean_val
+                # Per-channel normalization to [-1, 1] (valid pixels only)
+                valid_mask = ~np.isnan(band)
+                if not np.any(valid_mask):
+                    if logger:
+                        logger.warning("Channel contains only NaN values (background). Returning zeros.")
+                    normalized_image[i] = np.zeros_like(band, dtype=np.float32)
+                else:
+                    min_val = np.nanmin(band)
+                    max_val = np.nanmax(band)
+                    if max_val == min_val:
+                        if logger:
+                            logger.warning(f"Channel has constant value {min_val}. Returning zeros.")
+                        normalized_image[i] = np.zeros_like(band, dtype=np.float32)
+                    else:
+                        norm = (band - min_val) / (max_val - min_val)
+                        normalized_image[i] = 2 * norm - 1
+            image_tensor = torch.from_numpy(normalized_image)
+            if torch.isnan(image_tensor).any():
+                if logger:
+                    logger.info(f"[Sanitize] Replacing NaNs in input tensor with 0.0 to avoid propagation into model.")
+                image_tensor = torch.nan_to_num(image_tensor, nan=0.0)
+            # Compute fill_value as mean of valid (foreground) pixels per band for padding
+            foreground_mask = torch.from_numpy(leaf_mask).unsqueeze(0).bool()  # (1, H, W)
+            per_band_means = []
+            for b in range(image_tensor.shape[0]):
+                band_pixels = image_tensor[b][foreground_mask[0]]
+                band_mean = band_pixels.mean().item() if band_pixels.numel() > 0 else 0.0
+                per_band_means.append(band_mean)
+            fill_value = float(np.mean(per_band_means))
+            # Pad to square
+            c, h, w = image_tensor.shape
+            size = max(h, w, resolution)
+            pad_h = size - h
+            pad_w = size - w
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+            padding = (pad_left, pad_right, pad_top, pad_bottom)
+            image_tensor = F.pad(image_tensor, padding, value=fill_value)
+            # Resize
+            if image_tensor.shape[1] != resolution or image_tensor.shape[2] != resolution:
+                image_tensor = F.interpolate(
+                    image_tensor.unsqueeze(0),
+                    size=(resolution, resolution),
+                    mode='bilinear',
+                    align_corners=False
+                ).squeeze(0)
+            # Pad and resize mask
+            mask_tensor = torch.from_numpy(leaf_mask).unsqueeze(0)  # (1, H, W)
+            mask_tensor = F.pad(mask_tensor, padding, value=0.0)
+            if mask_tensor.shape[1] != resolution or mask_tensor.shape[2] != resolution:
+                mask_tensor = F.interpolate(
+                    mask_tensor.unsqueeze(0),
+                    size=(resolution, resolution),
+                    mode='nearest'
+                ).squeeze(0)
+            # Zero out background regions after resizing
+            image_tensor = image_tensor * mask_tensor
+            return image_tensor, mask_tensor
+    except Exception as e:
+        if logger:
+            logger.error(f"Error preprocessing image {image_path}: {str(e)}")
+        raise
+
+# --- DreamBooth Multispectral Dataset using shared logic ---
 class MultispectralDataset(Dataset):
     """
-    Dataset class for loading and preprocessing multispectral TIFF images.
-    Handles 5-channel data by selecting specific bands (9, 18, 32, 42, 55) from input TIFFs.
-    Outputs 5-channel tensors of shape (5, 512, 512) normalized to [-1, 1] range.
-    Optionally returns a background mask for each image.
-    
-    Channel Configuration:
-    - Input: TIFF files with at least 55 bands
-    - Selected: Bands 9, 18, 32, 42, 55 (1-based indexing for rasterio)
-    - Output: 5-channel tensor ready for VAE processing
-    - VAE Output: 16-channel latent (matching SD3 transformer expectation)
+    DreamBooth multispectral dataset using shared NaN/mask logic with VAE dataloader.
+    Returns dict with pixel_values, mask, prompts.
     """
-    
-    # Define the specific bands to use (1-based indexing for rasterio.read)
-    # IMPORTANT: rasterio.read() expects 1-based band indices, not 0-based.
-    # These correspond to bands 9, 18, 32, 42, 55 (wavelengths: 474.73, 538.71, 650.665, 730.635, 850.59 nm)
-    # If you ever change the band selection, ensure you use 1-based indices here.
     REQUIRED_BANDS = [9, 18, 32, 42, 55]  # 1-based indices for rasterio.read
-    
     def __init__(
         self,
         data_root: str,
         resolution: int = 512,
         transform: Optional[transforms.Compose] = None,
         use_cache: bool = True,
-        return_mask: bool = False,  # flag to control mask return
+        return_mask: bool = True,  # Always True for DreamBooth
+        prompt: str = "sks leaf",
     ):
-        """
-        Initialize the dataset.
-        
-        Args:
-            data_root (str): Path to directory containing TIFF files
-            resolution (int): Target resolution for images (default: 512)
-            transform (callable, optional): Additional transforms to apply
-            use_cache (bool): Whether to cache loaded images in memory
-        """
         self.data_root = data_root
         self.resolution = resolution
         self.transform = transform
         self.use_cache = use_cache
-        self.return_mask = return_mask  # Store the flag
-        
-        # Get list of TIFF files
+        self.return_mask = return_mask
+        self.prompt = prompt
         self.image_paths = [
             os.path.join(data_root, f) for f in os.listdir(data_root)
             if f.lower().endswith('.tiff') or f.lower().endswith('.tif')
         ]
-        
         if not self.image_paths:
             raise FileNotFoundError(
-                f"No TIFF files found in {data_root}. Please ensure the directory contains "
-                f".tiff or .tif files with at least 55 spectral bands."
+                f"No TIFF files found in {data_root}. Please ensure the directory contains .tiff or .tif files with at least 55 spectral bands."
             )
-        
-        # Cache for storing preprocessed images
         self.cache = {} if use_cache else None
-        
-        # Validate all images on initialization
-        self._validate_all_images()
-    
-    def _validate_all_images(self):
-        """Validate that all images have at least 55 bands."""
-        for path in self.image_paths:
-            try:
-                with rasterio.open(path) as src:
-                    if src.count < 55:
-                        raise ValueError(
-                            f"Image {path} has only {src.count} bands, but at least 55 bands are required. "
-                            f"This dataloader is configured to use specific bands (9, 18, 32, 42, 55). "
-                            f"Please ensure all input images have 55 or more bands."
-                        )
-            except rasterio.errors.RasterioIOError as e:
-                raise ValueError(
-                    f"Failed to open image {path}: {str(e)}. "
-                    f"Please ensure the file is a valid TIFF file and is not corrupted."
-                )
-            except Exception as e:
-                raise ValueError(
-                    f"Unexpected error validating {path}: {str(e)}. "
-                    f"Please check the file format and permissions."
-                )
-    
-    def normalize_channel(self, channel_data: np.ndarray) -> np.ndarray:
-        """
-        Per-channel normalization to [-1, 1] range for VAE compatibility.
-        Includes safety checks for division by zero and NaN values.
-        
-        Args:
-            channel_data: Input channel data
-            
-        Returns:
-            Normalized channel data in [-1, 1] range
-        """
-        # Handle NaN values
-        min_val = np.nanmin(channel_data)
-        max_val = np.nanmax(channel_data)
-        
-        # Safety check for division by zero
-        if max_val == min_val:
-            logger.warning(
-                f"Channel has constant value {min_val}. "
-                f"Returning zero array to avoid division by zero."
-            )
-            return np.zeros_like(channel_data, dtype=np.float32)
-            
-        # First normalize to [0, 1] 
-        normalized = (channel_data - min_val) / (max_val - min_val)
-        
-        # Then scale to [-1, 1] because SD3 VAE backbone expects input in [-1, 1]
-        return 2 * normalized - 1
-    
-    def pad_to_square(self, img: torch.Tensor, fill_value: float = None) -> torch.Tensor:
-        """
-        Pad a (C, H, W) tensor to a square shape (C, S, S) with the given fill value.
-        The fill_value should be computed from valid foreground pixels to prevent artificial edges.
-        If fill_value is None, raises an error.
-        """
-        if fill_value is None:
-            raise ValueError("Fill value for padding must be explicitly set based on foreground data.")
-        c, h, w = img.shape
-        size = max(h, w, self.resolution)
-        pad_h = size - h
-        pad_w = size - w
-        pad_top = pad_h // 2
-        pad_bottom = pad_h - pad_top
-        pad_left = pad_w // 2
-        pad_right = pad_w - pad_left
-        padding = (pad_left, pad_right, pad_top, pad_bottom)
-        img = torch.nn.functional.pad(img, padding, value=fill_value)
-        return img
-
-    def preprocess_image(self, image_path: str):
-        """
-        Loads and preprocesses a multispectral image, returning both the image tensor and a mask tensor.
-        The mask is 1 for leaf (foreground), 0 for background (NaN in original data).
-        """
-        try:
-            with rasterio.open(image_path) as src:
-                # Read required bands
-                image = src.read(self.REQUIRED_BANDS)  # Shape: (5, height, width)
-
-                # Generate background mask from NaN values
-                # Use first band to create mask (all bands should have same NaN pattern)
-                background_mask = np.isnan(image[0]).astype(np.float32)
-                leaf_mask = 1 - background_mask  # 1 for leaf, 0 for background
-
-                # Convert to float32 and normalize
-                image = image.astype(np.float32)
-                normalized_image = np.zeros_like(image)
-                # fill NaN with the mean value of each band (computed from the valid pixels in that image)
-                for i in range(5):
-                    band = image[i]
-                    nan_mask = np.isnan(band)
-                    mean_val = np.nanmean(band)
-                    band[nan_mask] = mean_val
-                    normalized_image[i] = self.normalize_channel(band)
-
-                # Convert to tensor
-                image_tensor = torch.from_numpy(normalized_image)
-                if torch.isnan(image_tensor).any():
-                    logger.info(f"[Sanitize] Replacing NaNs in input tensor with 0.0 to avoid propagation into model.")
-                    image_tensor = torch.nan_to_num(image_tensor, nan=0.0)
-
-                # Compute fill_value as mean of valid (foreground) pixels per band for padding
-                foreground_mask = torch.from_numpy(leaf_mask).unsqueeze(0).bool()  # shape: (1, H, W)
-                # Compute per-band mean for valid (foreground) pixels
-                per_band_means = []
-                for b in range(image_tensor.shape[0]):
-                    band_pixels = image_tensor[b][foreground_mask[0]]
-                    band_mean = band_pixels.mean().item() if band_pixels.numel() > 0 else 0.0
-                    per_band_means.append(band_mean)
-                # Always use the average of per-band means as a scalar fill value for F.pad
-                fill_value = float(np.mean(per_band_means))
-                
-                # Pad to square before resizing
-                image_tensor = self.pad_to_square(image_tensor, fill_value=fill_value)
-                
-                # Now resize to (resolution, resolution) if needed
-                if image_tensor.shape[1] != self.resolution or image_tensor.shape[2] != self.resolution:
-                    image_tensor = F.interpolate(
-                        image_tensor.unsqueeze(0),
-                        size=(self.resolution, self.resolution),
-                        mode='bilinear',
-                        align_corners=False
-                    ).squeeze(0)
-
-                # Pad and resize mask
-                mask_tensor = torch.from_numpy(leaf_mask).unsqueeze(0)  # (1, H, W)
-                mask_tensor = self.pad_to_square(mask_tensor, fill_value=0.0)
-                if mask_tensor.shape[1] != self.resolution or mask_tensor.shape[2] != self.resolution:
-                    mask_tensor = F.interpolate(
-                        mask_tensor.unsqueeze(0),
-                        size=(self.resolution, self.resolution),
-                        mode='nearest'
-                    ).squeeze(0)
-
-                # Explicitly zero out background regions (non-leaf) after resizing
-                image_tensor = image_tensor * mask_tensor
-
-                return image_tensor, mask_tensor
-
-        except Exception as e:
-            logger.error(f"Error preprocessing image {image_path}: {str(e)}")
-            raise
-    
-    def __len__(self) -> int:
-        return len(self.image_paths)
-    
     def __getitem__(self, idx: int):
-        """
-        Get a preprocessed image.
-        
-        Args:
-            idx: Index of the image to get
-            
-        Returns:
-            Dictionary with:
-            - pixel_values: 5-channel tensor of shape (5, 512, 512) normalized to [-1, 1]
-            - mask: Optional background mask tensor of shape (1, 512, 512) if return_mask=True
-        """
         image_path = self.image_paths[idx]
-        
         # Check cache first
         if self.use_cache and image_path in self.cache:
-            return self.cache[image_path]
-        
-        # Load and preprocess image
-        image_tensor, mask_tensor = self.preprocess_image(image_path)
-        
-        # Apply additional transforms if specified
+            cached = self.cache[image_path]
+            cached = dict(cached)  # shallow copy
+            cached["prompts"] = [self.prompt]
+            return cached
+        # Use shared preprocessing logic
+        image_tensor, mask_tensor = preprocess_multispectral_image(
+            image_path,
+            required_bands=self.REQUIRED_BANDS,
+            resolution=self.resolution,
+            logger=logger
+        )
         if self.transform:
             image_tensor = self.transform(image_tensor)
-        
-        # Always return a dict with pixel_values, and mask if enabled
-        sample = {"pixel_values": image_tensor}
-        if self.return_mask:
-            sample["mask"] = mask_tensor
-        
-        # Cache the result if caching is enabled
+        sample = {
+            "pixel_values": image_tensor,
+            "mask": mask_tensor,
+            "prompts": [self.prompt]
+        }
         if self.use_cache:
-            self.cache[image_path] = sample
-        
+            self.cache[image_path] = {"pixel_values": image_tensor, "mask": mask_tensor}
         return sample
+    def __len__(self):
+        return len(self.image_paths)
 
 # Custom collate function for DreamBooth multispectral dataloader
 # Adds a repeated prompt string for all images in the batch
@@ -485,6 +400,7 @@ def create_multispectral_dataloader(
         resolution=resolution,
         use_cache=use_cache,
         return_mask=return_mask,
+        prompt=prompt, # Pass the prompt to the dataset
     )
     
     # Only use prefetch_factor if num_workers > 0

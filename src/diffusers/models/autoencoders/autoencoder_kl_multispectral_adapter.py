@@ -790,7 +790,9 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             ignore_mismatched_sizes=True,
             low_cpu_mem_usage=False,
         )
+        # Load backbone weights (no adapters)
         self.load_state_dict(base_model.state_dict(), strict=False)
+        # Instantiate adapters
         if self.adapter_placement in ["input", "both"]:
             self.input_adapter = SpectralAdapter(
                 self.adapter_in_channels, self.backbone_in_channels,  # Refactored: adapter_in_channels -> backbone_in_channels
@@ -803,6 +805,21 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 use_attention=self.use_spectral_attention,
                 num_bands=self.adapter_out_channels
             )
+        # Load the full state dict (including adapters) if available
+        # instantiate adapter->full state dict load : 
+        # ensures that all trained adapter weights are restored when loading pretrained multispectral VAE
+        import os
+        import torch
+        # Try to find the state dict file (HuggingFace convention)
+        state_dict_path = None
+        for fname in ["pytorch_model.bin", "diffusion_pytorch_model.bin"]:
+            candidate = os.path.join(pretrained_model_name_or_path, fname)
+            if os.path.isfile(candidate):
+                state_dict_path = candidate
+                break
+        if state_dict_path is not None:
+            state_dict = torch.load(state_dict_path, map_location="cpu")
+            self.load_state_dict(state_dict, strict=False)
         self.freeze_backbone()
 
     # Freezing pretrained SD3 VAE ensures latent space remains aligned with pretrained distributions.
@@ -1064,6 +1081,18 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             torch_dtype=kwargs.get("torch_dtype", None),
             use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
         )
+        # After instantiation, load the full state dict (including adapters)
+        import os
+        import torch
+        state_dict_path = None
+        for fname in ["pytorch_model.bin", "diffusion_pytorch_model.bin"]:
+            candidate = os.path.join(pretrained_model_name_or_path, fname)
+            if os.path.isfile(candidate):
+                state_dict_path = candidate
+                break
+        if state_dict_path is not None:
+            state_dict = torch.load(state_dict_path, map_location="cpu")
+            model.load_state_dict(state_dict, strict=False)
         # Refactored: Post-load assertion for adapter channels
         if model.adapter_in_channels != 5:
             raise AssertionError(

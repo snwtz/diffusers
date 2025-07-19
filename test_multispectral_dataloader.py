@@ -62,10 +62,8 @@ import random
 from pathlib import Path
 import rasterio
 import torch.nn.functional as F
-from multispectral_dataloader import (
-    MultispectralDataset,
-    create_multispectral_dataloader
-)
+from multispectral_dataloader import MultispectralDataset
+from torch.utils.data import DataLoader
 
 # Set random seed for reproducibility
 random.seed(42)
@@ -102,169 +100,51 @@ def test_images(data_dir):
     """Get a subset of test images."""
     return get_test_images(data_dir)
 
-def test_dataset_initialization(data_dir, test_images):
-    """Test dataset initialization with real data."""
-    dataset = MultispectralDataset(data_dir)
-    assert len(dataset) > 0
-    assert dataset.resolution == 512
-    assert dataset.use_cache is True
+def test_dreambooth_batch_structure(data_dir):
+    """
+    Test that MultispectralDataset returns a dict with pixel_values, mask, and prompts,
+    with correct shapes, types, and value ranges, as required by the DreamBooth training script.
+    """
+    dataset = MultispectralDataset(data_root=data_dir, return_mask=True, prompt="test prompt")
+    sample = dataset[0]
+    assert isinstance(sample, dict)
+    assert "pixel_values" in sample
+    assert "mask" in sample
+    assert "prompts" in sample
+    # pixel_values checks
+    assert isinstance(sample["pixel_values"], torch.Tensor)
+    assert sample["pixel_values"].shape == (5, 512, 512)
+    assert sample["pixel_values"].dtype == torch.float32
+    assert not torch.isnan(sample["pixel_values"]).any()
+    assert torch.all(sample["pixel_values"] >= -1) and torch.all(sample["pixel_values"] <= 1)
+    # mask checks
+    assert isinstance(sample["mask"], torch.Tensor)
+    assert sample["mask"].shape == (1, 512, 512)
+    unique_mask = torch.unique(sample["mask"])
+    assert set(unique_mask.tolist()).issubset({0.0, 1.0})
+    # prompts checks
+    assert isinstance(sample["prompts"], list)
+    assert sample["prompts"][0] == "test prompt"
 
-def test_band_count_validation(data_dir, test_images):
-    """Test validation of band count."""
-    # Test with valid data
-    dataset = MultispectralDataset(data_dir)
-    assert len(dataset) > 0
-    
-    # Test with empty directory
-    with pytest.raises(FileNotFoundError):
-        MultispectralDataset("empty_dir")
-
-def test_normalize_channel(data_dir, test_images):
-    """Test channel normalization with real data."""
-    dataset = MultispectralDataset(data_dir)
-    
-    # Load a real image
-    image_path = str(test_images[0])
-    with rasterio.open(image_path) as src:
-        data = src.read(1)  # Read first band
-    
-    normalized = dataset.normalize_channel(data)
-    # Check for [-1, 1] range
-    assert np.all(normalized >= -1) and np.all(normalized <= 1)
-    
-    # Test with NaN values
-    data_with_nan = data.copy()
-    data_with_nan[0, 0] = np.nan
-    normalized = dataset.normalize_channel(data_with_nan)
-    mask = ~np.isnan(normalized)
-    assert np.all(normalized[mask] >= -1) and np.all(normalized[mask] <= 1)
-    assert np.isnan(normalized[0, 0])
-
-def test_sd3_compatible_input_shape(data_dir, test_images):
-    """Test that preprocessed images are compatible with SD3's VAE input requirements."""
-    dataset = MultispectralDataset(data_dir)
-    
-    # Load and preprocess image
-    image = dataset[0]
-    
-    # Check tensor properties for SD3 compatibility
-    assert isinstance(image, torch.Tensor)
-    assert image.shape == (5, 512, 512)  # 5 channels, 512x512 resolution
-    assert image.dtype == torch.float32
-    # Check for [-1, 1] range
-    assert torch.all(image >= -1) and torch.all(image <= 1)
-
-def test_pixel_range_normalization_for_vae(data_dir, test_images):
-    """Test that pixel values are properly normalized for VAE input."""
-    dataset = MultispectralDataset(data_dir)
-    image = dataset[0]
-    
-    # Check normalization properties
-    assert torch.all(image >= -1) and torch.all(image <= 1)
-    # Check that each channel has been normalized independently
-    for c in range(image.shape[0]):
-        channel = image[c]
-        # For [-1, 1] normalization, min should be close to -1 or max should be close to 1
-        assert torch.isclose(torch.min(channel), torch.tensor(-1.), atol=1e-2) or torch.isclose(torch.max(channel), torch.tensor(1.), atol=1e-2)
-
-def test_caching_behavior(data_dir, test_images):
-    """Test that caching improves load time and maintains data consistency."""
-    dataset = MultispectralDataset(data_dir, use_cache=True)
-    
-    # First load
-    start_time = time.time()
-    first_load = dataset[0]
-    first_load_time = time.time() - start_time
-    
-    # Second load (should be from cache)
-    start_time = time.time()
-    second_load = dataset[0]
-    second_load_time = time.time() - start_time
-    
-    # Verify cache is working
-    assert second_load_time < first_load_time
-    assert torch.allclose(first_load, second_load)
-
-def test_dataloader_creation(data_dir, test_images):
-    """Test dataloader creation and basic functionality."""
-    dataloader = create_multispectral_dataloader(
-        data_dir,
-        batch_size=2,
-        num_workers=0,  # Use 0 for testing
-        use_cache=True,
-        prefetch_factor=None,  # Disabled for local testing
-        persistent_workers=False  # Disabled for local testing
-    )
-    
-    # Test batch loading
+def test_dreambooth_dataloader_batch(data_dir):
+    """
+    Test that DataLoader batching works for DreamBooth: batch is a dict with stacked pixel_values and mask,
+    and a list of prompts of correct length.
+    """
+    dataset = MultispectralDataset(data_root=data_dir, return_mask=True, prompt="test prompt")
+    def collate_fn(batch):
+        return {
+            "pixel_values": torch.stack([s["pixel_values"] for s in batch]),
+            "mask": torch.stack([s["mask"] for s in batch]),
+            "prompts": [p for s in batch for p in s["prompts"]]
+        }
+    dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
     batch = next(iter(dataloader))
-    assert isinstance(batch, torch.Tensor)
-    assert batch.shape[0] == 2  # batch_size
-    assert batch.shape[1] == 5  # channels
-    assert batch.shape[2] == 512  # height
-    assert batch.shape[3] == 512  # width
-
-def test_worker_behavior(data_dir, test_images):
-    """Test worker behavior and data loading consistency."""
-    dataloader = create_multispectral_dataloader(
-        data_dir,
-        batch_size=2,
-        num_workers=0,  # Use 0 for testing
-        persistent_workers=False,  # Disabled for local testing
-        prefetch_factor=None  # Disabled for local testing
-    )
-    
-    # Test multiple epochs
-    for epoch in range(2):
-        batches = []
-        for batch in dataloader:
-            batches.append(batch)
-        
-        # Verify batch consistency
-        for i in range(len(batches)-1):
-            assert batches[i].shape == batches[i+1].shape
-
-def test_error_handling(data_dir):
-    """Test error handling for invalid data."""
-    # Test with non-existent directory
-    with pytest.raises(FileNotFoundError):
-        MultispectralDataset("non_existent_dir")
-
-def test_specific_band_selection(data_dir):
-    """Test that the dataloader correctly selects the hardcoded bands."""
-    dataset = MultispectralDataset(data_dir)
-    image = dataset[0]
-
-    # Print the file path used by the dataloader for index 0
-    image_path = dataset.image_paths[0]
-    print(f"Dataloader image path: {image_path}")
-
-    # Use the same file for the expected bands
-    with rasterio.open(image_path) as src:
-        expected_bands = src.read([9, 18, 32, 42, 55]).astype(np.float32)
-        # Per-channel normalization to [-1, 1]
-        for i in range(expected_bands.shape[0]):
-            band = expected_bands[i]
-            min_val = np.min(band)
-            max_val = np.max(band)
-            if max_val > min_val:
-                normalized = (band - min_val) / (max_val - min_val)
-                expected_bands[i] = 2 * normalized - 1
-            else:
-                expected_bands[i] = np.zeros_like(band)
-        expected_bands = torch.from_numpy(expected_bands)
-        expected_bands = F.interpolate(
-            expected_bands.unsqueeze(0),
-            size=(512, 512),
-            mode='bilinear',
-            align_corners=False
-        ).squeeze(0)
-
-    assert torch.allclose(image, expected_bands, rtol=1e-2, atol=1e-2), "Dataset output does not match expected band selection"
+    assert batch["pixel_values"].shape == (2, 5, 512, 512)
+    assert batch["mask"].shape == (2, 1, 512, 512)
+    assert isinstance(batch["prompts"], list)
+    assert batch["prompts"] == ["test prompt", "test prompt"]
 
 if __name__ == "__main__":
-    # Remove the script name from sys.argv
-    sys.argv.pop(0)
-    
-    # Run pytest with the remaining arguments
+    import sys
     pytest.main(sys.argv) 

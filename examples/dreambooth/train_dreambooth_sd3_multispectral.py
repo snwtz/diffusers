@@ -11,6 +11,8 @@ Only the SD3 components are trained during DreamBooth fine-tuning.
 
 CHANNEL CONFIGURATION:
 - Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
+- VAE Adapter: 5-in/5-out (adapter_in_channels/adapter_out_channels)
+- VAE Backbone: 3-in/3-out (backbone_in_channels/backbone_out_channels)
 - VAE Output: 16 latent channels (matching SD3 transformer's default expectation)
 - Transformer Input: 16 latent channels (SD3's default in_channels)
 
@@ -314,6 +316,9 @@ Usage:
 # - transformers: Using specific imports instead
 # - diffusers: Using specific imports instead
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))) # keep: fixes module import bug
 import argparse
 import copy
 import itertools
@@ -352,7 +357,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 # Import custom multispectral dataloader
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))) 
 from multispectral_dataloader import create_multispectral_dataloader
 
 # Import for logging setup
@@ -1030,18 +1035,20 @@ def main(args):
     
     # Log VAE configuration for debugging
     logger.info(f"VAE config - latent_channels: {vae.config.latent_channels}")
-    logger.info(f"VAE config - in_channels: {vae.config.in_channels}")
-    logger.info(f"VAE config - out_channels: {vae.config.out_channels}")
+    logger.info(f"VAE config - adapter_in_channels: {getattr(vae.config, 'adapter_in_channels', 'N/A')}")
+    logger.info(f"VAE config - adapter_out_channels: {getattr(vae.config, 'adapter_out_channels', 'N/A')}")
+    logger.info(f"VAE config - backbone_in_channels: {getattr(vae.config, 'backbone_in_channels', 'N/A')}")
+    logger.info(f"VAE config - backbone_out_channels: {getattr(vae.config, 'backbone_out_channels', 'N/A')}")
     
     # Check for configuration mismatches
-    if vae.config.in_channels != args.num_channels:
+    if getattr(vae.config, 'adapter_in_channels', None) != args.num_channels:
         logger.error(
-            f"VAE configuration mismatch! VAE expects {vae.config.in_channels} channels "
+            f"VAE configuration mismatch! VAE adapter expects {getattr(vae.config, 'adapter_in_channels', None)} channels "
             f"but dataloader provides {args.num_channels} channels. "
             f"This will cause errors during training."
         )
         raise ValueError(
-            f"VAE in_channels ({vae.config.in_channels}) != dataloader channels ({args.num_channels})"
+            f"VAE adapter_in_channels ({getattr(vae.config, 'adapter_in_channels', None)}) != dataloader channels ({args.num_channels})"
         )
     
     # SD3 transformer expects 16 latent channels by default, which is actually beneficial for multispectral data
@@ -1096,12 +1103,41 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move models to device with appropriate dtypes
+    # CRITICAL FIX: VAE should always be in fp32 for stability with multispectral data
+    # This follows the original DreamBooth SD3 pattern where VAE stays in fp32
+    # while other models use mixed precision for speed benefits
     vae.to(accelerator.device, dtype=torch.float32)
-    transformer.to(accelerator.device, dtype=weight_dtype)
+    # DO NOT manually set transformer/text_encoder dtypes - let accelerator.prepare() handle it
+    # This follows the original DreamBooth SD3 pattern exactly
+    transformer.to(accelerator.device)
     if not args.train_text_encoder:
-        text_encoder_one.to(accelerator.device, dtype=weight_dtype)
-        text_encoder_two.to(accelerator.device, dtype=weight_dtype)
-        text_encoder_three.to(accelerator.device, dtype=weight_dtype)
+        text_encoder_one.to(accelerator.device)
+        text_encoder_two.to(accelerator.device)
+        text_encoder_three.to(accelerator.device)
+
+    # EXPLANATION OF FP32 vs FP16 GRADIENT SCALING ISSUE:
+    # ===================================================
+    # The error "ValueError: Attempting to unscale FP16 gradients" occurs when:
+    # 1. Mixed precision training is enabled (fp16)
+    # 2. Models are manually set to fp16 before accelerator.prepare()
+    # 3. The gradient scaler tries to unscale gradients that are already in fp16
+    #
+    # WHY THIS HAPPENS:
+    # - PyTorch's gradient scaler expects gradients to be in fp32 during unscaling
+    # - When models are manually set to fp16, their gradients are also in fp16
+    # - The scaler cannot unscale fp16 gradients (it expects fp32)
+    #
+    # THE ORIGINAL DREAMBOOTH SD3 SOLUTION:
+    # - VAE always stays in fp32 (line 1130 in original: vae.to(accelerator.device, dtype=torch.float32))
+    # - Other models are moved to device WITHOUT setting dtype
+    # - accelerator.prepare() handles mixed precision setup automatically
+    # - This creates a clean fp32 -> fp16 boundary that the gradient scaler can handle
+    #
+    # OUR FIX:
+    # - Follow the exact same pattern as original DreamBooth SD3
+    # - VAE in fp32, other models moved to device without dtype
+    # - Let accelerator.prepare() handle mixed precision setup
+    # - This maintains numerical stability for multispectral data while enabling mixed precision speed
 
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
@@ -1400,11 +1436,17 @@ def main(args):
     logger.info(f"  Multispectral configuration:")
     logger.info(f"    - Input channels: {args.num_channels} (bands 9, 18, 32, 42, 55)")
     logger.info(f"    - VAE latent channels: {vae.config.latent_channels}")
-    logger.info(f"    - VAE input channels: {vae.config.in_channels}")
-    logger.info(f"    - VAE output channels: {vae.config.out_channels}")
+    logger.info(f"    - VAE adapter_in_channels: {getattr(vae.config, 'adapter_in_channels', 'N/A')}")
+    logger.info(f"    - VAE adapter_out_channels: {getattr(vae.config, 'adapter_out_channels', 'N/A')}")
+    logger.info(f"    - VAE backbone_in_channels: {getattr(vae.config, 'backbone_in_channels', 'N/A')}")
+    logger.info(f"    - VAE backbone_out_channels: {getattr(vae.config, 'backbone_out_channels', 'N/A')}")
     logger.info(f"    - Spectral data type: Multispectral plant tissue")
     global_step = 0
     first_epoch = 0
+    
+    # Initialize checkpoint tracking
+    best_val_loss = float('inf')
+    best_epoch = 0
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -1453,6 +1495,8 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
+    logger.info("About to enter main training loop")
+    
     # Main training loop
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -1467,8 +1511,12 @@ def main(args):
                 models_to_accumulate.extend([text_encoder_one, text_encoder_two, text_encoder_three])
             with accelerator.accumulate(models_to_accumulate):
                 # Multispectral data: 5-channel input (bands 9, 18, 32, 42, 55) instead of 3-channel RGB
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
+                # FIXED: Use vae.dtype (fp32) for pixel_values, following original DreamBooth SD3 pattern
+                # This ensures VAE input is in fp32, then we convert model_input to weight_dtype after encoding
+                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)  # vae.dtype is fp32
                 prompts = batch["prompts"]
+
+                logger.info("Fetched first batch from dataloader")    
 
                 # encode batch prompts when custom prompts are provided for each image
                 if args.train_text_encoder:
@@ -1530,6 +1578,7 @@ def main(args):
                         pooled_projections=pooled_prompt_embeds,
                         return_dict=False,
                     )[0]
+                logger.info(f"Transformer forward pass completed, output shape: {model_pred.shape}")
 
                 # Follow: Section 5 of https://arxiv.org/abs/2206.00364
                 # Preconditioning of the model outputs
@@ -1636,7 +1685,15 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
+        # Validation and checkpointing
         if accelerator.is_main_process:
+            # Save checkpoint every checkpointing_steps
+            if global_step % args.checkpointing_steps == 0:
+                checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                accelerator.save_state(checkpoint_path)
+                logger.info(f"Checkpoint saved to: {checkpoint_path}")
+            
+            # Validation
             if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
                 # create pipeline
                 if not args.train_text_encoder:
@@ -1664,6 +1721,19 @@ def main(args):
                     epoch=epoch,
                     torch_dtype=weight_dtype,
                 )
+                # Track best model based on validation loss
+                # For DreamBooth, we can use the training loss as a proxy since we don't have explicit validation
+                current_loss = loss.detach().item()
+                if current_loss < best_val_loss:
+                    best_val_loss = current_loss
+                    best_epoch = epoch
+                    logger.info(f"New best model found! Loss: {best_val_loss:.6f} at epoch {best_epoch}")
+                    
+                    # Save best model checkpoint
+                    best_checkpoint_path = os.path.join(args.output_dir, "best_model")
+                    accelerator.save_state(best_checkpoint_path)
+                    logger.info(f"Best model checkpoint saved to: {best_checkpoint_path}")
+                
                 if not args.train_text_encoder:
                     del text_encoder_one, text_encoder_two, text_encoder_three
                     free_memory()
@@ -1689,7 +1759,21 @@ def main(args):
                 args.pretrained_model_name_or_path, transformer=transformer
             )
 
-        # save the pipeline
+        # Save final model
+        final_model_path = os.path.join(args.output_dir, 'final_model')
+        pipeline.save_pretrained(final_model_path)
+        logger.info(f"Final model saved to: {final_model_path}")
+        
+        # Save best model if we have one
+        if hasattr(args, 'best_val_loss') and args.best_val_loss < float('inf'):
+            best_model_path = os.path.join(args.output_dir, 'best_model')
+            if os.path.exists(best_model_path):
+                import shutil
+                shutil.rmtree(best_model_path)
+            pipeline.save_pretrained(best_model_path)
+            logger.info(f"Best model saved to: {best_model_path}")
+        
+        # save the pipeline to output_dir as well for compatibility
         pipeline.save_pretrained(args.output_dir)
 
         # Final inference
@@ -1732,6 +1816,53 @@ def main(args):
                 ignore_patterns=["step_*", "epoch_*"],
             )
 
+    # Create comprehensive training summary
+    if accelerator.is_main_process:
+        
+        # Collect final metrics
+        final_metrics = {
+            "final_loss": loss.detach().item(),
+            "best_val_loss": best_val_loss,
+            "best_epoch": best_epoch,
+            "total_steps": global_step,
+            "total_epochs": epoch + 1,
+        }
+        
+        # Collect training configuration
+        training_config = {
+            "pretrained_model": args.pretrained_model_name_or_path,
+            "vae_path": args.vae_path,
+            "instance_prompt": args.instance_prompt,
+            "class_prompt": args.class_prompt if args.with_prior_preservation else None,
+            "num_epochs": args.num_train_epochs,
+            "batch_size": args.train_batch_size,
+            "learning_rate": args.learning_rate,
+            "mixed_precision": args.mixed_precision,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "max_grad_norm": args.max_grad_norm,
+            "resolution": args.resolution,
+            "num_channels": args.num_channels,
+            "with_prior_preservation": args.with_prior_preservation,
+            "train_text_encoder": args.train_text_encoder,
+        }
+        
+        # Create logger and log final summary
+        try:
+            from dreambooth_logger import create_dreambooth_logger
+            logger_instance = create_dreambooth_logger(args.output_dir, "dreambooth_multispectral")
+            logger_instance.log_final_summary(
+                total_epochs=epoch + 1,
+                total_steps=global_step,
+                total_time=0,  # Not tracking time
+                final_loss=loss.detach().item(),
+                best_val_loss=best_val_loss,
+                model_path=final_model_path,
+                training_config=training_config,
+                final_metrics=final_metrics
+            )
+        except Exception as e:
+            logger.warning(f"Failed to create training summary: {e}")
+    
     accelerator.end_training()
 
 def save_model_card(
