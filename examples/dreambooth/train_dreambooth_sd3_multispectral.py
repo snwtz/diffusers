@@ -345,6 +345,8 @@ from diffusers import (
     SD3Transformer2DModel,
     StableDiffusion3Pipeline,
 )
+# --- Import ControlNetModel for spatial conditioning integration ---
+from diffusers import ControlNetModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3, free_memory
 from diffusers.utils import (
@@ -408,6 +410,13 @@ def parse_args(input_args=None):
         type=str,
         required=True,
         help="Path to the pretrained multispectral VAE. Required for multispectral training.",
+    )
+    # --- ControlNet: Add argument for optional ControlNet model path ---
+    parser.add_argument(
+        "--controlnet_model_name_or_path",
+        type=str,
+        default=None,
+        help="Path or identifier for pretrained ControlNet (for spatial conditioning on leaf mask)."
     )
     
     # Add all other standard DreamBooth arguments
@@ -779,6 +788,12 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--log_steps",
+        type=int,
+        default=100,
+        help="Number of steps between detailed logs (loss, lr, grad_norm)."
+    )
+    parser.add_argument(
         "--prior_generation_precision",
         type=str,
         default=None,
@@ -934,6 +949,22 @@ def main(args):
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
+        
+        # Initialize wandb for the project
+        wandb.init(
+            project="MS Dreambooth",
+            name=f"multispectral-{args.instance_prompt.replace(' ', '-')}",
+            config={
+                "instance_prompt": args.instance_prompt,
+                "learning_rate": args.learning_rate,
+                "train_batch_size": args.train_batch_size,
+                "max_train_steps": args.max_train_steps,
+                "mixed_precision": args.mixed_precision,
+                "num_channels": args.num_channels,
+                "resolution": args.resolution,
+                "vae_path": args.vae_path,
+            }
+        )
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -1083,6 +1114,17 @@ def main(args):
     transformer = SD3Transformer2DModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     )
+
+    # --- Load lightweight ControlNet for mask-based spatial conditioning ---
+    controlnet = None
+    if args.controlnet_model_name_or_path:
+        controlnet = ControlNetModel.from_pretrained(
+            args.controlnet_model_name_or_path,
+            torch_dtype=weight_dtype,
+        )
+        controlnet.to(accelerator.device)
+        controlnet.requires_grad_(False)
+        logger.info(f"Loaded ControlNet from: {args.controlnet_model_name_or_path}")
 
     # Set up model training states (matches original DreamBooth)
     transformer.requires_grad_(True)
@@ -1516,8 +1558,6 @@ def main(args):
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)  # vae.dtype is fp32
                 prompts = batch["prompts"]
 
-                logger.info("Fetched first batch from dataloader")    
-
                 # encode batch prompts when custom prompts are provided for each image
                 if args.train_text_encoder:
                     tokens_one = tokenize_prompt(tokenizer_one, prompts)
@@ -1555,7 +1595,11 @@ def main(args):
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
+
+
                 # Predict the noise residual
+                # Note: SD3 transformer doesn't use down_block_additional_residuals/mid_block_additional_residual
+                # These are UNet-specific parameters. SD3 uses block_controlnet_hidden_states for ControlNet.
                 if not args.train_text_encoder:
                     model_pred = transformer(
                         hidden_states=noisy_model_input,
@@ -1578,7 +1622,6 @@ def main(args):
                         pooled_projections=pooled_prompt_embeds,
                         return_dict=False,
                     )[0]
-                logger.info(f"Transformer forward pass completed, output shape: {model_pred.shape}")
 
                 # Follow: Section 5 of https://arxiv.org/abs/2206.00364
                 # Preconditioning of the model outputs
@@ -1589,7 +1632,7 @@ def main(args):
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # flow matching loss
+                # --- Masked MSE: focus loss on leaf region only (background zeroed) ---
                 if args.precondition_outputs:
                     target = model_input
                 else:
@@ -1600,21 +1643,32 @@ def main(args):
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
 
-                    # Compute prior loss
-                    prior_loss = torch.mean(
-                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
-                            target_prior.shape[0], -1
-                        ),
-                        1,
+                    # Compute prior loss (masked MSE over class images)
+                    mask_prior = batch["mask"].to(model_pred_prior.device)
+                    mask_prior_resized = torch.nn.functional.interpolate(
+                        mask_prior, size=model_pred_prior.shape[-2:], mode="nearest"
                     )
-                    prior_loss = prior_loss.mean()
+                    loss_map_prior = (model_pred_prior.float() - target_prior.float()) ** 2
+                    masked_loss_per_sample_prior = (
+                        (loss_map_prior * mask_prior_resized).reshape(loss_map_prior.size(0), -1).sum(dim=1)
+                        / mask_prior_resized.reshape(mask_prior_resized.size(0), -1).sum(dim=1)
+                    )
+                    prior_loss = masked_loss_per_sample_prior.mean()
 
-                # Compute regular loss
-                loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
-                    1,
+                # Masked MSE over instance images: zero out background to focus loss on leaf
+                mask = batch["mask"].to(model_pred.device)  # shape (B,1,H,W)
+                # Resize mask to match model_pred spatial dims
+                mask_resized = torch.nn.functional.interpolate(
+                    mask, size=model_pred.shape[-2:], mode="nearest"
                 )
-                loss = loss.mean()
+                # Compute per-pixel MSE map
+                loss_map = (model_pred.float() - target.float()) ** 2  # (B,C,H',W')
+                # Apply mask (broadcasting over channels)
+                masked_loss_per_sample = (
+                    (loss_map * mask_resized).reshape(loss_map.size(0), -1).sum(dim=1)
+                    / mask_resized.reshape(mask_resized.size(0), -1).sum(dim=1)
+                )
+                loss = masked_loss_per_sample.mean()
 
                 if args.with_prior_preservation:
                     # Add the prior loss to the instance loss
@@ -1633,6 +1687,13 @@ def main(args):
                         else transformer.parameters()
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                    # Compute gradient norm for logging
+                    total_norm = 0.0
+                    for p in transformer.parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.detach().data.norm(2)
+                            total_norm += param_norm.item() ** 2
+                    grad_norm = total_norm ** 0.5
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -1670,15 +1731,11 @@ def main(args):
                         logger.info(f"Saved state to {save_path}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-            
-            # Add multispectral-specific logging information
-            if global_step % 100 == 0:  # Log spectral info every 100 steps to avoid spam
+            # Step-level logging every `log_steps`
+            if global_step % args.log_steps == 0:
                 logs.update({
-                    "multispectral_channels": args.num_channels,
-                    "latent_channels": vae.config.latent_channels,
-                    "spectral_data_type": "multispectral_5ch",
+                    "grad_norm": grad_norm,
                 })
-            
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 

@@ -194,6 +194,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # --- Shared utility for NaN/mask logic between DreamBooth and VAE dataloaders ---
+# TODO implement in VAE
 def preprocess_multispectral_image(
     image_path: str,
     required_bands: list,
@@ -354,25 +355,37 @@ class MultispectralDataset(Dataset):
         return len(self.image_paths)
 
 # Custom collate function for DreamBooth multispectral dataloader
-# Adds a repeated prompt string for all images in the batch
-# Stacks pixel_values and mask (if present)
-def multispectral_collate_fn(batch, prompt="a photo of a plant leaf"):
+# Stacks pixel_values and mask (if present), and extracts prompts from dataset items
+def multispectral_collate_fn(batch, prompt=None):
     """
     Collate function for multispectral DreamBooth dataloader.
-    Stacks pixel_values and mask (if present), and adds a repeated prompt.
+    Stacks pixel_values and mask (if present), and handles prompts.
     
     Channel Configuration:
     - pixel_values: Stacked tensor of shape (B, 5, 512, 512) normalized to [-1, 1]
     - mask: Optional stacked tensor of shape (B, 1, 512, 512) if return_mask=True
-    - prompts: List of repeated prompt strings for the batch
+    - prompts: List of prompt strings for the batch (from dataset items or repeated)
     """
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     batch_dict = {"pixel_values": pixel_values}
     if "mask" in batch[0]:
         mask = torch.stack([item["mask"] for item in batch])
         batch_dict["mask"] = mask
-    # Add prompts: repeat the same prompt for all images in the batch
-    batch_dict["prompts"] = [prompt] * len(batch)
+    
+    # Handle prompts: use prompts from dataset items if available, otherwise use provided prompt
+    if "prompts" in batch[0]:
+        # Extract prompts from dataset items (for multiprocessing compatibility)
+        prompts = []
+        for item in batch:
+            prompts.extend(item["prompts"])
+        batch_dict["prompts"] = prompts
+    elif prompt is not None:
+        # Use provided prompt (for single-threaded loading)
+        batch_dict["prompts"] = [prompt] * len(batch)
+    else:
+        # Fallback to default prompt
+        batch_dict["prompts"] = ["sks leaf"] * len(batch)
+    
     return batch_dict
 
 def create_multispectral_dataloader(
@@ -411,8 +424,18 @@ def create_multispectral_dataloader(
         "pin_memory": True,
         "persistent_workers": persistent_workers and num_workers > 0,
         "drop_last": True, # avoids partvial batches
-        "collate_fn": lambda batch: multispectral_collate_fn(batch, prompt=prompt),
     }
+    
+    # For multiprocessing compatibility, we need to handle the collate function differently
+    if num_workers > 0:
+        # Use a simple collate function that doesn't capture variables
+        # The prompt will be handled by the dataset itself
+        kwargs["collate_fn"] = multispectral_collate_fn
+    else:
+        # For single-threaded loading, we can use a function that captures the prompt
+        def collate_fn(batch):
+            return multispectral_collate_fn(batch, prompt=prompt)
+        kwargs["collate_fn"] = collate_fn
     
     # Only add prefetch_factor if specified and num_workers > 0
     if prefetch_factor is not None and num_workers > 0:
