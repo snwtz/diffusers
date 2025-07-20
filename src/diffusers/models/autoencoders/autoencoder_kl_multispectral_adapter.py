@@ -1189,6 +1189,10 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             Union[DecoderOutput, torch.Tensor]: Reconstructed 5-channel image with nonlinear transformations applied.
                          Output range is not guaranteed to be [-1, 1] due to adapter nonlinearities.
         """
+        # Cast input to float32 if it's float16 (for stability with mixed precision pipelines)
+        if z.dtype == torch.float16:
+            z = z.to(torch.float32)
+        
         # Get base decoder output
         raw = super().decode(z, return_dict=True)
         
@@ -1210,8 +1214,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             # Return DecoderOutput for downstream pipeline compatibility
             return DecoderOutput(sample=adapted_output)
         else:
-            # Return raw tensor for training script compatibility
-            return adapted_output
+            # Return tuple for pipeline compatibility (pipeline expects [0] indexing)
+            return (adapted_output,)
 
     def forward(
         self,
@@ -1237,47 +1241,33 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
         Returns:
             Tuple of (decoded_output, losses_dict) where losses_dict is None in eval mode
+
+        - In eval/inference mode: only encodes and decodes, returns decoded tensor (or DecoderOutput), skips all loss computation, mask handling, and logging.
         """
         # Input sample is adapted and encoded
         x = sample
 
-        # Log: NaNs in input
-        if torch.isnan(x).any():
-            logger.debug("[NaN DEBUG] NaNs detected in input")
-
-        # Optional: Print input stats before any adapter/encoder to diagnose anomalies in early pipeline
-        logger.debug(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
-
-        posterior = self.encode(x).latent_dist
-
-        # Log: NaNs in posterior distribution
-        if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
-            logger.debug("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
-
-        # Choose whether to sample from posterior or use mode
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-
-        # Log: NaNs in latent z
-        if torch.isnan(z).any():
-            logger.debug("[NaN DEBUG] NaNs detected in latent z")
-
-        # Decode to obtain reconstructed output
-        decoded = self.decode(z)
-        # Ensure decoded is a tensor, not DecoderOutput
-        if isinstance(decoded, DecoderOutput):
-            decoded_tensor = decoded.sample
-        else:
-            decoded_tensor = decoded
-
-        # Log: NaNs in reconstruction
-        if torch.isnan(decoded_tensor).any():
-            logger.debug("[NaN DEBUG] NaNs detected in reconstruction")
-
-        # Compute training losses if in training mode
         if self.training:
+            # Log: NaNs in input
+            if torch.isnan(x).any():
+                logger.debug("[NaN DEBUG] NaNs detected in input")
+            logger.debug(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+            posterior = self.encode(x).latent_dist
+            if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+                logger.debug("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
+            if sample_posterior:
+                z = posterior.sample(generator=generator)
+            else:
+                z = posterior.mode()
+            if torch.isnan(z).any():
+                logger.debug("[NaN DEBUG] NaNs detected in latent z")
+            decoded = self.decode(z)
+            if isinstance(decoded, DecoderOutput):
+                decoded_tensor = decoded.sample
+            else:
+                decoded_tensor = decoded
+            if torch.isnan(decoded_tensor).any():
+                logger.debug("[NaN DEBUG] NaNs detected in reconstruction")
             losses = self.compute_losses(x, decoded_tensor, mask)
             # Log: Loss debugging for NaNs or unusual values
             if torch.isnan(losses['mse']).any():
@@ -1301,24 +1291,18 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 logger.info(f"[Monitor] Global scale: {global_scale_val:.4f}")
                 if global_scale_val < 0.1 or global_scale_val > 3.0:
                     logger.warning(f"[Monitor] Global scale {global_scale_val:.4f} is outside recommended bounds [0.1, 3.0].")
-            
             return decoded_tensor, losses
-
-        # In evaluation mode, still compute losses for validation tracking
-        losses = self.compute_losses(x, decoded_tensor, mask)
-        
-        # Global scale convergence monitoring (both training and eval modes)
-        # This provides comprehensive tracking of scale behavior for scientific analysis
-        if hasattr(self, "output_adapter") and hasattr(self.output_adapter, "monitor_global_scale_convergence"):
-            scale_info = self.output_adapter.monitor_global_scale_convergence()
-            
-            # Log critical issues immediately
-            if scale_info['is_collapsed']:
-                logger.error(f"[Scale Monitor] CRITICAL: Output scale collapsed to {scale_info['scale_value']:.6f}")
-            elif scale_info['is_exploded']:
-                logger.error(f"[Scale Monitor] CRITICAL: Output scale exploded to {scale_info['scale_value']:.6f}")
-            
-            # Add scale monitoring info to losses for external logging
-            losses['scale_monitoring'] = scale_info
-        
-        return decoded_tensor, losses
+        else:
+            # inference only
+            posterior = self.encode(x).latent_dist
+            if sample_posterior:
+                z = posterior.sample(generator=generator)
+            else:
+                z = posterior.mode()
+            decoded = self.decode(z, return_dict=return_dict)
+            if return_dict and isinstance(decoded, DecoderOutput):
+                return decoded
+            elif isinstance(decoded, DecoderOutput):
+                return decoded.sample
+            else:
+                return decoded

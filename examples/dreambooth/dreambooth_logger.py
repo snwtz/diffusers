@@ -1,6 +1,9 @@
 """
 DreamBooth Multispectral Training Logger
 
+TODO in eval:
+-  all MSEs in one panel
+
 This module provides comprehensive logging functionality for the DreamBooth multispectral training process.
 It captures key metrics, concept learning progress, spectral fidelity, and training behavior in both
 compressed text format and structured JSON for analysis.
@@ -58,78 +61,67 @@ from typing import Dict, Any, Optional, List
 import torch
 import numpy as np
 from pathlib import Path
-import wandb
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    wandb = None
 from PIL import Image
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.colors import LinearSegmentedColormap
 import seaborn as sns
+try:
+    from skimage.metrics import structural_similarity as ssim
+    SSIM_AVAILABLE = True
+except ImportError:
+    SSIM_AVAILABLE = False
+    ssim = None
+
+# --- Helper functions for post-adapter stats, latent stats, and SSIM ---
+def compute_post_adapter_range_stats(decoded_imgs):
+    stats = {}
+    stats["min"] = decoded_imgs.min().item()
+    stats["max"] = decoded_imgs.max().item()
+    stats["mean"] = decoded_imgs.mean().item()
+    stats["std"] = decoded_imgs.std().item()
+    clipped = (decoded_imgs < -1.0) | (decoded_imgs > 1.0)
+    stats["percent_clipped"] = clipped.sum().item() / decoded_imgs.numel() * 100
+    return stats
+
+def compute_per_band_ssim(pred, target, mask):
+    if not SSIM_AVAILABLE:
+        return [0.0] * pred.shape[1]  # Return zeros if SSIM not available
+        
+    ssim_per_band = []
+    for i in range(pred.shape[1]):
+        pred_band = pred[:, i, :, :].squeeze().cpu().numpy()
+        tgt_band = target[:, i, :, :].squeeze().cpu().numpy()
+        msk_band = mask.squeeze().cpu().numpy().astype(bool)
+        if msk_band.sum() == 0:
+            ssim_score = 0.0
+        else:
+            pred_band = pred_band * msk_band
+            tgt_band = tgt_band * msk_band
+            ssim_score = ssim(tgt_band, pred_band, data_range=2.0)
+        ssim_per_band.append(ssim_score)
+    return ssim_per_band
 
 
 class DreamBoothLogger:
     """
     Comprehensive training logger for DreamBooth multispectral training.
-    
-    Captures and logs:
-    - Training progress metrics
-    - Concept learning indicators
-    - Spectral fidelity metrics
-    - Validation performance
-    - Generated image quality
-    - System performance
-    
-    SCIENTIFIC CONTRIBUTION:
-    ------------------------
-    This logger addresses the unique challenges of multispectral DreamBooth training by providing:
-    
-    1. CONCEPT LEARNING ANALYSIS:
-       - Monitors "sks" concept learning progress
-       - Tracks prior preservation loss effectiveness
-       - Analyzes text encoder adaptation to multispectral concepts
-       - Provides interpretable patterns of concept-spectral mapping
-    
-    2. SPECTRAL FIDELITY MONITORING:
-       - Quantifies spectral signature preservation during training
-       - Monitors VAE latent space quality
-       - Tracks multispectral-to-RGB conversion effectiveness
-       - Enables detection of spectral information loss
-    
-    3. TRAINING STABILITY ASSESSMENT:
-       - Tracks gradient clipping events for optimization stability
-       - Monitors mixed precision training performance
-       - Provides comprehensive loss decomposition
-       - Enables early detection of training divergence
-    
-    IMPLEMENTATION DESIGN:
-    ----------------------
-    The logger employs a hierarchical data structure that separates:
-    - Step-level metrics (training progress, loss values)
-    - Epoch-level metrics (validation performance, concept quality)
-    - Spectral-specific analysis (fidelity, latent quality)
-    - System-level information (timing, resource usage)
-    
-    This design enables both real-time monitoring and comprehensive post-training analysis.
+    Handles all logging to text, JSON, and wandb. Provides a clean API for the training script.
     """
-    
-    def __init__(self, output_dir: str, model_name: str = "dreambooth_multispectral"):
-        """
-        Initialize the DreamBooth training logger.
-        
-        Args:
-            output_dir: Directory to save log files
-            model_name: Name for the model/experiment
-        """
+    def __init__(self, output_dir: str, model_name: str = "dreambooth_multispectral", vae=None):
         self.output_dir = Path(output_dir)
         self.model_name = model_name
         self.log_dir = self.output_dir / "dreambooth_logs"
-        self.log_dir.mkdir(exist_ok=True)
-        
-        # Create log file with timestamp
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_file = self.log_dir / f"{model_name}_training_log_{timestamp}.txt"
         self.json_file = self.log_dir / f"{model_name}_training_log_{timestamp}.json"
-        
-        # Initialize log data
         self.log_data = {
             "experiment_info": {
                 "model_name": model_name,
@@ -141,22 +133,15 @@ class DreamBoothLogger:
             "steps": [],
             "epochs": [],
             "validations": [],
-            "concept_analysis": [],
-            "system_performance": [],
-            "best_metrics": {},
-            "final_summary": {}
+            "best_metrics": {}
         }
-        
-        # Track best metrics
         self.best_val_loss = float('inf')
         self.best_epoch = 0
         self.best_step = 0
-        
-        # Write header
+        self.vae = vae
         self._write_header()
-    
+
     def _write_header(self):
-        """Write header information to the log file."""
         header = f"""
 {'='*80}
 DREAMBOOTH MULTISPECTRAL TRAINING LOG
@@ -170,75 +155,20 @@ JSON File: {self.json_file}
 """
         with open(self.log_file, 'w') as f:
             f.write(header)
-    
+
     def log_config(self, config: Dict[str, Any]):
         """Log training configuration."""
         self.log_data["training_config"] = config
-        
-        config_str = f"""
-TRAINING CONFIGURATION:
-{'-'*40}
-"""
+        config_str = f"\nTRAINING CONFIGURATION:\n{'-'*40}\n"
         for key, value in config.items():
             config_str += f"{key}: {value}\n"
-        
         with open(self.log_file, 'a') as f:
             f.write(config_str + "\n")
-    
-    def log_step(self, 
-                 step: int,
-                 epoch: int,
-                 loss: float,
-                 learning_rate: float,
-                 grad_norm: Optional[float] = None,
-                 gradient_clipping: Optional[bool] = None,
-                 prior_loss: Optional[float] = None,
-                 instance_loss: Optional[float] = None,
-                 latent_stats: Optional[Dict] = None,
-                 memory_usage: Optional[float] = None,
-                 training_speed: Optional[float] = None,
-                 gpu_utilization: Optional[float] = None,
-                 cpu_utilization: Optional[float] = None,
-                 concept_similarity: Optional[float] = None,
-                 prior_preservation_score: Optional[float] = None,
-                 spectral_fidelity: Optional[float] = None,
-                 conversion_quality: Optional[float] = None):
-        """
-        Log step-level metrics.
-        
-        This method captures detailed training progress including concept learning
-        indicators that are critical for DreamBooth training analysis.
-        
-        DREAMBOOTH-SPECIFIC METRICS:
-        ----------------------------
-        
-        1. CONCEPT LEARNING TRACKING:
-           - loss: Total training loss
-           - prior_loss: Prior preservation loss (if enabled)
-           - instance_loss: Instance-specific loss
-           - These enable assessment of concept learning vs. preservation balance
-        
-        2. TRAINING STABILITY:
-           - grad_norm: Gradient magnitude for stability assessment
-           - gradient_clipping: Indicates optimization instability
-           - learning_rate: Current learning rate for scheduling analysis
-        
-        3. SPECTRAL FIDELITY:
-           - latent_stats: VAE latent space statistics
-           - Memory usage for computational efficiency
-        
-        Args:
-            step: Current training step
-            epoch: Current epoch
-            loss: Total training loss
-            learning_rate: Current learning rate
-            grad_norm: Gradient norm
-            gradient_clipping: Whether gradient clipping occurred
-            prior_loss: Prior preservation loss (if enabled)
-            instance_loss: Instance-specific loss
-            latent_stats: VAE latent space statistics
-            memory_usage: GPU memory usage in GB
-        """
+        with open(self.json_file, 'w') as f:
+            json.dump(self.log_data, f, indent=2)
+
+    def log_step(self, step: int, epoch: int, loss: float, learning_rate: float, grad_norm: Optional[float] = None, mse_per_channel: Optional[Any] = None):
+        """Log step-level metrics, including per-channel MSE if provided."""
         step_data = {
             "step": step,
             "epoch": epoch,
@@ -246,256 +176,48 @@ TRAINING CONFIGURATION:
             "loss": loss,
             "learning_rate": learning_rate,
             "grad_norm": grad_norm,
-            "gradient_clipping": gradient_clipping,
-            "prior_loss": prior_loss,
-            "instance_loss": instance_loss,
-            "latent_stats": latent_stats,
-            "memory_usage": memory_usage,
-            "training_speed": training_speed,
-            "gpu_utilization": gpu_utilization,
-            "cpu_utilization": cpu_utilization,
-            "concept_similarity": concept_similarity,
-            "prior_preservation_score": prior_preservation_score,
-            "spectral_fidelity": spectral_fidelity,
-            "conversion_quality": conversion_quality
         }
-        
+        # Handle per-channel MSE
+        if mse_per_channel is not None:
+            if hasattr(mse_per_channel, 'detach'):
+                mse_per_channel = mse_per_channel.detach().cpu().tolist()
+            for idx, val in enumerate(mse_per_channel):
+                step_data[f"mse_channel_{idx}"] = float(val)
         self.log_data["steps"].append(step_data)
-        
-        # Write to text file (only every 100 steps to avoid spam)
+        self._check_alert_thresholds(step_data, step, mode="step")
+        # Write to text file every 100 steps
         if step % 100 == 0:
             self._write_step_summary(step_data)
-        
-        # Log to wandb every 10 steps for real-time monitoring
-        if step % 10 == 0 and wandb.run:
-            self._log_step_to_wandb(step_data)
-        
+        # Log to wandb every 10 steps
+        if step % 10 == 0 and WANDB_AVAILABLE and wandb.run:
+            wandb_log = {k: v for k, v in step_data.items() if v is not None}
+            wandb.log(wandb_log, step=step)
         # Save JSON backup
         with open(self.json_file, 'w') as f:
             json.dump(self.log_data, f, indent=2)
-    
+
     def _write_step_summary(self, step_data: Dict[str, Any]):
-        """Write step summary to text file."""
         step = step_data["step"]
         epoch = step_data["epoch"]
         loss = step_data["loss"]
         lr = step_data["learning_rate"]
-        grad_norm = step_data.get("grad_norm", 0)
-        gradient_clipping = step_data.get("gradient_clipping", False)
-        prior_loss = step_data.get("prior_loss", None)
-        instance_loss = step_data.get("instance_loss", None)
-        memory_usage = step_data.get("memory_usage", 0)
-        training_speed = step_data.get("training_speed", 0)
-        gpu_util = step_data.get("gpu_utilization", 0)
-        cpu_util = step_data.get("cpu_utilization", 0)
-        concept_sim = step_data.get("concept_similarity", 0)
-        prior_pres = step_data.get("prior_preservation_score", 0)
-        spectral_fid = step_data.get("spectral_fidelity", 0)
-        conv_quality = step_data.get("conversion_quality", 0)
-        
-        # Format loss components
-        loss_str = f"Loss: {loss:.6f}"
-        if prior_loss is not None:
-            loss_str += f" | Prior: {prior_loss:.6f}"
-        if instance_loss is not None:
-            loss_str += f" | Instance: {instance_loss:.6f}"
-        
-        # Format gradient clipping indicator
-        clip_str = " [CLIP]" if gradient_clipping else ""
-        
-        # Format latent stats if available
-        latent_str = ""
-        if step_data.get("latent_stats"):
-            stats = step_data["latent_stats"]
-            latent_str = f" | Latent: μ={stats.get('mean', 0):.3f}, σ={stats.get('std', 0):.3f}"
-        
-        # Format performance metrics
-        perf_str = ""
-        if training_speed > 0:
-            perf_str += f" | Speed: {training_speed:.1f} steps/s"
-        if gpu_util > 0:
-            perf_str += f" | GPU: {gpu_util:.1f}%"
-        if cpu_util > 0:
-            perf_str += f" | CPU: {cpu_util:.1f}%"
-        
-        # Format concept and spectral metrics
-        concept_str = ""
-        if concept_sim > 0:
-            concept_str += f" | Concept: {concept_sim:.3f}"
-        if prior_pres > 0:
-            concept_str += f" | Prior: {prior_pres:.3f}"
-        if spectral_fid > 0:
-            concept_str += f" | Spectral: {spectral_fid:.3f}"
-        if conv_quality > 0:
-            concept_str += f" | Conv: {conv_quality:.3f}"
-        
-        # Main step line
-        step_line = f"Step {step:6d} (Epoch {epoch:3d}) | {loss_str} | LR: {lr:.2e} | Grad: {grad_norm:.3f}{clip_str} | Mem: {memory_usage:.1f}GB{latent_str}{perf_str}{concept_str}"
-        
+        grad_norm = step_data.get("grad_norm", None)
+        # Handle None grad_norm gracefully
+        if grad_norm is not None:
+            grad_norm_str = f" | GradNorm: {grad_norm:.4f}"
+        else:
+            grad_norm_str = " | GradNorm: N/A"
+        line = f"Step {step} | Epoch {epoch} | Loss: {loss:.4f} | LR: {lr:.2e}{grad_norm_str}"
+        # Add per-channel MSE if present
+        mse_keys = [k for k in step_data if k.startswith("mse_channel_")]
+        if mse_keys:
+            mse_str = " | " + ", ".join([f"{k}: {step_data[k]:.4f}" for k in mse_keys])
+            line += mse_str
         with open(self.log_file, 'a') as f:
-            f.write(step_line + "\n")
-    
-    def _log_step_to_wandb(self, step_data: Dict[str, Any]):
-        """Log step data to wandb for real-time monitoring."""
-        if not wandb.run:
-            return
-        
-        try:
-            wandb_log_data = {
-                "step": step_data["step"],
-                "epoch": step_data["epoch"],
-                "loss": step_data["loss"],
-                "learning_rate": step_data["learning_rate"],
-            }
-            
-            # Add optional metrics
-            if step_data.get("grad_norm"):
-                wandb_log_data["gradient_norm"] = step_data["grad_norm"]
-            if step_data.get("prior_loss"):
-                wandb_log_data["prior_loss"] = step_data["prior_loss"]
-            if step_data.get("instance_loss"):
-                wandb_log_data["instance_loss"] = step_data["instance_loss"]
-            if step_data.get("memory_usage"):
-                wandb_log_data["memory_usage_gb"] = step_data["memory_usage"]
-            if step_data.get("training_speed"):
-                wandb_log_data["training_speed"] = step_data["training_speed"]
-            if step_data.get("gpu_utilization"):
-                wandb_log_data["gpu_utilization"] = step_data["gpu_utilization"]
-            if step_data.get("cpu_utilization"):
-                wandb_log_data["cpu_utilization"] = step_data["cpu_utilization"]
-            if step_data.get("concept_similarity"):
-                wandb_log_data["concept_similarity"] = step_data["concept_similarity"]
-            if step_data.get("prior_preservation_score"):
-                wandb_log_data["prior_preservation_score"] = step_data["prior_preservation_score"]
-            if step_data.get("spectral_fidelity"):
-                wandb_log_data["spectral_fidelity"] = step_data["spectral_fidelity"]
-            if step_data.get("conversion_quality"):
-                wandb_log_data["conversion_quality"] = step_data["conversion_quality"]
-            
-            # Add latent statistics
-            if step_data.get("latent_stats"):
-                stats = step_data["latent_stats"]
-                wandb_log_data.update({
-                    "latent/mean": stats.get("mean", 0),
-                    "latent/std": stats.get("std", 0),
-                    "latent/min": stats.get("min", 0),
-                    "latent/max": stats.get("max", 0),
-                    "latent/spatial_mean": stats.get("spatial_mean", 0),
-                    "latent/channel_std": stats.get("channel_std", 0),
-                })
-            
-            wandb.log(wandb_log_data)
-            
-        except Exception as e:
-            print(f"Warning: Failed to log step to wandb: {e}")
-    
-    def _log_epoch_to_wandb(self, epoch_data: Dict[str, Any]):
-        """Log epoch data to wandb for comprehensive monitoring."""
-        if not wandb.run:
-            return
-        
-        try:
-            wandb_log_data = {
-                "epoch": epoch_data["epoch"],
-                "avg_loss": epoch_data["avg_loss"],
-                "avg_learning_rate": epoch_data["avg_learning_rate"],
-                "total_steps": epoch_data["total_steps"],
-                "epoch_time": epoch_data["epoch_time"],
-            }
-            
-            # Add validation metrics
-            if epoch_data.get("validation_metrics"):
-                val_metrics = epoch_data["validation_metrics"]
-                wandb_log_data.update({
-                    "val_loss": val_metrics.get("val_loss", 0),
-                    "val_concept_similarity": val_metrics.get("concept_similarity", 0),
-                    "val_image_quality": val_metrics.get("image_quality", 0),
-                })
-            
-            # Add concept quality metrics
-            if epoch_data.get("concept_quality"):
-                concept = epoch_data["concept_quality"]
-                wandb_log_data.update({
-                    "concept_quality": concept.get("quality_score", 0),
-                    "concept_prior_preservation": concept.get("prior_preservation", 0),
-                    "concept_similarity": concept.get("similarity", 0),
-                })
-            
-            # Add spectral fidelity metrics
-            if epoch_data.get("spectral_fidelity"):
-                spectral = epoch_data["spectral_fidelity"]
-                wandb_log_data.update({
-                    "spectral_fidelity": spectral.get("fidelity", 0),
-                    "spectral_latent_quality": spectral.get("latent_quality", 0),
-                    "spectral_conversion_quality": spectral.get("conversion_quality", 0),
-                })
-            
-            # Add band importance
-            if epoch_data.get("band_importance"):
-                band_imp = epoch_data["band_importance"]
-                if isinstance(band_imp, dict):
-                    for band, importance in band_imp.items():
-                        wandb_log_data[f"band_importance_{band}"] = importance
-            
-            # Add band correlation
-            if epoch_data.get("band_correlation"):
-                band_corr = epoch_data["band_correlation"]
-                if isinstance(band_corr, dict):
-                    for band_pair, correlation in band_corr.items():
-                        wandb_log_data[f"band_correlation_{band_pair}"] = correlation
-            
-            # Add spectral signature preservation
-            if epoch_data.get("spectral_signature_preservation"):
-                wandb_log_data["spectral_signature_preservation"] = epoch_data["spectral_signature_preservation"]
-            
-            # Add latent clustering metrics
-            if epoch_data.get("latent_clustering"):
-                latent_cluster = epoch_data["latent_clustering"]
-                wandb_log_data.update({
-                    "latent_clustering_score": latent_cluster.get("clustering_score", 0),
-                    "latent_separation": latent_cluster.get("separation", 0),
-                })
-            
-            # Add concept-latent mapping metrics
-            if epoch_data.get("concept_latent_mapping"):
-                concept_map = epoch_data["concept_latent_mapping"]
-                wandb_log_data.update({
-                    "concept_latent_correlation": concept_map.get("correlation", 0),
-                    "concept_latent_separation": concept_map.get("separation", 0),
-                })
-            
-            wandb.log(wandb_log_data)
-            
-        except Exception as e:
-            print(f"Warning: Failed to log epoch to wandb: {e}")
-    
-    def log_epoch(self, 
-                  epoch: int,
-                  avg_loss: float,
-                  avg_learning_rate: float,
-                  total_steps: int,
-                  epoch_time: float,
-                  validation_metrics: Optional[Dict] = None,
-                  concept_quality: Optional[Dict] = None,
-                  spectral_fidelity: Optional[Dict] = None,
-                  band_importance: Optional[Dict] = None,
-                  band_correlation: Optional[Dict] = None,
-                  spectral_signature_preservation: Optional[float] = None,
-                  latent_clustering: Optional[Dict] = None,
-                  concept_latent_mapping: Optional[Dict] = None):
-        """
-        Log epoch-level metrics.
-        
-        Args:
-            epoch: Current epoch number
-            avg_loss: Average loss for the epoch
-            avg_learning_rate: Average learning rate for the epoch
-            total_steps: Total steps in the epoch
-            epoch_time: Time taken for the epoch
-            validation_metrics: Validation performance metrics
-            concept_quality: Concept learning quality indicators
-            spectral_fidelity: Spectral fidelity metrics
-        """
+            f.write(line + "\n")
+
+    def log_epoch(self, epoch: int, avg_loss: float, avg_learning_rate: float, total_steps: int, epoch_time: float, validation_metrics: Optional[Dict] = None):
+        """Log epoch-level metrics."""
         epoch_data = {
             "epoch": epoch,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -503,519 +225,224 @@ TRAINING CONFIGURATION:
             "avg_learning_rate": avg_learning_rate,
             "total_steps": total_steps,
             "epoch_time": epoch_time,
-            "validation_metrics": validation_metrics,
-            "concept_quality": concept_quality,
-            "spectral_fidelity": spectral_fidelity,
-            "band_importance": band_importance,
-            "band_correlation": band_correlation,
-            "spectral_signature_preservation": spectral_signature_preservation,
-            "latent_clustering": latent_clustering,
-            "concept_latent_mapping": concept_latent_mapping
         }
-        
+        if validation_metrics is not None:
+            epoch_data["validation_metrics"] = validation_metrics
         self.log_data["epochs"].append(epoch_data)
-        
-        # Check for best model
-        if validation_metrics and validation_metrics.get('val_loss', float('inf')) < self.best_val_loss:
-            self.best_val_loss = validation_metrics['val_loss']
-            self.best_epoch = epoch
-            self.log_data["best_metrics"] = {
-                "best_epoch": epoch,
-                "best_val_loss": self.best_val_loss,
-                "train_loss_at_best": avg_loss
-            }
-        
-        # Write to text file
         self._write_epoch_summary(epoch_data)
-        
-        # Save JSON backup
         with open(self.json_file, 'w') as f:
             json.dump(self.log_data, f, indent=2)
-    
+        if WANDB_AVAILABLE and wandb.run:
+            wandb_log = {k: v for k, v in epoch_data.items() if v is not None}
+            wandb.log(wandb_log, step=epoch)
+
     def _write_epoch_summary(self, epoch_data: Dict[str, Any]):
-        """Write epoch summary to text file."""
         epoch = epoch_data["epoch"]
         avg_loss = epoch_data["avg_loss"]
         avg_lr = epoch_data["avg_learning_rate"]
-        total_steps = epoch_data["total_steps"]
-        epoch_time = epoch_data["epoch_time"]
-        
-        # Format validation metrics
-        val_str = ""
+        val_loss = 0.0
         if epoch_data.get("validation_metrics"):
             val_metrics = epoch_data["validation_metrics"]
-            val_str = f" | Val Loss: {val_metrics.get('val_loss', 0):.6f}"
-            if 'concept_similarity' in val_metrics:
-                val_str += f" | Concept Sim: {val_metrics['concept_similarity']:.3f}"
-            if 'image_quality' in val_metrics:
-                val_str += f" | Quality: {val_metrics['image_quality']:.3f}"
-        
-        # Format concept quality
-        concept_str = ""
-        if epoch_data.get("concept_quality"):
-            concept = epoch_data["concept_quality"]
-            concept_str = f" | Concept Quality: {concept.get('quality_score', 0):.3f}"
-            if 'prior_preservation' in concept:
-                concept_str += f" | Prior Pres: {concept['prior_preservation']:.3f}"
-            if 'similarity' in concept:
-                concept_str += f" | Similarity: {concept['similarity']:.3f}"
-        
-        # Format spectral fidelity
-        spectral_str = ""
-        if epoch_data.get("spectral_fidelity"):
-            spectral = epoch_data["spectral_fidelity"]
-            spectral_str = f" | Spectral Fidelity: {spectral.get('fidelity', 0):.3f}"
-            if 'latent_quality' in spectral:
-                spectral_str += f" | Latent: {spectral['latent_quality']:.3f}"
-            if 'conversion_quality' in spectral:
-                spectral_str += f" | Conv: {spectral['conversion_quality']:.3f}"
-        
-        # Format band importance
-        band_str = ""
-        if epoch_data.get("band_importance"):
-            band_imp = epoch_data["band_importance"]
-            if isinstance(band_imp, dict) and len(band_imp) > 0:
-                # Show top 3 bands
-                sorted_bands = sorted(band_imp.items(), key=lambda x: x[1], reverse=True)[:3]
-                band_str = f" | Top Bands: {', '.join([f'{k}({v:.2f})' for k, v in sorted_bands])}"
-        
-        # Format spectral signature preservation
-        sig_str = ""
-        if epoch_data.get("spectral_signature_preservation"):
-            sig_pres = epoch_data["spectral_signature_preservation"]
-            sig_str = f" | Sig Pres: {sig_pres:.3f}"
-        
-        # Main epoch line
-        epoch_line = f"Epoch {epoch:3d} | Avg Loss: {avg_loss:.6f} | Steps: {total_steps} | Time: {epoch_time:.1f}s | LR: {avg_lr:.2e}{val_str}{concept_str}{spectral_str}{band_str}{sig_str}"
-        
-        # Add best model indicator
-        if epoch == self.best_epoch:
-            epoch_line += " [BEST]"
-        
+            val_loss = val_metrics.get('val_loss', 0)
+        line = f"Epoch {epoch} | Avg Loss: {avg_loss:.4f} | Val Loss: {val_loss:.4f} | LR: {avg_lr:.2e}"
         with open(self.log_file, 'a') as f:
-            f.write(epoch_line + "\n")
-        
-        # Log to wandb
-        if wandb.run:
-            self._log_epoch_to_wandb(epoch_data)
-    
-    def log_validation(self, 
-                      epoch: int,
-                      images: List[Image.Image],
-                      prompt: str,
-                      validation_metrics: Dict[str, Any],
-                      spectral_analysis: Optional[Dict] = None):
-        """
-        Log validation results including generated images and metrics.
-        
-        Args:
-            epoch: Current epoch
-            images: Generated validation images
-            prompt: Validation prompt used
-            validation_metrics: Validation performance metrics
-            spectral_analysis: Spectral analysis of generated images
-        """
+            f.write(line + "\n")
+
+    def log_validation(self, epoch: int, images: List[Any], prompt: str, validation_metrics: Dict[str, Any], mse_per_channel: Optional[Any] = None):
+        """Log validation results, including images and per-channel MSE."""
         validation_data = {
             "epoch": epoch,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "prompt": prompt,
             "num_images": len(images),
             "validation_metrics": validation_metrics,
-            "spectral_analysis": spectral_analysis
         }
-        
+        # Handle per-channel MSE
+        if mse_per_channel is not None:
+            if hasattr(mse_per_channel, 'detach'):
+                mse_per_channel = mse_per_channel.detach().cpu().tolist()
+            for idx, val in enumerate(mse_per_channel):
+                validation_data[f"mse_channel_{idx}"] = float(val)
         self.log_data["validations"].append(validation_data)
-        
         # Save validation images
         validation_dir = self.log_dir / "validation_images"
         validation_dir.mkdir(exist_ok=True)
-        
         for i, image in enumerate(images):
             image_path = validation_dir / f"epoch_{epoch:03d}_image_{i:02d}.png"
             image.save(image_path)
-        
+
+        # --- VAE decoding and metric computation ---
+        if self.vae is not None:
+            try:
+                with torch.no_grad():
+                    # Expect images[i] contains {"latent": Tensor, "target": Tensor, "mask": Tensor}
+                    decoded_imgs = self.vae.decode(torch.stack([i["latent"] for i in images[:3]]))
+                    val_images = torch.stack([i["target"] for i in images[:3]])
+                    val_mask = torch.stack([i["mask"] for i in images[:3]])
+
+                # Clamp decoded images for output comparison
+                decoded_imgs_clamped = torch.clamp(decoded_imgs, -1.0, 1.0)
+
+                # Compute post-adapter range stats
+                range_stats = compute_post_adapter_range_stats(decoded_imgs)
+                # Track clamped output stats for comparison
+                range_stats_clamped = compute_post_adapter_range_stats(decoded_imgs_clamped)
+                for k, v in range_stats.items():
+                    validation_data["validation_metrics"][f"range/{k}"] = v
+                for k, v in range_stats_clamped.items():
+                    validation_data["validation_metrics"][f"range_clamped/{k}"] = v
+
+                # Compute per-band SSIM
+                if SSIM_AVAILABLE:
+                    ssim_per_band = compute_per_band_ssim(decoded_imgs, val_images, val_mask)
+                    for i, score in enumerate(ssim_per_band):
+                        validation_data["validation_metrics"][f"ssim_channel_{i}"] = score
+                else:
+                    # Fallback when SSIM is not available
+                    for i in range(decoded_imgs.shape[1]):
+                        validation_data["validation_metrics"][f"ssim_channel_{i}"] = 0.0
+
+                # Optionally compute latent stats (if available)
+                if "latent" in images[0]:
+                    latents = torch.stack([i["latent"] for i in images[:3]])
+                    latent_stats = compute_latent_statistics(latents)
+                    for k, v in latent_stats.items():
+                        validation_data["validation_metrics"][f"latent/{k}"] = v
+
+                # Compute SAM on all 5 channels
+                pred_vectors = decoded_imgs.permute(0, 2, 3, 1).reshape(-1, 5)
+                gt_vectors = val_images.permute(0, 2, 3, 1).reshape(-1, 5)
+                mask_flat = val_mask.reshape(-1)
+                valid = mask_flat > 0
+                pred_vectors = pred_vectors[valid]
+                gt_vectors = gt_vectors[valid]
+
+                cos_sim = torch.nn.functional.cosine_similarity(pred_vectors, gt_vectors, dim=1, eps=1e-8)
+                cos_sim = cos_sim.clamp(-1.0, 1.0)
+                angles = torch.acos(cos_sim)
+                sam_score = angles.mean().item()
+                validation_data["validation_metrics"]["SAM"] = sam_score
+
+                # Per-channel masked MSE logging
+                diff = decoded_imgs - val_images
+                mask_exp = val_mask.expand_as(diff)
+                diff_masked = diff * mask_exp
+                mse_num = (diff_masked ** 2).flatten(2).sum(dim=2)
+                valid_pixels = mask_exp.flatten(2).sum(dim=2)
+                channel_mse = (mse_num / (valid_pixels + 1e-8)).mean(dim=0)
+                for idx, val in enumerate(channel_mse):
+                    validation_data[f"mse_channel_{idx}"] = float(val)
+
+                # Visualize clamped vs raw output in wandb
+                if WANDB_AVAILABLE and wandb.run:
+                    # Visualize clamped vs raw output
+                    raw_imgs_vis = [Image.fromarray((np.clip(img.cpu().numpy()[0], -1, 1) * 127.5 + 127.5).astype(np.uint8).transpose(1, 2, 0)) for img in decoded_imgs]
+                    clamped_imgs_vis = [Image.fromarray((img.cpu().numpy()[0] * 127.5 + 127.5).astype(np.uint8).transpose(1, 2, 0)) for img in decoded_imgs_clamped]
+                    wandb_images = []
+                    for i, (raw, clamped) in enumerate(zip(raw_imgs_vis, clamped_imgs_vis)):
+                        wandb_images.append(wandb.Image(raw, caption=f"raw_{i}"))
+                        wandb_images.append(wandb.Image(clamped, caption=f"clamped_{i}"))
+                    wandb.log({"val/raw_vs_clamped_outputs": wandb_images}, step=epoch)
+            except Exception as e:
+                self.log_warning(f"VAE metric computation failed: {e}")
+                sam_score = None
+                channel_mse = None
+        else:
+            sam_score = None
+            channel_mse = None
+
         # Write validation summary
         self._write_validation_summary(validation_data)
-        
+        self._check_alert_thresholds(validation_data["validation_metrics"], epoch, mode="val")
         # Save JSON backup
         with open(self.json_file, 'w') as f:
             json.dump(self.log_data, f, indent=2)
-    
+        # Log to wandb
+        if WANDB_AVAILABLE and wandb.run:
+            wandb_images = [wandb.Image(image, caption=f"{i}: {prompt}") for i, image in enumerate(images)]
+            wandb_log = {"validation_images": wandb_images}
+            # Add per-channel MSE and metrics
+            if channel_mse is not None:
+                for idx, val in enumerate(channel_mse):
+                    wandb_log[f"val/mse_channel_{idx}"] = float(val)
+            elif mse_per_channel is not None:
+                for idx, val in enumerate(mse_per_channel or []):
+                    wandb_log[f"val/mse_channel_{idx}"] = float(val)
+            # Add all validation metrics (including range, SSIM, latent, SAM)
+            for k, v in validation_data["validation_metrics"].items():
+                wandb_log[f"val/{k}"] = v
+            if sam_score is not None:
+                wandb_log["val/SAM"] = sam_score
+            wandb.log(wandb_log, step=epoch)
+
+    def _check_alert_thresholds(self, metrics: Dict[str, float], step_or_epoch: int, mode: str = "step"):
+        """Checks key metrics for warning thresholds."""
+        prefix = f"[ALERT][{mode.upper()} {step_or_epoch}]"
+        if "range/percent_clipped" in metrics:
+            val = metrics["range/percent_clipped"]
+            if val > 5.0:
+                self.log_warning(f"{prefix} CRITICAL: Percent of clipped values >5% ({val:.2f}%)")
+            elif val > 1.0:
+                self.log_warning(f"{prefix} WARN: Clipping creeping up (>1%) – currently {val:.2f}%")
+        if "SAM" in metrics:
+            val = metrics["SAM"]
+            if val > 0.4:
+                self.log_warning(f"{prefix} CRITICAL: SAM > 0.4 indicates angular distortion ({val:.3f})")
+            elif val > 0.25:
+                self.log_warning(f"{prefix} WARN: SAM > 0.25 may signal degradation ({val:.3f})")
+        ssim_vals = [v for k, v in metrics.items() if k.startswith("ssim_channel_")]
+        if ssim_vals:
+            min_ssim = min(ssim_vals)
+            if min_ssim < 0.4:
+                self.log_warning(f"{prefix} CRITICAL: One or more SSIM < 0.4 ({min_ssim:.3f})")
+            elif min_ssim < 0.6:
+                self.log_warning(f"{prefix} WARN: SSIM dropping below 0.6 ({min_ssim:.3f})")
+
     def _write_validation_summary(self, validation_data: Dict[str, Any]):
-        """Write validation summary to text file."""
         epoch = validation_data["epoch"]
         prompt = validation_data["prompt"]
         num_images = validation_data["num_images"]
         metrics = validation_data["validation_metrics"]
-        
-        val_line = f"Validation Epoch {epoch:3d} | Prompt: '{prompt}' | Images: {num_images}"
-        
+        line = f"Validation Epoch {epoch:3d} | Prompt: '{prompt}' | Images: {num_images}"
         if metrics:
-            val_line += f" | Loss: {metrics.get('val_loss', 0):.6f}"
-            if 'concept_similarity' in metrics:
-                val_line += f" | Concept Sim: {metrics['concept_similarity']:.3f}"
-            if 'image_quality' in metrics:
-                val_line += f" | Quality: {metrics['image_quality']:.3f}"
-        
+            line += f" | Loss: {metrics.get('val_loss', 0):.6f}"
+        mse_keys = [k for k in validation_data if k.startswith("mse_channel_")]
+        if mse_keys:
+            mse_str = " | " + ", ".join([f"{k}: {validation_data[k]:.4f}" for k in mse_keys])
+            line += mse_str
         with open(self.log_file, 'a') as f:
-            f.write(val_line + "\n")
-    
-    def log_concept_analysis(self, 
-                           epoch: int,
-                           concept_embeddings: Optional[torch.Tensor] = None,
-                           prior_embeddings: Optional[torch.Tensor] = None,
-                           concept_similarity: Optional[float] = None,
-                           prior_preservation_score: Optional[float] = None,
-                           text_encoder_adaptation: Optional[Dict] = None):
-        """
-        Log concept learning analysis.
-        
-        Args:
-            epoch: Current epoch
-            concept_embeddings: Text embeddings for the concept
-            prior_embeddings: Text embeddings for the prior
-            concept_similarity: Similarity between concept and prior
-            prior_preservation_score: Prior preservation effectiveness
-            text_encoder_adaptation: Text encoder adaptation metrics
-        """
-        concept_data = {
-            "epoch": epoch,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "concept_similarity": concept_similarity,
-            "prior_preservation_score": prior_preservation_score,
-            "text_encoder_adaptation": text_encoder_adaptation
-        }
-        
-        # Convert tensors to lists for JSON serialization
-        if concept_embeddings is not None:
-            concept_data["concept_embeddings"] = concept_embeddings.detach().cpu().tolist()
-        if prior_embeddings is not None:
-            concept_data["prior_embeddings"] = prior_embeddings.detach().cpu().tolist()
-        
-        self.log_data["concept_analysis"].append(concept_data)
-        
-        # Write concept analysis summary
-        self._write_concept_summary(concept_data)
-        
-        # Save JSON backup
-        with open(self.json_file, 'w') as f:
-            json.dump(self.log_data, f, indent=2)
-    
-    def _write_concept_summary(self, concept_data: Dict[str, Any]):
-        """Write concept analysis summary to text file."""
-        epoch = concept_data["epoch"]
-        concept_sim = concept_data.get("concept_similarity", 0)
-        prior_pres = concept_data.get("prior_preservation_score", 0)
-        
-        concept_line = f"Concept Analysis Epoch {epoch:3d} | Similarity: {concept_sim:.3f} | Prior Pres: {prior_pres:.3f}"
-        
-        with open(self.log_file, 'a') as f:
-            f.write(concept_line + "\n")
-    
-    def log_system_performance(self, 
-                             epoch: int,
-                             memory_usage: float,
-                             gpu_utilization: Optional[float] = None,
-                             cpu_utilization: Optional[float] = None,
-                             training_speed: Optional[float] = None):
-        """
-        Log system performance metrics.
-        
-        Args:
-            epoch: Current epoch
-            memory_usage: GPU memory usage in GB
-            gpu_utilization: GPU utilization percentage
-            cpu_utilization: CPU utilization percentage
-            training_speed: Steps per second
-        """
-        performance_data = {
-            "epoch": epoch,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "memory_usage": memory_usage,
-            "gpu_utilization": gpu_utilization,
-            "cpu_utilization": cpu_utilization,
-            "training_speed": training_speed
-        }
-        
-        self.log_data["system_performance"].append(performance_data)
-        
-        # Write performance summary
-        self._write_performance_summary(performance_data)
-        
-        # Save JSON backup
-        with open(self.json_file, 'w') as f:
-            json.dump(self.log_data, f, indent=2)
-    
-    def _write_performance_summary(self, performance_data: Dict[str, Any]):
-        """Write system performance summary to text file."""
-        epoch = performance_data["epoch"]
-        memory = performance_data["memory_usage"]
-        gpu_util = performance_data.get("gpu_utilization", 0)
-        cpu_util = performance_data.get("cpu_utilization", 0)
-        speed = performance_data.get("training_speed", 0)
-        
-        perf_line = f"Performance Epoch {epoch:3d} | Memory: {memory:.1f}GB | GPU: {gpu_util:.1f}% | CPU: {cpu_util:.1f}% | Speed: {speed:.1f} steps/s"
-        
-        with open(self.log_file, 'a') as f:
-            f.write(perf_line + "\n")
-    
-    def log_final_summary(self, 
-                         total_epochs: int,
-                         total_steps: int,
-                         total_time: float,
-                         final_loss: float,
-                         best_val_loss: float,
-                         model_path: str,
-                         training_config: Optional[Dict] = None,
-                         final_metrics: Optional[Dict] = None,
-                         spectral_analysis: Optional[Dict] = None,
-                         performance_stats: Optional[Dict] = None,
-                         concept_learning_summary: Optional[Dict] = None):
-        """
-        Create a comprehensive training summary file with all information needed to assess performance.
-        
-        This creates a single text file that contains everything needed to understand:
-        - Training configuration and hyperparameters
-        - Final model performance metrics
-        - Spectral fidelity analysis
-        - Concept learning progress
-        - System performance statistics
-        - Model architecture details
-        - Training dynamics and convergence
-        
-        Args:
-            total_epochs: Total number of epochs completed
-            total_steps: Total number of training steps
-            total_time: Total training time in seconds
-            final_loss: Final training loss
-            best_val_loss: Best validation loss achieved
-            model_path: Path where final model was saved
-            training_config: Complete training configuration
-            final_metrics: Final epoch metrics
-            spectral_analysis: Spectral fidelity analysis results
-            performance_stats: System performance statistics
-            concept_learning_summary: Concept learning analysis
-        """
-        summary_file = os.path.join(self.output_dir, "training_summary.txt")
-        
-        with open(summary_file, 'w') as f:
-            f.write("=" * 80 + "\n")
-            f.write("DREAMBOOTH MULTISPECTRAL TRAINING SUMMARY\n")
-            f.write("=" * 80 + "\n")
-            f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Model: {self.model_name}\n")
-            f.write(f"Output Directory: {self.output_dir}\n\n")
-            
-            # Training Overview
-            f.write("TRAINING OVERVIEW\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Total Epochs: {total_epochs}\n")
-            f.write(f"Total Steps: {total_steps}\n")
-            f.write(f"Final Training Loss: {final_loss:.6f}\n")
-            f.write(f"Best Validation Loss: {best_val_loss:.6f}\n")
-            f.write(f"Model Saved To: {model_path}\n\n")
-            
-            # Training Configuration
-            if training_config:
-                f.write("TRAINING CONFIGURATION\n")
-                f.write("-" * 40 + "\n")
-                for key, value in training_config.items():
-                    f.write(f"{key}: {value}\n")
-                f.write("\n")
-            
-            # Final Metrics
-            if final_metrics:
-                f.write("FINAL METRICS\n")
-                f.write("-" * 40 + "\n")
-                for key, value in final_metrics.items():
-                    if isinstance(value, (list, tuple)):
-                        f.write(f"{key}: {[f'{v:.4f}' for v in value]}\n")
-                    else:
-                        f.write(f"{key}: {value:.6f}\n")
-                f.write("\n")
-            
-            # Spectral Analysis
-            if spectral_analysis:
-                f.write("SPECTRAL FIDELITY ANALYSIS\n")
-                f.write("-" * 40 + "\n")
-                for key, value in spectral_analysis.items():
-                    if isinstance(value, dict):
-                        f.write(f"{key}:\n")
-                        for subkey, subvalue in value.items():
-                            f.write(f"  {subkey}: {subvalue:.4f}\n")
-                    else:
-                        f.write(f"{key}: {value:.4f}\n")
-                f.write("\n")
-            
-            # Concept Learning Summary
-            if concept_learning_summary:
-                f.write("CONCEPT LEARNING SUMMARY\n")
-                f.write("-" * 40 + "\n")
-                for key, value in concept_learning_summary.items():
-                    if isinstance(value, dict):
-                        f.write(f"{key}:\n")
-                        for subkey, subvalue in value.items():
-                            f.write(f"  {subkey}: {subvalue:.4f}\n")
-                    else:
-                        f.write(f"{key}: {value:.4f}\n")
-                f.write("\n")
-            
-            # Performance Statistics
-            if performance_stats:
-                f.write("SYSTEM PERFORMANCE STATISTICS\n")
-                f.write("-" * 40 + "\n")
-                for key, value in performance_stats.items():
-                    if isinstance(value, dict):
-                        f.write(f"{key}:\n")
-                        for subkey, subvalue in value.items():
-                            f.write(f"  {subkey}: {subvalue:.2f}\n")
-                    else:
-                        f.write(f"{key}: {value:.2f}\n")
-                f.write("\n")
-            
-            # Training Dynamics Analysis
-            f.write("TRAINING DYNAMICS ANALYSIS\n")
-            f.write("-" * 40 + "\n")
-            
-            # Analyze loss progression from JSON data
-            if os.path.exists(self.json_file):
-                try:
-                    with open(self.json_file, 'r') as json_f:
-                        training_data = json.load(json_f)
-                    
-                    if 'steps' in training_data and training_data['steps']:
-                        steps = training_data['steps']
-                        losses = [step.get('loss', 0) for step in steps if 'loss' in step]
-                        
-                        if losses:
-                            f.write(f"Loss Progression:\n")
-                            f.write(f"  Initial Loss: {losses[0]:.6f}\n")
-                            f.write(f"  Final Loss: {losses[-1]:.6f}\n")
-                            f.write(f"  Loss Reduction: {((losses[0] - losses[-1]) / losses[0] * 100):.2f}%\n")
-                            f.write(f"  Min Loss: {min(losses):.6f}\n")
-                            f.write(f"  Max Loss: {max(losses):.6f}\n")
-                            
-                            # Convergence analysis
-                            if len(losses) > 10:
-                                recent_losses = losses[-10:]
-                                recent_std = np.std(recent_losses)
-                                f.write(f"  Recent Loss Std (last 10): {recent_std:.6f}\n")
-                                if recent_std < 0.001:
-                                    f.write("  ✓ Training appears to have converged\n")
-                                else:
-                                    f.write("  ⚠ Training may not have fully converged\n")
-                except Exception as e:
-                    f.write(f"Could not analyze training dynamics: {e}\n")
-            
-            # Model Assessment
-            f.write("\nMODEL ASSESSMENT\n")
-            f.write("-" * 40 + "\n")
-            
-            # Loss-based assessment
-            if final_loss < 0.01:
-                f.write("✓ Excellent training loss (< 0.01)\n")
-            elif final_loss < 0.05:
-                f.write("✓ Good training loss (< 0.05)\n")
-            elif final_loss < 0.1:
-                f.write("⚠ Acceptable training loss (< 0.1)\n")
-            else:
-                f.write("⚠ High training loss (> 0.1) - consider longer training\n")
-            
-            # Validation loss assessment
-            if best_val_loss < 0.01:
-                f.write("✓ Excellent validation loss (< 0.01)\n")
-            elif best_val_loss < 0.05:
-                f.write("✓ Good validation loss (< 0.05)\n")
-            elif best_val_loss < 0.1:
-                f.write("⚠ Acceptable validation loss (< 0.1)\n")
-            else:
-                f.write("⚠ High validation loss (> 0.1) - potential overfitting\n")
-            
+            f.write(line + "\n")
 
-            
-            # Recommendations
-            f.write("\nRECOMMENDATIONS\n")
-            f.write("-" * 40 + "\n")
-            
-            if final_loss > 0.05:
-                f.write("- Consider increasing training epochs\n")
-                f.write("- Try adjusting learning rate\n")
-                f.write("- Check data quality and preprocessing\n")
-            
-            if best_val_loss > 0.05:
-                f.write("- Model may be overfitting - consider regularization\n")
-                f.write("- Check validation data quality\n")
-                f.write("- Consider early stopping with lower patience\n")
-            
-
-            
-            f.write("\n- Monitor spectral fidelity in generated images\n")
-            f.write("- Validate concept learning with test prompts\n")
-            f.write("- Check for spectral signature preservation\n")
-            
-            # File locations
-            f.write("\nIMPORTANT FILES\n")
-            f.write("-" * 40 + "\n")
-            f.write(f"Training Summary: {summary_file}\n")
-            f.write(f"Training Log: {self.log_file}\n")
-            f.write(f"Training Data: {self.json_file}\n")
-            f.write(f"Final Model: {model_path}\n")
-            f.write(f"Best Model: {os.path.join(self.output_dir, 'best_model')}\n")
-            f.write(f"Checkpoints: {os.path.join(self.output_dir, 'checkpoint-*')}\n")
-            
-            f.write("\n" + "=" * 80 + "\n")
-            f.write("END OF TRAINING SUMMARY\n")
-            f.write("=" * 80 + "\n")
-        
-        # Also log to main log file
-        with open(self.log_file, 'a') as f:
-            f.write(f"\nTraining completed successfully!\n")
-            f.write(f"Final loss: {final_loss:.6f}, Best val loss: {best_val_loss:.6f}\n")
-            f.write(f"Training summary saved to: {summary_file}\n")
-        
-        # Log to wandb if available
-        if wandb.run:
-            try:
-                wandb.log({
-                    "training_summary/final_loss": final_loss,
-                    "training_summary/best_val_loss": best_val_loss,
-                    "training_summary/total_epochs": total_epochs,
-                    "training_summary/total_steps": total_steps,
-                })
-                
-                # Upload summary file to wandb
-                wandb.save(summary_file)
-                
-            except Exception as e:
-                print(f"Warning: Failed to log final summary to wandb: {e}")
-        
-        print(f"Training summary saved to: {summary_file}")
-    
     def log_warning(self, warning_msg: str):
         """Log warnings during training."""
         warning_str = f"[WARNING] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {warning_msg}\n"
         with open(self.log_file, 'a') as f:
             f.write(warning_str)
-    
+
     def log_error(self, error_msg: str):
         """Log errors during training."""
         error_str = f"[ERROR] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}: {error_msg}\n"
         with open(self.log_file, 'a') as f:
             f.write(error_str)
 
+    def close(self):
+        """Optional: Finalize and flush logs if needed."""
+        pass
 
-def create_dreambooth_logger(output_dir: str, model_name: str = "dreambooth_multispectral") -> DreamBoothLogger:
+
+def create_dreambooth_logger(output_dir: str, model_name: str = "dreambooth_multispectral", vae=None) -> DreamBoothLogger:
     """
     Factory function to create a DreamBooth training logger.
     
     Args:
         output_dir: Directory to save log files
         model_name: Name for the model/experiment
+        vae: The frozen VAE model (optional)
     
     Returns:
         DreamBoothLogger instance
     """
-    return DreamBoothLogger(output_dir, model_name)
+    return DreamBoothLogger(output_dir, model_name, vae=vae)
 
 
 def setup_wandb_dreambooth(args, instance_prompt: str, class_prompt: Optional[str] = None):
@@ -1030,6 +457,10 @@ def setup_wandb_dreambooth(args, instance_prompt: str, class_prompt: Optional[st
     Returns:
         bool: True if wandb initialization successful
     """
+    if not WANDB_AVAILABLE:
+        print("Warning: wandb not available, skipping wandb initialization")
+        return False
+        
     try:
         # Create a descriptive run name
         run_name = f"dreambooth_multispectral_{instance_prompt.replace(' ', '_')}"
@@ -1038,7 +469,7 @@ def setup_wandb_dreambooth(args, instance_prompt: str, class_prompt: Optional[st
         run_name += f"_lr{args.learning_rate}_bs{args.train_batch_size}"
         
         wandb.init(
-            project="dreambooth-multispectral",
+            project="MS Dreambooth",
             name=run_name,
             config={
                 "learning_rate": args.learning_rate,
@@ -1099,7 +530,7 @@ def log_to_wandb_dreambooth(step: int,
         concept_metrics: Concept learning metrics
         spectral_metrics: Spectral fidelity metrics
     """
-    if not wandb.run:
+    if not WANDB_AVAILABLE or not wandb.run:
         return
     
     try:
