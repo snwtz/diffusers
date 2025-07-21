@@ -693,6 +693,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     3. Keeping backbone frozen during training (parameter-efficient fine-tuning)
     4. Only training the adapter layers (supports rapid adaptation)
     5. Including spectral attention and specialized losses
+    6. **Supports spectral signature guidance**: The training script can now include a reference-based spectral signature loss, encouraging the reconstructed mean spectrum (over leaf pixels) to match a provided healthy leaf signature. This is important for scientific realism and spectral fidelity in generated images.
 
     Parameters:
         pretrained_model_name_or_path (str): Path to pretrained SD3 VAE

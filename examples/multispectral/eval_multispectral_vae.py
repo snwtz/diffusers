@@ -565,6 +565,9 @@ def main():
     all_signature_errors = []
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # After all batches are processed, compute mean reconstructed spectrum and deviation from reference
+    recon_mean_spectra = []
+    reference_signature = np.array([0.055, 0.12, 0.05, 0.31, 0.325], dtype=np.float32)
     for idx, (batch, mask) in enumerate(tqdm(loader, desc='Evaluating')):
         # Handle both tuple and single tensor returns from dataloader
         if isinstance(batch, (tuple, list)):
@@ -645,6 +648,12 @@ def main():
             all_ssim_bg.append(ssim_results['background'])
         all_ssim_ov.append(ssim_results['overall'])
 
+        # Compute mean spectrum for this batch (foreground/leaf only)
+        mask_sum = mask.sum(dim=(0,2,3)).cpu().numpy() + 1e-8
+        recon_sum = (decoded_tensor * mask).sum(dim=(0,2,3)).cpu().numpy()
+        recon_mean_spectrum = recon_sum / mask_sum
+        recon_mean_spectra.append(recon_mean_spectrum)
+
     # Aggregate metrics by averaging over all batches
     all_mse_fg = np.stack(all_mse_fg) if all_mse_fg else None
     all_mse_bg = np.stack(all_mse_bg) if all_mse_bg else None
@@ -695,6 +704,21 @@ def main():
 
     # Aggregate and plot spectral signature errors
     aggregate_spectral_errors(all_signature_errors, args.output_dir)
+
+    # After all batches
+    if recon_mean_spectra:
+        eval_recon_mean_spectrum = np.mean(np.stack(recon_mean_spectra), axis=0)
+        deviation = eval_recon_mean_spectrum - reference_signature
+        print(f"\nMean reconstructed spectrum (eval set): {[f'{v:.4f}' for v in eval_recon_mean_spectrum]}")
+        print(f"Reference signature: {[f'{v:.4f}' for v in reference_signature]}")
+        print(f"Deviation from reference: {[f'{v:+.4f}' for v in deviation]}")
+        # Save to file
+        with open(os.path.join(args.output_dir, 'mean_spectrum_eval.json'), 'w') as f:
+            json.dump({
+                'mean_reconstructed_spectrum': eval_recon_mean_spectrum.tolist(),
+                'reference_signature': reference_signature.tolist(),
+                'deviation': deviation.tolist()
+            }, f, indent=2)
 
 if __name__ == '__main__':
     main()

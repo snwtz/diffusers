@@ -185,7 +185,8 @@ TRAINING CONFIGURATION:
                   gradient_clipping: Optional[bool] = None,
                   global_min_max_per_band: Optional[Dict] = None,
                   output_range_stats: Optional[Dict] = None,
-                  post_adapter_range_stats: Optional[Dict] = None):
+                  post_adapter_range_stats: Optional[Dict] = None,
+                  recon_mean_spectrum: Optional[list] = None):
         """
         Log epoch-level metrics.
         
@@ -210,6 +211,7 @@ TRAINING CONFIGURATION:
            - ssim_per_band: Structural similarity per spectral band
            - global_min_max_per_band: Range statistics per band
            - These metrics enable assessment of spectral signature preservation
+           reconstructed mean spectrum
         
         TRAINING STABILITY METRICS:
         ---------------------------
@@ -242,7 +244,6 @@ TRAINING CONFIGURATION:
             "gradient_clipping": gradient_clipping,
             "global_scale": global_scale,
         }
-        
         if band_importance:
             epoch_data["band_importance"] = band_importance
         if band_importance_analysis:
@@ -255,7 +256,13 @@ TRAINING CONFIGURATION:
             epoch_data["output_range_stats"] = output_range_stats
         if post_adapter_range_stats:
             epoch_data["post_adapter_range_stats"] = post_adapter_range_stats
-        
+        if recon_mean_spectrum is not None:
+            epoch_data["recon_mean_spectrum"] = recon_mean_spectrum
+            # Optionally, compute deviation from reference if available
+            ref = self.log_data.get("training_config", {}).get("reference_signature")
+            if ref is not None:
+                deviation = [float(r) - float(s) for r, s in zip(recon_mean_spectrum, ref)]
+                epoch_data["recon_mean_spectrum_deviation"] = deviation
         self.log_data["epochs"].append(epoch_data)
         
         # Check for best model
@@ -270,7 +277,6 @@ TRAINING CONFIGURATION:
         
         # Write to text file
         self._write_epoch_summary(epoch_data)
-        
         # Save JSON backup
         with open(self.json_file, 'w') as f:
             json.dump(self.log_data, f, indent=2)
@@ -351,6 +357,18 @@ TRAINING CONFIGURATION:
         
         with open(self.log_file, 'a') as f:
             f.write(epoch_line + "\n")
+        
+        # Add mean spectrum info if present
+        if "recon_mean_spectrum" in epoch_data:
+            rms = epoch_data["recon_mean_spectrum"]
+            rms_str = f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in rms]}"
+            with open(self.log_file, 'a') as f:
+                f.write(rms_str + "\n")
+        if "recon_mean_spectrum_deviation" in epoch_data:
+            dev = epoch_data["recon_mean_spectrum_deviation"]
+            dev_str = f"Deviation from reference: {[f'{v:+.4f}' for v in dev]}"
+            with open(self.log_file, 'a') as f:
+                f.write(dev_str + "\n")
     
     def log_model_health(self, health_data: Dict[str, Any]):
         """Log model health indicators."""

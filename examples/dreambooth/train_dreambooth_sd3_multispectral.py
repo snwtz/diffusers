@@ -382,8 +382,6 @@ check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
 
-print("DreamBooth multispectral training script loaded successfully!")
-
 # --- DreamBooth logger creation (ensure frozen VAE is passed in for validation decoding) ---
 def create_dreambooth_logger(output_dir, model_name, vae):
     # Use the comprehensive DreamBooth logger from dreambooth_logger.py
@@ -1700,8 +1698,14 @@ def main(args):
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            # Use the full path directly 
+            if args.resume_from_checkpoint == "latest":
+                resume_path = os.path.join(args.output_dir, path)
+            else:
+                resume_path = args.resume_from_checkpoint
+
+            accelerator.print(f"Resuming from checkpoint {resume_path}")
+            accelerator.load_state(resume_path)
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
