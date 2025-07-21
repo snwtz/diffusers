@@ -315,11 +315,10 @@ class SpectralAttention(nn.Module):
         which bands the model finds most important for the task.
         """
         with torch.no_grad():
-            # Create a dummy input to get attention weights
-            # Using ones ensures we get the base attention values
-            dummy_input = torch.ones(1, len(self.wavelengths), 1, 1)
+            # Create a dummy input to get attention weights, on the same device as the module
+            device = next(self.parameters()).device
+            dummy_input = torch.ones(1, len(self.wavelengths), 1, 1, device=device)
             attention_weights = self.attention(dummy_input).squeeze()
-
             # Map weights to wavelengths for interpretability
             return {self.wavelengths[i]: float(weight)
                    for i, weight in enumerate(attention_weights)}

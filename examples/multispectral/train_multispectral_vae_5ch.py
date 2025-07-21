@@ -183,6 +183,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
 from vae_multispectral_dataloader import create_vae_dataloaders
 from training_logger import create_training_logger
+from diffusers.models.autoencoders.vae import DecoderOutput
 
 def setup_logging(args):
     # Create logs directory for experiment traceability and reproducibility
@@ -892,6 +893,10 @@ def train(args: argparse.Namespace) -> None:
 
     # Load reference signature (default to provided values if not given)
     if args.reference_signature_path is not None:
+        reference_signature = np.load(args.reference_signature_path)
+        reference_signature = torch.tensor(reference_signature, dtype=torch.float32)
+    else:
+        # Default: mean of provided ranges
         reference_signature = torch.tensor([
             0.055,  # Band 0 (474.73 nm): mean of 0.045–0.065
             0.12,   # Band 1 (538.71 nm): mean of 0.10–0.14
@@ -899,7 +904,6 @@ def train(args: argparse.Namespace) -> None:
             0.31,   # Band 3 (730.635 nm): mean of 0.26–0.36
             0.325   # Band 4 (850.59 nm): mean of 0.26–0.39
         ], dtype=torch.float32)
-    # Move to device after device is set
     reference_signature = reference_signature.to(device)
 
     # Log parameter counts before training
@@ -1001,8 +1005,8 @@ def train(args: argparse.Namespace) -> None:
                     losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
                     # Log mean spectrum for monitoring
                     if step % log_interval == 0:
-                        logger.info(f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.cpu().numpy()]}")
-                        logger.info(f"Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.cpu().numpy()]}")
+                        logger.info(f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
+                        logger.info(f"Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
                         logger.info(f"Spectral signature loss: {spectral_signature_loss.item():.6f}")
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
@@ -1132,79 +1136,60 @@ def train(args: argparse.Namespace) -> None:
 
         # Validation phase
         model.eval()
+        # At the start of every epoch, always re-initialize val_losses as tensors/scalars
         val_losses = {
             'total_loss': 0,
             'mse_per_channel': torch.zeros(5, device=device),  # 5 bands
             'sam_loss': 0
         }
-
+        recon_mean_spectra = []
+        ssim_per_band = []  # To accumulate average SSIM per band over all batches
+        output_range_stats = None  # To collect output range statistics
         with torch.no_grad():
-            ssim_per_band = []  # To accumulate average SSIM per band over all batches
-            output_range_stats = None  # To collect output range statistics
-            recon_mean_spectra = []
             for batch, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
                 batch = batch.to(device)
                 mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
                 if mask is None:
                     logger.warning(f"[MASK WARNING] No mask provided for validation batch!")
-                # (Removed debug logging for NaNs in validation batch)
                 # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
                 batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
                 # Forward pass with mask support for validation
-                try:
-                    # Use the model's forward method which now supports mask parameter
-                    # This automatically handles encoding, decoding, and masked loss computation
-                    reconstruction, losses = model.forward(sample=batch, mask=mask)
-                    # Add spectral signature loss (validation)
-                    if reference_signature is not None:
-                        mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                        recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                        recon_mean_spectrum = recon_sum / mask_sum
-                        recon_mean_spectra.append(recon_mean_spectrum.cpu().numpy())
-                        spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                        losses['spectral_signature_loss'] = spectral_signature_loss
-                        losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
-                        # Log mean spectrum for monitoring
-                        logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.cpu().numpy()]}")
-                        logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.cpu().numpy()]}")
-                        logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
-                except Exception as e:
-                    logger.error(f"Validation forward pass failed: {e}")
-                    continue
+                result = model.forward(sample=batch, mask=mask)
+                if isinstance(result, tuple) and len(result) == 2: # "not enough values to unpack" debug
+                    reconstruction, losses = result
+                else:
+                    reconstruction = result
+                    losses = {}
+                # Fix: If reconstruction is DecoderOutput, extract .sample
+                if isinstance(reconstruction, DecoderOutput):
+                    reconstruction = reconstruction.sample
 
-                # Pass the mask into compute_losses to handle background masking internally.
-                # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
-                # such as background bounding box artifacts. Background is optionally included via a soft penalty.
-                # Validate losses structure
-                if not isinstance(losses, dict):
-                    logger.error(f"Model forward() returned non-dict losses: {type(losses)}")
-                    continue
+                # Spectral signature loss and mean spectrum
+                if reference_signature is not None:
+                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
+                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
+                    recon_mean_spectrum = recon_sum / mask_sum
+                    recon_mean_spectra.append(recon_mean_spectrum.detach().cpu().numpy())
+                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
+                    losses['spectral_signature_loss'] = spectral_signature_loss
+                    losses['total_loss'] = losses.get('total_loss', 0) + args.spectral_signature_weight * spectral_signature_loss
+                    logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
+                    logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
+                    logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
 
-                # Calculate total loss
-                # Consistent with training loss computation
-                if 'mse' not in losses:
-                    continue
-
-                total_loss = losses['mse']
+                # Accumulate losses
+                val_losses['total_loss'] += losses.get('total_loss', 0).item() if 'total_loss' in losses else 0
+                if 'mse_per_channel' in losses:
+                    val_losses['mse_per_channel'] += losses['mse_per_channel']
                 if args.use_sam_loss and 'sam' in losses:
-                    total_loss = total_loss + args.sam_weight * losses['sam']
-                # Debugging: Check for NaN in total loss (validation)
-                if torch.isnan(total_loss):
-                    logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
+                    val_losses['sam_loss'] += losses['sam'].item()
 
-                # Compute SSIM per-band (compatibility with skimage.metrics.ssim)
-                # Loop over both batch and channel dimensions using skimage.metrics.structural_similarity
-                # CRITICAL: Apply mask to both original and reconstructed images before SSIM computation
-                # This ensures we only evaluate reconstruction quality on leaf regions, not background
-
-                # NOTE: fallback of computing SSIM without mask will include background, potentially biasing results.
+                # SSIM computation (per band, accumulate)
                 batch_np = batch.detach()
                 recon_np = reconstruction.detach()
                 mask_np = mask.detach()  # Background mask (1 for leaf, 0 for background)
-                
-                # Accumulate average SSIM per band for this batch
                 num_bands = batch_np.shape[1]
                 batch_size = batch_np.shape[0]
                 batch_ssim_per_band = []
@@ -1216,58 +1201,38 @@ def train(args: argparse.Namespace) -> None:
                         original_band = batch_np[sample_idx, band_idx].cpu().numpy()
                         recon_band = recon_np[sample_idx, band_idx].cpu().numpy()
                         sample_mask = mask_np[sample_idx, 0].cpu().numpy()  # (H, W)
-                        
                         # Only compute SSIM if there are valid leaf pixels
                         if np.sum(sample_mask) > 0:
-                            # Apply mask to both original and reconstructed bands
                             masked_orig = original_band * sample_mask
                             masked_recon = recon_band * sample_mask
-                            
-                            # Compute SSIM only on the masked region
-                            # NOTE: SSIM computation assumes [-1, 1] range, but adapter output may be unconstrained
-                            # The data_range parameter should be adjusted based on actual output range
-                            # TODO: Consider dynamic data_range adjustment based on output_range_stats
                             try:
-                                # Use fixed data_range for now, but consider dynamic adjustment
-                                # data_range = output_range_stats['global_max'] - output_range_stats['global_min'] if output_range_stats else 2.0
-                                ssim_val = ssim(masked_orig, masked_recon, data_range=2.0,  # [-1, 1] range = 2.0
-                                              mask=sample_mask.astype(bool))
+                                ssim_val = ssim(masked_orig, masked_recon, data_range=2.0, mask=sample_mask.astype(bool))
                             except TypeError:
-                                # Fallback: compute SSIM on entire image but this includes background
-                                # This is less accurate but ensures compatibility
                                 logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
-                                ssim_val = ssim(original_band, recon_band, data_range=2.0)  # [-1, 1] range = 2.0
-                            
+                                ssim_val = ssim(original_band, recon_band, data_range=2.0)
                             band_ssim_total += ssim_val
                             valid_samples += 1
-                    
-                    # Average SSIM for this band across valid samples
                     if valid_samples > 0:
                         batch_ssim_per_band.append(band_ssim_total / valid_samples)
                     else:
                         batch_ssim_per_band.append(0.0)  # No valid leaf regions
-                
-                # Accumulate per-batch SSIMs for averaging after all batches
                 if len(ssim_per_band) == 0:
                     ssim_per_band = batch_ssim_per_band
                 else:
                     ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
 
-                # Track losses and mask statistics
-                # Monitors validation performance and mask coverage
-                val_losses['total_loss'] += total_loss.item()
-                if 'mse_per_channel' in losses:
-                    val_losses['mse_per_channel'] += losses['mse_per_channel']
-                if args.use_sam_loss and 'sam' in losses:
-                    val_losses['sam_loss'] += losses['sam'].item()
-                
-                # Collect output range statistics (use first batch for efficiency)
+                # Output range stats (first batch only)
                 if output_range_stats is None:
                     output_range_stats = compute_output_range_stats(reconstruction)
-                    
-            # After validation loop, average ssim_per_band over number of batches
-            if len(val_loader) > 0:
-                ssim_per_band = [v / len(val_loader) for v in ssim_per_band]
+
+        # After validation loop: compute epoch-level mean spectrum and other summaries
+        num_batches = len(val_loader)
+        if recon_mean_spectra:
+            epoch_recon_mean_spectrum = np.mean(np.stack(recon_mean_spectra), axis=0)
+        else:
+            epoch_recon_mean_spectrum = None
+        if ssim_per_band:
+            ssim_per_band = [v / num_batches for v in ssim_per_band]
 
         # Average losses
         # Computes epoch-level metrics
@@ -1282,6 +1247,10 @@ def train(args: argparse.Namespace) -> None:
                 val_losses[key] /= len(val_loader)
             else:
                 val_losses[key] /= len(val_loader)
+
+        # Now convert per-channel MSE tensor to list of floats for correct logging
+        if isinstance(val_losses.get('mse_per_channel', None), torch.Tensor):
+            val_losses['mse_per_channel'] = val_losses['mse_per_channel'].cpu().numpy().tolist()
 
         # Get band importance if using spectral attention
         # Analyzes model's spectral understanding
@@ -1318,262 +1287,6 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     return v.detach().cpu().tolist()
             return v
-
-        # After validation loop, before logger.log_epoch(...)
-        recon_mean_spectra = []
-        for batch, mask in val_loader:
-            batch = batch.to(device)
-            mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
-            if mask is None:
-                logger.warning(f"[MASK WARNING] No mask provided for validation batch!")
-            # (Removed debug logging for NaNs in validation batch)
-            # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
-            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
-            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
-
-            # Forward pass with mask support for validation
-            try:
-                # Use the model's forward method which now supports mask parameter
-                # This automatically handles encoding, decoding, and masked loss computation
-                reconstruction, losses = model.forward(sample=batch, mask=mask)
-                # Add spectral signature loss (validation)
-                if reference_signature is not None:
-                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                    recon_mean_spectrum = recon_sum / mask_sum
-                    recon_mean_spectra.append(recon_mean_spectrum.cpu().numpy())
-                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                    losses['spectral_signature_loss'] = spectral_signature_loss
-                    losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
-                    # Log mean spectrum for monitoring
-                    logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.cpu().numpy()]}")
-                    logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.cpu().numpy()]}")
-                    logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
-            except Exception as e:
-                logger.error(f"Validation forward pass failed: {e}")
-                continue
-
-            # Pass the mask into compute_losses to handle background masking internally.
-            # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
-            # such as background bounding box artifacts. Background is optionally included via a soft penalty.
-            # Validate losses structure
-            if not isinstance(losses, dict):
-                logger.error(f"Model forward() returned non-dict losses: {type(losses)}")
-                continue
-
-            # Calculate total loss
-            # Consistent with training loss computation
-            if 'mse' not in losses:
-                continue
-
-            total_loss = losses['mse']
-            if args.use_sam_loss and 'sam' in losses:
-                total_loss = total_loss + args.sam_weight * losses['sam']
-            # Debugging: Check for NaN in total loss (validation)
-            if torch.isnan(total_loss):
-                logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
-
-            # Compute SSIM per-band (compatibility with skimage.metrics.ssim)
-            # Loop over both batch and channel dimensions using skimage.metrics.structural_similarity
-            # CRITICAL: Apply mask to both original and reconstructed images before SSIM computation
-            # This ensures we only evaluate reconstruction quality on leaf regions, not background
-
-            # NOTE: fallback of computing SSIM without mask will include background, potentially biasing results.
-            batch_np = batch.detach()
-            recon_np = reconstruction.detach()
-            mask_np = mask.detach()  # Background mask (1 for leaf, 0 for background)
-            
-            # Accumulate average SSIM per band for this batch
-            num_bands = batch_np.shape[1]
-            batch_size = batch_np.shape[0]
-            batch_ssim_per_band = []
-            for band_idx in range(num_bands):
-                band_ssim_total = 0.0
-                valid_samples = 0  # Count samples with valid leaf regions
-                for sample_idx in range(batch_size):
-                    # Apply mask to isolate leaf regions only
-                    original_band = batch_np[sample_idx, band_idx].cpu().numpy()
-                    recon_band = recon_np[sample_idx, band_idx].cpu().numpy()
-                    sample_mask = mask_np[sample_idx, 0].cpu().numpy()  # (H, W)
-                    
-                    # Only compute SSIM if there are valid leaf pixels
-                    if np.sum(sample_mask) > 0:
-                        # Apply mask to both original and reconstructed bands
-                        masked_orig = original_band * sample_mask
-                        masked_recon = recon_band * sample_mask
-                        
-                        # Compute SSIM only on the masked region
-                        # NOTE: SSIM computation assumes [-1, 1] range, but adapter output may be unconstrained
-                        # The data_range parameter should be adjusted based on actual output range
-                        # TODO: Consider dynamic data_range adjustment based on output_range_stats
-                        try:
-                            # Use fixed data_range for now, but consider dynamic adjustment
-                            # data_range = output_range_stats['global_max'] - output_range_stats['global_min'] if output_range_stats else 2.0
-                            ssim_val = ssim(masked_orig, masked_recon, data_range=2.0,  # [-1, 1] range = 2.0
-                                          mask=sample_mask.astype(bool))
-                        except TypeError:
-                            # Fallback: compute SSIM on entire image but this includes background
-                            # This is less accurate but ensures compatibility
-                            logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
-                            ssim_val = ssim(original_band, recon_band, data_range=2.0)  # [-1, 1] range = 2.0
-                        
-                        band_ssim_total += ssim_val
-                        valid_samples += 1
-                
-                # Average SSIM for this band across valid samples
-                if valid_samples > 0:
-                    batch_ssim_per_band.append(band_ssim_total / valid_samples)
-                else:
-                    batch_ssim_per_band.append(0.0)  # No valid leaf regions
-            
-            # Accumulate per-batch SSIMs for averaging after all batches
-            if len(ssim_per_band) == 0:
-                ssim_per_band = batch_ssim_per_band
-            else:
-                ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
-
-            # Track losses and mask statistics
-            # Monitors validation performance and mask coverage
-            val_losses['total_loss'] += total_loss.item()
-            if 'mse_per_channel' in losses:
-                val_losses['mse_per_channel'] += losses['mse_per_channel']
-            if args.use_sam_loss and 'sam' in losses:
-                val_losses['sam_loss'] += losses['sam'].item()
-            
-            # Collect output range statistics (use first batch for efficiency)
-            if output_range_stats is None:
-                output_range_stats = compute_output_range_stats(reconstruction)
-                
-        # After validation loop, before logger.log_epoch(...)
-        recon_mean_spectra = []
-        for batch, mask in val_loader:
-            batch = batch.to(device)
-            mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
-            if mask is None:
-                logger.warning(f"[MASK WARNING] No mask provided for validation batch!")
-            # (Removed debug logging for NaNs in validation batch)
-            # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
-            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
-            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
-
-            # Forward pass with mask support for validation
-            try:
-                # Use the model's forward method which now supports mask parameter
-                # This automatically handles encoding, decoding, and masked loss computation
-                reconstruction, losses = model.forward(sample=batch, mask=mask)
-                # Add spectral signature loss (validation)
-                if reference_signature is not None:
-                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                    recon_mean_spectrum = recon_sum / mask_sum
-                    recon_mean_spectra.append(recon_mean_spectrum.cpu().numpy())
-                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                    losses['spectral_signature_loss'] = spectral_signature_loss
-                    losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
-                    # Log mean spectrum for monitoring
-                    logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.cpu().numpy()]}")
-                    logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.cpu().numpy()]}")
-                    logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
-            except Exception as e:
-                logger.error(f"Validation forward pass failed: {e}")
-                continue
-
-            # Pass the mask into compute_losses to handle background masking internally.
-            # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
-            # such as background bounding box artifacts. Background is optionally included via a soft penalty.
-            # Validate losses structure
-            if not isinstance(losses, dict):
-                logger.error(f"Model forward() returned non-dict losses: {type(losses)}")
-                continue
-
-            # Calculate total loss
-            # Consistent with training loss computation
-            if 'mse' not in losses:
-                continue
-
-            total_loss = losses['mse']
-            if args.use_sam_loss and 'sam' in losses:
-                total_loss = total_loss + args.sam_weight * losses['sam']
-            # Debugging: Check for NaN in total loss (validation)
-            if torch.isnan(total_loss):
-                logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
-
-            # Compute SSIM per-band (compatibility with skimage.metrics.ssim)
-            # Loop over both batch and channel dimensions using skimage.metrics.structural_similarity
-            # CRITICAL: Apply mask to both original and reconstructed images before SSIM computation
-            # This ensures we only evaluate reconstruction quality on leaf regions, not background
-
-            # NOTE: fallback of computing SSIM without mask will include background, potentially biasing results.
-            batch_np = batch.detach()
-            recon_np = reconstruction.detach()
-            mask_np = mask.detach()  # Background mask (1 for leaf, 0 for background)
-            
-            # Accumulate average SSIM per band for this batch
-            num_bands = batch_np.shape[1]
-            batch_size = batch_np.shape[0]
-            batch_ssim_per_band = []
-            for band_idx in range(num_bands):
-                band_ssim_total = 0.0
-                valid_samples = 0  # Count samples with valid leaf regions
-                for sample_idx in range(batch_size):
-                    # Apply mask to isolate leaf regions only
-                    original_band = batch_np[sample_idx, band_idx].cpu().numpy()
-                    recon_band = recon_np[sample_idx, band_idx].cpu().numpy()
-                    sample_mask = mask_np[sample_idx, 0].cpu().numpy()  # (H, W)
-                    
-                    # Only compute SSIM if there are valid leaf pixels
-                    if np.sum(sample_mask) > 0:
-                        # Apply mask to both original and reconstructed bands
-                        masked_orig = original_band * sample_mask
-                        masked_recon = recon_band * sample_mask
-                        
-                        # Compute SSIM only on the masked region
-                        # NOTE: SSIM computation assumes [-1, 1] range, but adapter output may be unconstrained
-                        # The data_range parameter should be adjusted based on actual output range
-                        # TODO: Consider dynamic data_range adjustment based on output_range_stats
-                        try:
-                            # Use fixed data_range for now, but consider dynamic adjustment
-                            # data_range = output_range_stats['global_max'] - output_range_stats['global_min'] if output_range_stats else 2.0
-                            ssim_val = ssim(masked_orig, masked_recon, data_range=2.0,  # [-1, 1] range = 2.0
-                                          mask=sample_mask.astype(bool))
-                        except TypeError:
-                            # Fallback: compute SSIM on entire image but this includes background
-                            # This is less accurate but ensures compatibility
-                            logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
-                            ssim_val = ssim(original_band, recon_band, data_range=2.0)  # [-1, 1] range = 2.0
-                        
-                        band_ssim_total += ssim_val
-                        valid_samples += 1
-                
-                # Average SSIM for this band across valid samples
-                if valid_samples > 0:
-                    batch_ssim_per_band.append(band_ssim_total / valid_samples)
-                else:
-                    batch_ssim_per_band.append(0.0)  # No valid leaf regions
-            
-            # Accumulate per-batch SSIMs for averaging after all batches
-            if len(ssim_per_band) == 0:
-                ssim_per_band = batch_ssim_per_band
-            else:
-                ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
-
-            # Track losses and mask statistics
-            # Monitors validation performance and mask coverage
-            val_losses['total_loss'] += total_loss.item()
-            if 'mse_per_channel' in losses:
-                val_losses['mse_per_channel'] += losses['mse_per_channel']
-            if args.use_sam_loss and 'sam' in losses:
-                val_losses['sam_loss'] += losses['sam'].item()
-            
-            # Collect output range statistics (use first batch for efficiency)
-            if output_range_stats is None:
-                output_range_stats = compute_output_range_stats(reconstruction)
-                
-        # After validation loop, before logger.log_epoch(...)
-        if recon_mean_spectra:
-            epoch_recon_mean_spectrum = np.mean(np.stack(recon_mean_spectra), axis=0)
-        else:
-            epoch_recon_mean_spectrum = None
 
         training_logger.log_epoch(
             epoch=epoch,
