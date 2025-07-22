@@ -507,11 +507,9 @@ def analyze_band_importance(model, problematic_bands=None):
         - lowest_band: Band with lowest attention weight
         - highest_band: Band with highest attention weight
     """
-    if not hasattr(model, 'output_adapter') or not hasattr(model.output_adapter, 'attention'):
-        return None
-    
-    # Get band importance from attention mechanism
-    band_importance = model.output_adapter.attention.get_band_importance()
+    # Spectral attention has been removed - band importance analysis is no longer available
+    # Return None to indicate band importance analysis is disabled
+    return None
     
     # Convert to list for analysis
     importance_values = list(band_importance.values())

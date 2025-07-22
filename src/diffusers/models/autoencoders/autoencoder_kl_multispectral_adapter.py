@@ -43,7 +43,6 @@ Thesis Context and Scientific Innovation:
 2. Core Innovation:
    - Lightweight adapter architecture for 5-channel spectral data
    - Parameter-efficient fine-tuning strategy
-   - Spectral attention mechanism for interpretable band selection (nonlinear)
    - Dual loss function preserving both spatial and spectral fidelity
    - Nonlinear transformations enabling complex spectral relationship learning
 
@@ -64,11 +63,7 @@ Architectural Design Decisions:
       - SiLU activation: Gradient-friendly nonlinearity better suited than ReLU (nonlinear activation)
       - Three-layer design: Progressive feature extraction and channel adaptation with nonlinear transformations
 
-   b) SpectralAttention:
-      - 1×1 convolution: Learn band importance weights (linear transformation)
-      - Sigmoid activation: Ensure interpretable [0,1] importance scores (nonlinear activation)
-      - Element-wise multiplication: Apply learned weights to input (nonlinear due to sigmoid weights)
-      - Wavelength mapping: Enable scientific visualization of band contributions
+
 
 2. Loss Function Design:
    a) Per-channel MSE Loss:
@@ -107,7 +102,6 @@ Integration and Downstream Use:
    - Enables spectral concept learning
 
 2. Scientific Analysis:
-   - get_band_importance(): Generate interpretable visualizations
    - Per-band loss tracking for spectral fidelity analysis
    - Support for spectral signature preservation studies
 
@@ -116,14 +110,12 @@ Implementation Details:
 1. Model Components:
    - Pretrained SD3 VAE backbone
    - Input/output adapter layers
-   - Spectral attention mechanism
    - Loss computation pipeline
 
 2. Training Integration:
    - Parameter isolation for efficient fine-tuning
    - Loss term balancing
    - Spectral fidelity preservation
-   - Band importance tracking
 
 Known Limitations:
 ----------------
@@ -140,7 +132,6 @@ Known Limitations:
 Scientific Contributions and Future Work:
 -------------------------------------
 1. Spectral Representation Learning:
-   - Develop novel spectral attention mechanisms
    - Investigate band correlation patterns
    - Study spectral signature preservation
    - Explore adaptive normalization strategies
@@ -149,7 +140,6 @@ Scientific Contributions and Future Work:
 2. Model Architecture:
    - Propose new adapter architectures
    - Develop spectral correlation models
-   - Create band importance metrics
    - Design spectral normalization layers
    - Investigate residual spectral connections
 
@@ -193,7 +183,6 @@ Usage:
     vae = AutoencoderKLMultispectralAdapter.from_pretrained(
         "stabilityai/stable-diffusion-3-medium-diffusers",
         adapter_placement="both",  # or "input" or "output"
-        use_spectral_attention=True,
         use_sam_loss=True
     )
 
@@ -222,8 +211,7 @@ Usage:
 
 # ------------------------------------------------------------
 # VAE Loading Fix Summary:
-# After encountering multiple initialization and argument errors,
-# we determined that Hugging Face's `from_pretrained()` logic uses
+# Hugging Face's `from_pretrained()` logic uses
 # keyword arguments via a config object. The original constructor
 # was not compatible with this pattern. To fix this:
 #
@@ -259,76 +247,10 @@ from ..modeling_outputs import AutoencoderKLOutput
 from .autoencoder_kl import AutoencoderKL
 from .vae import DecoderOutput
 
+# SpectralAttention class removed completely
 
-
-
-
-#
-# Design Rationale: Spectral Attention
-# ------------------------------------
-# Applies learnable per-band weights via 1×1 conv + sigmoid to modulate the importance of each band.
-# This aids interpretability and allows the model to emphasize diagnostically relevant wavelengths.
-# The weights can later be visualized and mapped to biological wavelengths for scientific insight.
-#
-class SpectralAttention(nn.Module):
-    """Attention mechanism for spectral band selection.
-
-    This module learns to weight the importance of each spectral band
-    during the adaptation process. It helps the model focus on the most
-    relevant bands for the task while maintaining spectral relationships.
-    
-    IMPORTANT: This module applies nonlinear transformations:
-    - 1×1 convolution (linear)
-    - Sigmoid activation (nonlinear: maps to [0,1] range)
-    - Element-wise multiplication with input (nonlinear due to sigmoid weights)
-    
-    - Enables explainable AI attention weights can be visualized and mapped to wavelengths for scientific interpretability.
-    - Supports plant science by highlighting diagnostically relevant bands.
-    - Nonlinear attention mechanism allows for complex band interaction modeling.
-    """
-
-    def __init__(self, num_bands: int):
-        super().__init__()
-        # Simple 1x1 convolution followed by sigmoid to learn band weights
-        self.attention = nn.Sequential(
-            nn.Conv2d(num_bands, num_bands, kernel_size=1),  # Linear transformation
-            nn.Sigmoid()  # Nonlinear activation: ensures weights are between 0 and 1
-        )
-
-        # Store wavelength information for interpretability
-        # These wavelengths correspond to specific bands in the hyperspectral data
-        self.wavelengths = {
-            0: 474.73,  # Band 9: Blue - chlorophyll absorption
-            1: 538.71,  # Band 18: Green - healthy vegetation
-            2: 650.665, # Band 32: Red - chlorophyll content
-            3: 730.635, # Band 42: Red-edge - stress detection
-            4: 850.59   # Band 55: NIR - leaf health
-        }
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (batch, channels, height, width)
-        # Compute attention weights for each band (nonlinear: conv + sigmoid)
-        attention_weights = self.attention(x)
-        # Apply attention weights to input (nonlinear: element-wise multiplication with sigmoid weights)
-        return x * attention_weights
-
-    def get_band_importance(self) -> Dict[float, float]:
-        """Get the importance of each spectral band based on attention weights.
-
-        This method is useful for interpretability and understanding
-        which bands the model finds most important for the task.
-        """
-        with torch.no_grad():
-            # Create a dummy input to get attention weights, on the same device as the module
-            device = next(self.parameters()).device
-            dummy_input = torch.ones(1, len(self.wavelengths), 1, 1, device=device)
-            attention_weights = self.attention(dummy_input).squeeze()
-            # Map weights to wavelengths for interpretability
-            return {self.wavelengths[i]: float(weight)
-                   for i, weight in enumerate(attention_weights)}
-
-#
-# Design Rationale: SpectralAdapter
+# 
+# SpectralAdapter
 # ---------------------------------
 # These adapter layers transform between 5-channel multispectral inputs and the 3-channel
 # format expected by the SD3 VAE. The input adapter maps 5→3 and output adapter maps 3→5.
@@ -336,21 +258,28 @@ class SpectralAttention(nn.Module):
 # - 3×3 convs for efficient spatial-spectral processing
 # - GroupNorm for stability with small batch sizes (nonlinear normalization)
 # - SiLU (Swish) activation for smoother gradients compared to ReLU (nonlinear activation)
-# - Spectral attention with sigmoid for band weighting (nonlinear attention)
 # The adapters can be placed at input/output/both to allow ablation studies and flexibility.
 # 
-# IMPORTANT: The nonlinear transformations (SiLU, GroupNorm, sigmoid attention) mean that
+# The nonlinear transformations (SiLU, GroupNorm) mean that
 # the output range is not constrained to [-1, 1] and may require post-processing normalization.
 #
 # Output Scale and Bias Parameters:
 # ---------------------------------
 # The output_scale and output_bias parameters are learnable linear transformation coefficients
-# applied to the SpectralAdapter output (via the formula: )output = input * output_scale + output_bias.
+# applied to the SpectralAdapter output (output = input * output_scale + output_bias). 
+# They are learned via gradient descent during training:
+        #   - output_scale (default: 1.0): scales the output amplitude.
+        #   - output_bias  (default: 0.0): shifts the output baseline.  
+# Together, they form an affine transformation: x' = output_scale * x + output_bias.     
 # These parameters enable trainable calibration of the spectral output dynamic range to align
-# with SD3 pipeline expectations (ideally [-1, 1]) while preserving spectral fidelity. Optimal
-# values are output_scale ≈ 1.0 and output_bias ≈ 0.0, indicating minimal transformation is
-# required and the adapter naturally produces appropriately scaled outputs. Values significantly
-# deviating from these targets (output_scale < 0.1 or > 3.0, |output_bias| > 0.5) may indicate
+# with SD3 pipeline expectations (ideally [-1, 1]) while preserving spectral fidelity. 
+# This approach is more adaptive and flexible than clamping or fixed postprocessing.
+# Optimal values are output_scale ≈ 1.0 and output_bias ≈ 0.0, indicating minimal transformation is
+# required and the adapter naturally produces appropriately scaled outputs. T
+# This enables smooth, trainable calibration of spectral output without hard clipping or nonlinear warping.
+
+# 
+# Values significantly deviating from these targets (output_scale < 0.1 or > 3.0, |output_bias| > 0.5) may indicate
 # training instability, data normalization issues, or inappropriate hyperparameter settings.
 # Scale collapse (output_scale < 0.001) represents a critical failure mode where the model
 # produces near-zero outputs, while scale explosion (output_scale > 5.0) indicates potential
@@ -363,37 +292,27 @@ class SpectralAdapter(nn.Module):
 
     This module handles the conversion between the 5-channel multispectral
     input and the 3-channel RGB-like format expected by the SD3 VAE.
-    It includes spectral attention and a series of convolutions to learn
-    the optimal transformation while preserving spectral information.
+    It includes a series of convolutions to learn the optimal transformation 
+    while preserving spectral information.
 
     Key design changes for spectral fidelity:
     -----------------------------------------
-    - Tanh and adaptive normalization were removed. These nonlinearities, while useful for bounding outputs, can distort the spectral signature in ways that are difficult to interpret and may compromise scientific analysis.
-    - Instead, a single global learnable scale parameter is introduced. This provides linear, interpretable range control and preserves the relative relationships between spectral bands.
-    - torch.clamp(x, -1.0, 1.0) is applied during both training and inference for safety, ensuring no extreme values propagate, but the transformation remains linear.
-    - This approach aligns with the scientific goal of preserving spectral signature fidelity, allowing post-hoc calibration and interpretation.
-    - Global scaling is biologically plausible, as real plant reflectance spectra can vary in magnitude due to illumination, but the *shape* (ratios) is most important for analysis.
+    - Spectral attention has been removed for simplicity and improved training stability
+    - Single global learnable scale parameter provides linear, interpretable range control
+    - torch.clamp(x, -1.0, 1.0) is applied during both training and inference for safety
+    - This approach preserves the relative relationships between spectral bands
+    - Global scaling is biologically plausible, as real plant reflectance spectra can vary in magnitude due to illumination
     """
-    # NOTE: We assume that background pixels in padded multispectral input are encoded as NaN.
-    # This adapter explicitly masks (zeroes out) these background pixels to avoid propagating NaNs.
 
     def __init__(
         self,
         in_channels: int,
-        out_channels: int,
-        use_attention: bool = True,
-        num_bands: int = 5
+        out_channels: int
     ):
         super().__init__()
         # Store channel configuration for validation and logging
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.use_attention = use_attention
-        # Tanh and adaptive normalization are removed
-
-        # Initialize spectral attention if needed
-        if use_attention and in_channels == num_bands:
-            self.attention = SpectralAttention(num_bands)
 
         # Three-layer convolutional network for channel adaptation
         # First two layers use 3x3 convolutions with group normalization and nonlinear activation
@@ -402,17 +321,6 @@ class SpectralAdapter(nn.Module):
         # Final layer uses 1x1 convolution for channel reduction/expansion (no activation)
         self.conv3 = nn.Conv2d(32, out_channels, kernel_size=1)
 
-        # Learnable linear output scaling: aligns the dynamic range of adapter output to the desired range (ideally [-1, 1]).
-        # more adaptive and flexible than clamping or fixed postprocessing.
-        # These parameters are learned via gradient descent during training:
-        #   - output_scale (default: 1.0): scales the output amplitude.
-        #   - output_bias  (default: 0.0): shifts the output baseline.
-        # Together, they form an affine transformation: x' = output_scale * x + output_bias.
-        # This enables smooth, trainable calibration of spectral output without hard clipping or nonlinear warping.
-        # Motivation:
-        #   - Avoids saturating Tanh or clamping artifacts which can distort spectral shapes.
-        #   - Adapts output to match SD3 pipeline expectations (range ~[-1, 1]).
-   
         self.output_scale = nn.Parameter(torch.tensor(1.0))  # Global scaling factor
         self.output_bias = nn.Parameter(torch.tensor(0.0))   # Global shift
 
@@ -454,10 +362,6 @@ class SpectralAdapter(nn.Module):
 
         # Log adapter input stats for NaN debugging
         logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
-
-        # Apply spectral attention if enabled (nonlinear: sigmoid + element-wise multiplication)
-        if self.use_attention and hasattr(self, 'attention'):
-            x = self.attention(x)
 
         # First convolutional block (nonlinear: conv + GroupNorm + SiLU)
         x = self.conv1(x)
@@ -705,7 +609,6 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
 # This constructor registers all adapter-relevant settings for reproducibility.
 # These include:
 # - adapter_placement: Determines whether input/output or both sides of the VAE use adapters.
-# - use_spectral_attention: Enables band-wise weighting for interpretable spectral relevance.
 # - use_sam_loss: Includes a spectral fidelity loss term (Spectral Angle Mapper).
 #
 # These are currently passed via config but not stored in the output config.json.
@@ -720,7 +623,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     2. Adding lightweight adapter layers for 5-channel input/output
     3. Keeping backbone frozen during training (parameter-efficient fine-tuning)
     4. Only training the adapter layers (supports rapid adaptation)
-    5. Including spectral attention and specialized losses
+    5. Including specialized SAM loss for spectral fidelity
     6. **Supports spectral signature guidance**: The training script can now include a reference-based spectral signature loss, encouraging the reconstructed mean spectrum (over leaf pixels) to match a provided healthy leaf signature. This is important for scientific realism and spectral fidelity in generated images.
 
     Parameters:
@@ -729,7 +632,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         out_channels (int, optional): Number of output channels (default: 5)
         adapter_channels (int, optional): Number of channels in adapter layers (default: 32)
         adapter_placement (str, optional): Where to place adapters ("input", "output", or "both")
-        use_spectral_attention (bool, optional): Whether to use spectral attention (default: True)
         use_sam_loss (bool, optional): Whether to use SAM loss (default: True)
         subfolder (str, optional): Subfolder for SD3 compatibility
         revision (str, optional): Revision for SD3 compatibility
@@ -752,7 +654,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         backbone_out_channels: int = 3, # Refactored: backbone output channels
         adapter_channels: int = 32,
         adapter_placement: str = "both",
-        use_spectral_attention: bool = True,
         use_sam_loss: bool = True,
         subfolder: str = "vae",
         revision: str = None,
@@ -762,7 +663,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     ):
         # Adapter config: these are for the adapters only, not the backbone
         self.adapter_placement = adapter_placement
-        self.use_spectral_attention = use_spectral_attention
         self.use_sam_loss = use_sam_loss
         self.adapter_in_channels = adapter_in_channels  # Refactored: adapter input channels
         self.adapter_out_channels = adapter_out_channels  # Refactored: adapter output channels
@@ -783,7 +683,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             "pretrained_model_name_or_path",
             "adapter_channels",
             "adapter_placement",
-            "use_spectral_attention",
             "use_sam_loss",
             "revision",
             "subfolder",
@@ -824,15 +723,11 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # Instantiate adapters
         if self.adapter_placement in ["input", "both"]:
             self.input_adapter = SpectralAdapter(
-                self.adapter_in_channels, self.backbone_in_channels,  # Refactored: adapter_in_channels -> backbone_in_channels
-                use_attention=self.use_spectral_attention,
-                num_bands=self.adapter_in_channels
+                self.adapter_in_channels, self.backbone_in_channels  # Refactored: adapter_in_channels -> backbone_in_channels
             )
         if self.adapter_placement in ["output", "both"]:
             self.output_adapter = SpectralAdapter(
-                self.backbone_out_channels, self.adapter_out_channels,  # Refactored: backbone_out_channels -> adapter_out_channels
-                use_attention=self.use_spectral_attention,
-                num_bands=self.adapter_out_channels
+                self.backbone_out_channels, self.adapter_out_channels  # Refactored: backbone_out_channels -> adapter_out_channels
             )
         # Load the full state dict (including adapters) if available
         # instantiate adapter->full state dict load : 
@@ -1102,7 +997,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             backbone_out_channels=kwargs.get("backbone_out_channels", 3),
             adapter_channels=kwargs.get("adapter_channels", 32),
             adapter_placement=kwargs.get("adapter_placement", "both"),
-            use_spectral_attention=kwargs.get("use_spectral_attention", True),
             use_sam_loss=kwargs.get("use_sam_loss", True),
             subfolder=kwargs.get("subfolder", "vae"),
             revision=kwargs.get("revision", None),
@@ -1147,7 +1041,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             backbone_in_channels=self.backbone_in_channels,
             backbone_out_channels=self.backbone_out_channels,
             adapter_placement=self.adapter_placement,
-            use_spectral_attention=self.use_spectral_attention,
             use_sam_loss=self.use_sam_loss,
             adapter_channels=self.adapter_channels,
             use_saturation_penalty=self.use_saturation_penalty,
@@ -1203,9 +1096,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         - Consistent behavior with base AutoencoderKL.decode() method
 
         IMPORTANT: The output adapter applies significant nonlinear transformations including:
-        - Spectral attention with sigmoid activation and element-wise multiplication
         - Two convolutional blocks with SiLU activations and GroupNorm
-        - Final linear convolution
+        - Final linear convolution with learnable scale and bias parameters
         
         These nonlinearities mean the output range is NOT constrained to [-1, 1] and may require
         post-processing normalization depending on downstream usage.

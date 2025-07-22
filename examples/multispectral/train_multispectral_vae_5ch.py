@@ -17,7 +17,7 @@ Data Flow Summary:
 - Model: Adapters map 5-channel input to 3-channel HF's AutoencoderKL backbone, then back to 5-channel output
 - Output: Reconstructed 5-channel image, with losses computed for both spatial and spectral fidelity
 - Loss: Multi-objective (MSE + SAM), with mask-aware background handling
-- Logging: Per-epoch metrics, band importance, and SSIM for scientific analysis
+- Logging: Per-epoch metrics and SSIM for scientific analysis
 
 Training Strategy:
 The model should naturally learn to produce outputs in the [-1, 1] range because:
@@ -26,8 +26,8 @@ Loss function penalizes reconstruction error
 The model will learn to match the input distribution
 
 However:
-- The nonlinear processes (spectral attention, SiLU) contain important spectral information
-- spectral relationships learned by the attention mechanism need to be preserved (no hard clamping or tanh activation to force data range [-1/1])
+- The nonlinear processes (SiLU, GroupNorm) contain important spectral information
+- spectral relationships need to be preserved (no hard clamping or tanh activation to force data range [-1/1])
 - 
 
 Thesis Context and Training Workflow:
@@ -79,13 +79,11 @@ Thesis Context and Training Workflow:
    a) Per-epoch Validation:
       - Per-band MSE tracking
       - SAM loss computation
-      - Spectral attention weights
       - Reconstruction quality
 
    b) Scientific Logging:
       - Weights & Biases integration
       - Automatic experiment logging with wandb (setup inside `train()`)
-      - Band importance visualization
       - Spectral signature plots
       - Training dynamics analysis
 
@@ -108,7 +106,6 @@ Development and Testing Strategy:
    b) Validation Metrics:
       - Per-band MSE tracking
       - SAM loss components
-      - Spectral attention weights
       - Reconstruction quality
 
 3. Training Configuration:
@@ -122,7 +119,6 @@ Scientific Contributions:
 1. Training Methodology:
    - Parameter-efficient fine-tuning
    - Spectral-aware optimization
-   - Band importance analysis
    - Spectral fidelity preservation
 
 2. Validation Framework:
@@ -144,11 +140,11 @@ Usage:
 
 
     # Then, train the VAE:
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0 --use_saturation_penalty
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0 --use_saturation_penalty
 NOTE: add to your CLI call: --use_saturation_penalty
 
     # Testing
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0 --use_saturation_penalty
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0 --use_saturation_penalty
 
 VAE Loading Note:
    RGB VAE weights from SD3 could not be loaded directly via `from_pretrained()` using a config object,
@@ -214,7 +210,7 @@ def setup_logging(args):
 
     return logger
 
-def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats=None):
+def log_training_metrics(logger, epoch, train_losses, val_losses, args, output_range_stats=None):
     # Logs all relevant metrics for scientific reporting and experiment tracking
     logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
     logger.info("Training Metrics:")
@@ -233,9 +229,7 @@ def log_training_metrics(logger, epoch, train_losses, val_losses, band_importanc
     if 'sam' in val_losses:
         logger.info(f"  SAM Loss: {val_losses['sam']:.4f}")
 
-    logger.info("Band Importance:")
-    for band, importance in band_importance.items():
-        logger.info(f"  {band}: {importance:.4f}")
+
     
     # Log mask statistics if available
     if 'mask_stats' in train_losses:
@@ -300,8 +294,6 @@ def setup_wandb(args):
     try:
         # Create a descriptive run name
         run_name = f"multispectral_vae_{args.adapter_placement}"
-        if args.use_spectral_attention:
-            run_name += "_spectral_attn"
         if args.use_sam_loss:
             run_name += "_sam"
         run_name += f"_lr{args.learning_rate}_bs{args.batch_size}"
@@ -314,7 +306,6 @@ def setup_wandb(args):
                 "batch_size": args.batch_size,
                 "num_epochs": args.num_epochs,
                 "adapter_placement": args.adapter_placement,
-                "use_spectral_attention": args.use_spectral_attention,
                 "use_sam_loss": args.use_sam_loss,
                 "sam_weight": args.sam_weight,
                 "warmup_ratio": args.warmup_ratio,
@@ -340,7 +331,7 @@ def setup_wandb(args):
             print(f"Warning: Failed to initialize wandb: {e}")
         return False
 
-def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats=None, ssim_per_band=None, current_lr=None, grad_norm=None):
+def log_to_wandb(epoch, train_losses, val_losses, batch, reconstruction, model, output_range_stats=None, ssim_per_band=None, current_lr=None, grad_norm=None):
     """Logs metrics and sample images to Weights & Biases for visualization and analysis."""
     # Check if wandb is initialized
     if not wandb.run:
@@ -354,7 +345,6 @@ def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, recons
             "val_total_loss": val_losses.get('total_loss', float('nan')),
             **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses.get('mse_per_channel', []))},
             **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses.get('mse_per_channel', []))},
-            **{f"band_importance_{k}": v for k, v in band_importance.items()},
         }
         
         # Add SSIM metrics if available
@@ -796,7 +786,7 @@ def train(args: argparse.Namespace) -> None:
        - Saves checkpoints for reproducibility and analysis.
 
     5. Monitoring and Logging:
-       - Comprehensive logging of all metrics, band importance, and training dynamics.
+       - Comprehensive logging of all metrics and training dynamics.
        - Weights & Biases integration for experiment tracking and visualization.
        - Logs all hyperparameters and results for scientific reproducibility.
     """
@@ -815,7 +805,6 @@ def train(args: argparse.Namespace) -> None:
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "adapter_placement": args.adapter_placement,
-        "use_spectral_attention": args.use_spectral_attention,
         "use_sam_loss": args.use_sam_loss,
         "sam_weight": args.sam_weight,
         "use_saturation_penalty": args.use_saturation_penalty,
@@ -849,8 +838,6 @@ def train(args: argparse.Namespace) -> None:
             pretrained_model_name_or_path=args.base_model_path,
             subfolder=args.subfolder,
             adapter_placement=args.adapter_placement,
-            use_spectral_attention=args.use_spectral_attention,
-            use_sam_loss=args.use_sam_loss,
             adapter_in_channels=5,  # Refactored: adapter input channels
             adapter_out_channels=5, # Refactored: adapter output channels
             backbone_in_channels=3, # Refactored: backbone input channels
@@ -865,7 +852,6 @@ def train(args: argparse.Namespace) -> None:
         logger.info(f"  - out_channels: {model.config.out_channels}")
         logger.info(f"  - latent_channels: {model.config.latent_channels}")
         logger.info(f"  - adapter_placement: {model.adapter_placement}")
-        logger.info(f"  - use_spectral_attention: {model.use_spectral_attention}")
         # Explicit assertion and log for input/output adapter channels (safer)
         assert model.input_adapter.in_channels == 5, f"Input adapter expects {model.input_adapter.in_channels} channels, expected 5!"
         assert model.output_adapter.out_channels == 5, f"Output adapter produces {model.output_adapter.out_channels} channels, expected 5!"
@@ -1278,14 +1264,7 @@ def train(args: argparse.Namespace) -> None:
             else:
                 val_losses[key] /= len(val_loader)
 
-        # Get band importance if using spectral attention
-        # Analyzes model's spectral understanding
-        band_importance = {}
-        if args.use_spectral_attention and hasattr(model, 'input_adapter') and hasattr(model.input_adapter, 'attention'):
-            try:
-                band_importance = model.input_adapter.attention.get_band_importance()
-            except Exception as e:
-                logger.warning(f"Failed to get band importance: {e}")
+
 
         # Global scale monitoring:
         # The model applies a learnable scalar multiplier (global_scale) to preserve spectral shape across bands.
@@ -1318,7 +1297,6 @@ def train(args: argparse.Namespace) -> None:
             epoch=epoch,
             train_losses={k: convert_tensor_for_logging(v) for k, v in train_losses.items()},
             val_losses={k: convert_tensor_for_logging(v) for k, v in val_losses.items()},
-            band_importance=band_importance,
             ssim_per_band=ssim_per_band,
             global_scale=current_scale,
             learning_rate=scheduler.get_last_lr()[0],
@@ -1339,7 +1317,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Log metrics
         # Tracks training progress
-        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats)
+        log_training_metrics(logger, epoch, train_losses, val_losses, args, output_range_stats)
         # Log spectral signature loss
         if 'spectral_signature_loss' in train_losses:
             logger.info(f"[EPOCH] Spectral signature loss (train): {train_losses['spectral_signature_loss']:.6f}")
@@ -1362,7 +1340,7 @@ def train(args: argparse.Namespace) -> None:
         # Log to wandb (includes both metrics and images)
         if wandb_initialized:
             try:
-                log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats, ssim_per_band, scheduler.get_last_lr()[0], current_grad_norm)
+                log_to_wandb(epoch, train_losses, val_losses, batch, reconstruction, model, output_range_stats, ssim_per_band, scheduler.get_last_lr()[0], current_grad_norm)
             except Exception as e:
                 logger.warning(f"Failed to log to wandb: {e}")
 
@@ -1429,8 +1407,7 @@ def main():
     parser.add_argument("--adapter_placement", type=str, default="both",
                       choices=["input", "output", "both"],
                       help="Where to place adapters")
-    parser.add_argument("--use_spectral_attention", action="store_true",
-                      help="Use spectral attention mechanism")
+
     parser.add_argument("--use_sam_loss", action="store_true",
                       help="Use Spectral Angle Mapper loss")
     parser.add_argument("--sam_weight", type=float, default=0.1,
