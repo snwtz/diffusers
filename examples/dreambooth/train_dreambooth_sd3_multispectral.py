@@ -1296,7 +1296,7 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     )
 
-    # --- Load lightweight ControlNet for mask-based spatial conditioning ---
+    """ --- Load lightweight ControlNet for mask-based spatial conditioning ---
     controlnet = None
     if args.controlnet_model_name_or_path:
         controlnet = ControlNetModel.from_pretrained(
@@ -1306,7 +1306,8 @@ def main(args):
         controlnet.to(accelerator.device)
         controlnet.requires_grad_(False)
         logger.info(f"Loaded ControlNet from: {args.controlnet_model_name_or_path}")
-
+    """
+    
     # Set up model training states (matches original DreamBooth)
     transformer.requires_grad_(True)
     if args.train_text_encoder:

@@ -75,11 +75,11 @@ def plot_individual_bands(bands, output_dir, image_idx):
     
     # Band information for descriptive titles
     band_info = [
-        "Band 1 (474.73nm - Blue - Chlorophyll Absorption)",
-        "Band 2 (538.71nm - Green - Healthy Vegetation)",
-        "Band 3 (650.665nm - Red - Chlorophyll Content)", 
-        "Band 4 (730.635nm - Red-edge - Stress Detection)",
-        "Band 5 (850.59nm - NIR - Leaf Health)"
+        "Band 1 (474.73nm - Blue)",
+        "Band 2 (538.71nm - Green)",
+        "Band 3 (650.665nm - Red)", 
+        "Band 4 (730.635nm - Red-edge)",
+        "Band 5 (850.59nm - NIR)"
     ]
     
     # Create subplot for all bands
