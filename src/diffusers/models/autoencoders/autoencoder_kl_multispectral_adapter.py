@@ -259,6 +259,10 @@ from ..modeling_outputs import AutoencoderKLOutput
 from .autoencoder_kl import AutoencoderKL
 from .vae import DecoderOutput
 
+
+
+
+
 #
 # Design Rationale: Spectral Attention
 # ------------------------------------
@@ -338,6 +342,21 @@ class SpectralAttention(nn.Module):
 # IMPORTANT: The nonlinear transformations (SiLU, GroupNorm, sigmoid attention) mean that
 # the output range is not constrained to [-1, 1] and may require post-processing normalization.
 #
+# Output Scale and Bias Parameters:
+# ---------------------------------
+# The output_scale and output_bias parameters are learnable linear transformation coefficients
+# applied to the SpectralAdapter output (via the formula: )output = input * output_scale + output_bias.
+# These parameters enable trainable calibration of the spectral output dynamic range to align
+# with SD3 pipeline expectations (ideally [-1, 1]) while preserving spectral fidelity. Optimal
+# values are output_scale ≈ 1.0 and output_bias ≈ 0.0, indicating minimal transformation is
+# required and the adapter naturally produces appropriately scaled outputs. Values significantly
+# deviating from these targets (output_scale < 0.1 or > 3.0, |output_bias| > 0.5) may indicate
+# training instability, data normalization issues, or inappropriate hyperparameter settings.
+# Scale collapse (output_scale < 0.001) represents a critical failure mode where the model
+# produces near-zero outputs, while scale explosion (output_scale > 5.0) indicates potential
+# gradient instability. Convergence to near-identity values demonstrates successful preservation
+# of biological spectral signatures with minimal range distortion.
+#
 class SpectralAdapter(nn.Module):
     """
     Adapter module for converting between 3 and 5 spectral channels.
@@ -392,11 +411,8 @@ class SpectralAdapter(nn.Module):
         # This enables smooth, trainable calibration of spectral output without hard clipping or nonlinear warping.
         # Motivation:
         #   - Avoids saturating Tanh or clamping artifacts which can distort spectral shapes.
-        #   - Maintains biological interpretability of band ratios.
         #   - Adapts output to match SD3 pipeline expectations (range ~[-1, 1]).
-        # Final trained values (e.g., output_scale ≈ 0.9989, output_bias ≈ -0.0010) indicate almost identity behavior, meaning:
-        #   - The adapter outputs are already in the desired range without drastic transformation.
-        #   - Spectral fidelity and output amplitude are preserved, with only a minimal bias shift.
+   
         self.output_scale = nn.Parameter(torch.tensor(1.0))  # Global scaling factor
         self.output_bias = nn.Parameter(torch.tensor(0.0))   # Global shift
 
@@ -424,11 +440,17 @@ class SpectralAdapter(nn.Module):
         self.collapse_warning_issued = False  # Track if collapse warning was issued
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply background mask: Set any NaNs to 0.0 (e.g., padding area)
+        # Apply background mask: Replace NaNs with per-band means to maintain spectral realism
         # This prevents downstream convolutional layers from propagating invalid values
+        # while preserving realistic spectral signatures in background regions
         if torch.isnan(x).any():
-            logger.debug("[NaN DEBUG] NaNs found in adapter input, replacing with 0.0 (masked background).")
-        x = torch.nan_to_num(x, nan=0.0)
+            logger.debug("[NaN DEBUG] NaNs found in adapter input, replacing with per-band means.")
+            for band_idx in range(x.shape[1]):
+                band = x[:, band_idx]
+                nan_mask = torch.isnan(band)
+                if nan_mask.any():
+                    band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
+                    x[:, band_idx][nan_mask] = band_mean
 
         # Log adapter input stats for NaN debugging
         logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
@@ -628,8 +650,15 @@ class InputAdapter(nn.Module):
         if torch.isinf(x).any():
             logger.debug("[NaN DEBUG] Infs detected in InputAdapter output.")
 
-        # Optionally clamp to prevent propagation of small/large values
-        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Handle NaN/Inf values: use per-band means for NaNs, clamp infinities
+        if torch.isnan(x).any():
+            for band_idx in range(x.shape[1]):
+                band = x[:, band_idx]
+                nan_mask = torch.isnan(band)
+                if nan_mask.any():
+                    band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
+                    x[:, band_idx][nan_mask] = band_mean
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)  # Only handles remaining Infs
         return x
 
 

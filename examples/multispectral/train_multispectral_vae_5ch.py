@@ -185,6 +185,8 @@ from vae_multispectral_dataloader import create_vae_dataloaders
 from training_logger import create_training_logger
 from diffusers.models.autoencoders.vae import DecoderOutput
 
+
+
 def setup_logging(args):
     # Create logs directory for experiment traceability and reproducibility
     log_dir = os.path.join(args.output_dir, 'logs')
@@ -984,9 +986,16 @@ def train(args: argparse.Namespace) -> None:
             if mask is None:
                 logger.warning(f"[MASK WARNING] No mask provided for training batch at step {step}!")
             # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
-            # Conceptually preserve the NaN-based primary mask for calculating masked losses!
+            # Use per-band means for NaNs to maintain spectral realism, clamp infinities to [-1,1]
             # Ensures that only valid data is passed to the model, preventing NaN/infinity propagation
-            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
+            if torch.isnan(batch).any():
+                for band_idx in range(batch.shape[1]):
+                    band = batch[:, band_idx]
+                    nan_mask = torch.isnan(band)
+                    if nan_mask.any():
+                        band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
+                        batch[:, band_idx][nan_mask] = band_mean
+            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
             batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
             # Forward pass with mask support for leaf-focused training
@@ -1153,7 +1162,15 @@ def train(args: argparse.Namespace) -> None:
                 # Debug print for mask sum
                 print("[DEBUG] Validation mask sum (should be >0):", mask.sum().item())
                 # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
-                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
+                # Use per-band means for NaNs to maintain spectral realism, clamp infinities to [-1,1]
+                if torch.isnan(batch).any():
+                    for band_idx in range(batch.shape[1]):
+                        band = batch[:, band_idx]
+                        nan_mask = torch.isnan(band)
+                        if nan_mask.any():
+                            band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
+                            batch[:, band_idx][nan_mask] = band_mean
+                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
                 batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
                 # Forward pass with mask support for validation
