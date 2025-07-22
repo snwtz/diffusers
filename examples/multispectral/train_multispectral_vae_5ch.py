@@ -867,7 +867,7 @@ def train(args: argparse.Namespace) -> None:
         # Explicit assertion and log for input/output adapter channels (safer)
         assert model.input_adapter.in_channels == 5, f"Input adapter expects {model.input_adapter.in_channels} channels, expected 5!"
         assert model.output_adapter.out_channels == 5, f"Output adapter produces {model.output_adapter.out_channels} channels, expected 5!"
-        logger.info(f"[CHECK] Adapter input/output channels: {model.input_adapter.in_channels} → {model.output_adapter.out_channels}")
+        logger.info(f"[CHECK] Adapter input/output channels: {model.input_adapter.in_channels} -> {model.output_adapter.out_channels}")
     except Exception as e:
         logger.error(f"Failed to load base model: {e}")
         raise RuntimeError(f"Model loading failed: {e}")
@@ -1136,7 +1136,6 @@ def train(args: argparse.Namespace) -> None:
 
         # Validation phase
         model.eval()
-        # At the start of every epoch, always re-initialize val_losses as tensors/scalars
         val_losses = {
             'total_loss': 0,
             'mse_per_channel': torch.zeros(5, device=device),  # 5 bands
@@ -1151,17 +1150,26 @@ def train(args: argparse.Namespace) -> None:
                 mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
                 if mask is None:
                     logger.warning(f"[MASK WARNING] No mask provided for validation batch!")
+                # Debug print for mask sum
+                print("[DEBUG] Validation mask sum (should be >0):", mask.sum().item())
                 # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
                 batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
                 # Forward pass with mask support for validation
+                # MSE FIX: Temporarily set model to training mode to get losses
+                model.train()
                 result = model.forward(sample=batch, mask=mask)
-                if isinstance(result, tuple) and len(result) == 2: # "not enough values to unpack" debug
+                model.eval()  # Switch back to eval mode
+                
+                if isinstance(result, tuple) and len(result) == 2:
                     reconstruction, losses = result
                 else:
+                    # This should not happen anymore with the fix above
                     reconstruction = result
                     losses = {}
+                    logger.warning("WARNING: Model forward() returned only reconstruction in validation")
+                
                 # Fix: If reconstruction is DecoderOutput, extract .sample
                 if isinstance(reconstruction, DecoderOutput):
                     reconstruction = reconstruction.sample
@@ -1225,8 +1233,13 @@ def train(args: argparse.Namespace) -> None:
                 if output_range_stats is None:
                     output_range_stats = compute_output_range_stats(reconstruction)
 
-        # After validation loop: compute epoch-level mean spectrum and other summaries
+        # After validation loop: average all metrics
         num_batches = len(val_loader)
+        for key in val_losses:
+            if isinstance(val_losses[key], torch.Tensor):
+                val_losses[key] /= num_batches
+            else:
+                val_losses[key] /= num_batches
         if recon_mean_spectra:
             epoch_recon_mean_spectrum = np.mean(np.stack(recon_mean_spectra), axis=0)
         else:
@@ -1247,10 +1260,6 @@ def train(args: argparse.Namespace) -> None:
                 val_losses[key] /= len(val_loader)
             else:
                 val_losses[key] /= len(val_loader)
-
-        # Now convert per-channel MSE tensor to list of floats for correct logging
-        if isinstance(val_losses.get('mse_per_channel', None), torch.Tensor):
-            val_losses['mse_per_channel'] = val_losses['mse_per_channel'].cpu().numpy().tolist()
 
         # Get band importance if using spectral attention
         # Analyzes model's spectral understanding

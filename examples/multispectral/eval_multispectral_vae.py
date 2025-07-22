@@ -578,7 +578,7 @@ def main():
             print(f"[MASK WARNING] No mask provided for evaluation batch {idx}!")
         
         with torch.no_grad():
-            recon, _ = model(batch)
+            recon = model(batch)
             # Extract tensor from DecoderOutput
             if hasattr(recon, "sample"):
                 decoded_tensor = recon.sample
