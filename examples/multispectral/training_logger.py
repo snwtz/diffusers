@@ -242,10 +242,14 @@ TRAINING CONFIGURATION:
             "learning_rate": learning_rate,
             "grad_norm": grad_norm,
             "gradient_clipping": gradient_clipping,
-            "global_scale": global_scale,
         }
+        # Only log global_scale if not None (and not default value)
+        if global_scale is not None: # and global_scale != 1.0:
+            epoch_data["global_scale"] = global_scale
+        # Only log band_importance if not None and not empty
         if band_importance:
             epoch_data["band_importance"] = band_importance
+        # Only log band_importance_analysis if not None and not empty
         if band_importance_analysis:
             epoch_data["band_importance_analysis"] = band_importance_analysis
         if ssim_per_band:

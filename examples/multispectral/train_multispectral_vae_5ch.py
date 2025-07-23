@@ -178,7 +178,8 @@ import numpy as np  # Ensure numpy is imported
 from skimage.metrics import structural_similarity as ssim
 import time # Added for timing
 
-from diffusers import AutoencoderKLMultispectralAdapter
+# from diffusers import AutoencoderKLMultispectralAdapter  # <-- Commented out sophisticated VAE
+from diffusers.models.autoencoders.autoencoder_ms_benchmark import AutoencoderMSBenchmark as AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
 from vae_multispectral_dataloader import create_vae_dataloaders

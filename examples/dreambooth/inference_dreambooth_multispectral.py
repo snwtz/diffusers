@@ -162,6 +162,12 @@ def main():
         default=None,
         help="Path to custom multispectral VAE directory (optional)"
     )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default=None,
+        help="Output directory for generated images (default: model_path/inference_test)"
+    )
     
     args = parser.parse_args()
 
@@ -186,10 +192,14 @@ def main():
         print(f"Final model not found at {model_path}, using main model directory")
         model_path = args.model_path
 
-    # Define fixed output directory inside model_path
-    args.output_dir = os.path.join(model_path, "inference_test")
+    # Define output directory
+    if args.output_dir is not None:
+        output_dir = args.output_dir
+    else:
+        output_dir = os.path.join(model_path, "inference_test")
     
     print(f"Loading model from: {model_path}")
+    print(f"Output directory: {output_dir}")
     
     # Load MS VAE if provided
     vae = None
@@ -198,6 +208,13 @@ def main():
         # Always load VAE in float32 for stability
         vae = AutoencoderKLMultispectralAdapter.from_pretrained(args.vae).float()
         vae = vae.to("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32)
+
+        # Log successful adapter loading
+        print("MS adapter loaded")
+        if hasattr(vae, 'input_adapter'):
+            print(f"   - Input adapter: {vae.input_adapter.in_channels} → {vae.input_adapter.out_channels} channels")
+        if hasattr(vae, 'output_adapter'):
+            print(f"   - Output adapter: {vae.output_adapter.in_channels} → {vae.output_adapter.out_channels} channels")
 
     # Set pipeline dtype: float16 for speed (except VAE)
     pipeline_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
@@ -276,7 +293,7 @@ def main():
         print(f"Using seed: {args.seed}")
     
     # Create output directory
-    os.makedirs(args.output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
     
     print(f"Generating {args.num_images} images with prompt: '{args.prompt}'")
 
@@ -312,7 +329,7 @@ def main():
     for i, image in enumerate(images):
         # This is the pipeline's default RGB output (pseudo-RGB conversion)
         filename = f"pipeline_rgb_output_{i+1}.png"
-        filepath = os.path.join(args.output_dir, filename)
+        filepath = os.path.join(output_dir, filename)
         image.save(filepath)
         print(f"Saved pipeline RGB output: {filepath}")
     
@@ -345,12 +362,12 @@ def main():
             # print(f"Saved multispectral TIFF: {ms_filepath} (shape: {ms_numpy.shape})")
             
             # Create individual band plots
-            plot_individual_bands(ms_numpy, args.output_dir, i)
+            plot_individual_bands(ms_numpy, output_dir, i)
             
             # Also save pseudo-RGB visualization (our custom spectral mapping)
             rgb = create_pseudo_rgb(ms_numpy)  # Shape: (3, H, W)
             rgb_filename = f"custom_pseudo_rgb_{i+1}.png"
-            rgb_filepath = os.path.join(args.output_dir, rgb_filename)
+            rgb_filepath = os.path.join(output_dir, rgb_filename)
             
             # Save pseudo-RGB as PNG
             from PIL import Image
@@ -361,7 +378,7 @@ def main():
             
             print(f"Saved custom pseudo-RGB: {rgb_filepath} (shape: {rgb.shape})")
     
-    print(f"Generated {len(images)} images in {args.output_dir}")
+    print(f"Generated {len(images)} images in {output_dir}")
     print("\nFile descriptions:")
     print("- pipeline_rgb_output_*.png: Pipeline's default RGB output (pseudo-RGB conversion)")
     print("- custom_pseudo_rgb_*.png: Our custom spectral mapping (B1→B, B2→G, B3→R, B4→R+, B5→G+)")
