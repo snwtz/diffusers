@@ -269,10 +269,25 @@ JSON File: {self.json_file}
         validation_dir.mkdir(exist_ok=True)
         for i, image in enumerate(images):
             image_path = validation_dir / f"epoch_{epoch:03d}_image_{i:02d}.png"
-            image.save(image_path)
+            # If image is PIL, just save; if tensor dict, decode and save
+            if hasattr(image, 'save'):
+                image.save(image_path)
+            else:
+                # fallback: try to convert tensor to PIL
+                try:
+                    from PIL import Image
+                    import numpy as np
+                    arr = (image["decoded_clamped"].detach().cpu().numpy()[:3] + 1) / 2
+                    arr = np.clip(arr, 0, 1)
+                    arr = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+                    pil_img = Image.fromarray(arr)
+                    pil_img.save(image_path)
+                except Exception:
+                    pass
 
         # --- VAE decoding and metric computation ---
-        if self.vae is not None:
+        # Only run metrics if images are dicts (not PIL)
+        if self.vae is not None and images and not hasattr(images[0], 'save'):
             try:
                 with torch.no_grad():
                     # Expect images[i] contains {"latent": Tensor, "target": Tensor, "mask": Tensor}
@@ -359,7 +374,20 @@ JSON File: {self.json_file}
             json.dump(self.log_data, f, indent=2)
         # Log to wandb
         if WANDB_AVAILABLE and wandb.run:
-            wandb_images = [wandb.Image(image, caption=f"{i}: {prompt}") for i, image in enumerate(images)]
+            wandb_images = [wandb.Image(image, caption=f"{i}: {prompt}") for i, image in enumerate(images) if hasattr(image, 'save')]
+            # If images are not PIL, fallback to previous logic
+            if not wandb_images and images and not hasattr(images[0], 'save'):
+                try:
+                    from PIL import Image
+                    import numpy as np
+                    for i, v in enumerate(images):
+                        arr = (v["decoded_clamped"].detach().cpu().numpy()[:3] + 1) / 2
+                        arr = np.clip(arr, 0, 1)
+                        arr = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+                        pil_img = Image.fromarray(arr)
+                        wandb_images.append(wandb.Image(pil_img, caption=f"{i}: {prompt}"))
+                except Exception:
+                    pass
             wandb_log = {"validation_images": wandb_images}
             # Add per-channel MSE and metrics
             if channel_mse is not None:

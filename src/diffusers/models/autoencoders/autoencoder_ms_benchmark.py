@@ -10,7 +10,7 @@ Baseline comparison for the more sophisticated multispectral adapter.
 Required Training Interface Methods
 - freeze_backbone() - Freezes backbone, unfreezes adapters
 - get_trainable_params() - Returns only adapter parameters
-- ompute_losses() - Minimal MSE loss with mask support
+- compute_losses() - Minimal MSE loss with mask support, SAM loss, and spectral guidance
 
 Configuration Attributes
 - All expected config parameters (adapter_placement, use_spectral_attention, etc.)
@@ -20,15 +20,12 @@ Configuration Attributes
 Training Script Integration
 - Updated import to use benchmark model: AutoencoderMSBenchmark as AutoencoderKLMultispectralAdapter
 - forward() method supports mask parameter and returns (reconstruction, losses) in training mode
-
-Fake Features for Compatibility
-- global_scale parameter in adapters (for scale logging)
-- FakeAttention class with get_band_importance() method
-- Placeholder monitoring info to avoid training script errors
+- Supports spectral guidance for scientific realism
+- Includes SAM loss for spectral fidelity
 """
 
 from typing import Dict, Optional, Tuple, Union
-
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -52,6 +49,41 @@ from ..modeling_utils import ModelMixin
 from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
 from .autoencoder_kl import AutoencoderKL
 
+# Set up logger for this module
+logger = logging.getLogger(__name__)
+
+# Numerically stable normalization for SAM loss (copied from sophisticated adapter)
+def safe_normalize(tensor, dim=1, eps=1e-8):
+    """Numerically stable normalization for SAM loss computation."""
+    norm = torch.norm(tensor, p=2, dim=dim, keepdim=True)
+    norm = norm.clamp(min=eps)
+    return tensor / norm
+
+def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable Spectral Angle Mapper (SAM) loss between two multispectral images.
+    
+    Args:
+        original: Original multispectral image
+        reconstructed: Reconstructed multispectral image
+    Returns:
+        Mean spectral angle in radians
+    """
+    # Use safe normalization to avoid NaNs
+    normalized_original = safe_normalize(original, dim=1)
+    normalized_reconstructed = safe_normalize(reconstructed, dim=1)
+
+    # Compute cosine similarity and clamp for stability
+    cos_sim = F.cosine_similarity(normalized_original, normalized_reconstructed, dim=1)
+    cos_sim = cos_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+
+    angle = torch.acos(cos_sim)
+    angle = torch.nan_to_num(angle, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if torch.isnan(angle).any():
+        logger.debug("NaNs detected in SAM angle computation.")
+
+    return angle.mean()
 
 class SimpleChannelAdapter(nn.Module):
     """Minimal channel adapter - just a single convolution layer."""
@@ -71,7 +103,7 @@ class AutoencoderMSBenchmark(AutoencoderKL):
     Minimal multispectral VAE benchmark implementation.
     
     Takes the original AutoencoderKL and adds only basic 5->3->5 channel adapters.
-    No sophisticated features - just bare minimum for 5-channel processing.
+    Now includes SAM loss and spectral guidance for scientific comparison.
     """
 
     @register_to_config
@@ -98,12 +130,13 @@ class AutoencoderMSBenchmark(AutoencoderKL):
         # Training script compatibility parameters
         adapter_placement: str = "both",
         use_spectral_attention: bool = False,  # Disabled for benchmark
-        use_sam_loss: bool = False,  # Disabled for benchmark
+        use_sam_loss: bool = False,  # Now configurable
         adapter_in_channels: int = 5,
         adapter_out_channels: int = 5,
         backbone_in_channels: int = 3,
         backbone_out_channels: int = 3,
         use_saturation_penalty: bool = False,  # Disabled for benchmark
+        spectral_guidance_weight: float = 0.05,  # NEW: weight for spectral guidance
     ):
         # Store adapter config attributes for training script compatibility
         self.adapter_placement = adapter_placement
@@ -114,6 +147,7 @@ class AutoencoderMSBenchmark(AutoencoderKL):
         self.backbone_in_channels = backbone_in_channels
         self.backbone_out_channels = backbone_out_channels
         self.use_saturation_penalty = use_saturation_penalty
+        self.spectral_guidance_weight = spectral_guidance_weight
         
         # Initialize parent with 3 channels (SD3 backbone)
         super().__init__(
@@ -141,9 +175,6 @@ class AutoencoderMSBenchmark(AutoencoderKL):
         self.input_adapter = SimpleChannelAdapter(5, 3)  # 5->3 for encoder
         self.output_adapter = SimpleChannelAdapter(3, 5)  # 3->5 for decoder
         
-        # Add fake attention for training script compatibility if needed
-        if use_spectral_attention:
-            self.input_adapter.attention = FakeAttention()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
@@ -172,6 +203,7 @@ class AutoencoderMSBenchmark(AutoencoderKL):
             backbone_in_channels=kwargs.get("backbone_in_channels", 3),
             backbone_out_channels=kwargs.get("backbone_out_channels", 3),
             use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
+            spectral_guidance_weight=kwargs.get("spectral_guidance_weight", 0.05),
         )
         
         # Copy backbone weights
@@ -191,6 +223,7 @@ class AutoencoderMSBenchmark(AutoencoderKL):
             backbone_in_channels=self.backbone_in_channels,
             backbone_out_channels=self.backbone_out_channels,
             use_saturation_penalty=self.use_saturation_penalty,
+            spectral_guidance_weight=self.spectral_guidance_weight,
         )
         super().save_pretrained(save_directory, *args, **kwargs)
 
@@ -215,45 +248,145 @@ class AutoencoderMSBenchmark(AutoencoderKL):
             params.extend(self.output_adapter.parameters())
         return params
 
-    def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-        """Compute minimal loss for benchmark comparison (MSE only)."""
+    def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None, 
+                      reference_signature: torch.Tensor = None) -> Dict[str, torch.Tensor]:
+        """
+        Compute loss terms for benchmark comparison with spectral guidance and SAM loss.
+        
+        Args:
+            original: Original multispectral image, shape (B, 5, H, W)
+            reconstructed: Reconstructed multispectral image, shape (B, 5, H, W)
+            mask: Binary mask (1 for leaf/foreground, 0 for background), shape (B, 1, H, W)
+            reference_signature: Reference spectral signature for guidance, shape (5,)
+        
+        Returns:
+            Dictionary containing loss terms
+        """
         losses = {}
         
-        # Simple MSE loss
+        # Validate mask shape and prepare for broadcasting
         if mask is not None:
-            # Apply mask if provided
-            masked_original = original * mask
-            masked_reconstructed = reconstructed * mask
-            mse_loss = F.mse_loss(masked_reconstructed, masked_original, reduction='none')
-            # Average over masked regions only
-            valid_pixels = mask.sum() + 1e-8
-            losses['mse'] = (mse_loss * mask).sum() / valid_pixels
+            # Ensure mask has correct shape for broadcasting with (B, 5, H, W)
+            if mask.shape[1] == 1:
+                # Expand mask from (B, 1, H, W) to (B, 5, H, W) for channel-wise masking
+                mask = mask.expand(-1, original.shape[1], -1, -1)
+            elif mask.shape[1] != original.shape[1]:
+                raise ValueError(f"Mask channels ({mask.shape[1]}) must be 1 or match input channels ({original.shape[1]})")
             
-            # Per-channel MSE
-            mse_per_channel = torch.zeros(original.shape[1], device=original.device)
-            for c in range(original.shape[1]):
-                channel_loss = (mse_loss[:, c:c+1] * mask).sum() / valid_pixels
-                mse_per_channel[c] = channel_loss
-            losses['mse_per_channel'] = mse_per_channel
+            # Ensure mask is binary (0 or 1)
+            mask = (mask > 0.5).float()
             
-            # Mask statistics
+            # Log mask statistics for monitoring
+            mask_coverage = mask.mean().item()
             losses['mask_stats'] = {
-                'coverage': mask.mean().item(),
+                'coverage': mask_coverage,
                 'valid_pixels': mask.sum().item(),
                 'total_pixels': mask.numel()
             }
+            
+            if mask_coverage < 0.01:
+                logger.warning(f"Very low mask coverage ({mask_coverage:.4f}), training may be unstable")
+            elif mask_coverage > 0.99:
+                logger.warning(f"Very high mask coverage ({mask_coverage:.4f}), consider if masking is necessary")
         else:
-            # No mask - compute over entire image
-            losses['mse'] = F.mse_loss(reconstructed, original)
-            mse_per_channel = F.mse_loss(reconstructed, original, reduction='none').mean(dim=(0, 2, 3))
-            losses['mse_per_channel'] = mse_per_channel
+            # No mask provided - use full image
+            mask = torch.ones_like(original)
             losses['mask_stats'] = {
                 'coverage': 1.0,
-                'valid_pixels': original.numel(),
-                'total_pixels': original.numel()
+                'valid_pixels': mask.numel(),
+                'total_pixels': mask.numel()
             }
+
+        # Apply mask to both original and reconstructed images
+        masked_original = original * mask
+        masked_reconstructed = reconstructed * mask
+
+        # Simple MSE loss with masking
+        mse_per_pixel = F.mse_loss(masked_reconstructed, masked_original, reduction='none')
         
-        losses['total_loss'] = losses['mse']
+        # Average over masked regions only (excluding background)
+        if mask is not None:
+            # Sum over spatial dimensions, then divide by number of valid pixels per channel
+            mse_per_channel = (mse_per_pixel * mask).sum(dim=(0, 2, 3)) / (mask.sum(dim=(0, 2, 3)) + 1e-8)
+        else:
+            mse_per_channel = mse_per_pixel.mean(dim=(0, 2, 3))
+        
+        losses['mse_per_channel'] = mse_per_channel
+        losses['mse'] = mse_per_channel.mean()
+
+        # SAM loss for spectral fidelity (if enabled)
+        if self.use_sam_loss:
+            # Apply mask before computing SAM loss
+            if mask is not None:
+                # For SAM, we need to handle the case where some pixels have zero spectral magnitude
+                # after masking. We'll compute SAM only on pixels with sufficient spectral content.
+                spectral_magnitude = torch.norm(masked_original, dim=1, keepdim=True)  # (B, 1, H, W)
+                valid_spectral_mask = (spectral_magnitude > 1e-6) & (mask[:, :1, :, :] > 0.5)
+                
+                if valid_spectral_mask.sum() > 0:
+                    # Extract valid pixels for SAM computation
+                    valid_original = masked_original[valid_spectral_mask.expand_as(masked_original)]
+                    valid_reconstructed = masked_reconstructed[valid_spectral_mask.expand_as(masked_reconstructed)]
+                    
+                    # Reshape to (N, C) where N is number of valid pixels, C is channels
+                    valid_original = valid_original.view(-1, original.shape[1])
+                    valid_reconstructed = valid_reconstructed.view(-1, original.shape[1])
+                    
+                    # Compute SAM on valid pixels only
+                    losses['sam'] = compute_sam_loss(valid_original, valid_reconstructed)
+                else:
+                    # No valid spectral pixels, set SAM loss to zero
+                    losses['sam'] = torch.tensor(0.0, device=original.device, dtype=original.dtype)
+                    logger.warning("No valid spectral pixels found for SAM loss computation")
+            else:
+                # No mask provided, compute SAM on entire image
+                losses['sam'] = compute_sam_loss(original, reconstructed)
+            
+            if torch.isnan(losses['sam']):
+                logger.debug("[NaN DEBUG] SAM loss returned NaN")
+
+        # Spectral guidance loss (copied from sophisticated adapter)
+        if reference_signature is not None:
+            # Compute mean spectrum over leaf pixels for guidance
+            if mask is not None:
+                # Use original mask shape (B, 1, H, W) for summing
+                original_mask = mask[:, :1, :, :]  # Take first channel of expanded mask
+                mask_sum = original_mask.sum(dim=(2, 3), keepdim=False)  # (B, 1)
+                recon_sum = (reconstructed * mask).sum(dim=(2, 3))  # (B, 5)
+                recon_mean_spectrum = recon_sum / (mask_sum + 1e-8)  # (B, 5)
+            else:
+                recon_mean_spectrum = reconstructed.mean(dim=(2, 3))  # (B, 5)
+            
+            # Ensure reference_signature is on the same device and has correct shape
+            if reference_signature.device != reconstructed.device:
+                reference_signature = reference_signature.to(reconstructed.device)
+            
+            # Expand reference to match batch size: (5,) -> (B, 5)
+            if reference_signature.dim() == 1:
+                reference_signature = reference_signature.unsqueeze(0).expand(reconstructed.shape[0], -1)
+            
+            # Compute guidance loss (MSE between mean reconstructed spectrum and reference)
+            spectral_guidance_loss = F.mse_loss(recon_mean_spectrum, reference_signature)
+            losses['spectral_guidance'] = spectral_guidance_loss
+            
+            # Log spectral guidance info
+            logger.debug(f"[Spectral Guidance] Recon mean: {recon_mean_spectrum.mean(0).cpu().numpy()}")
+            logger.debug(f"[Spectral Guidance] Reference: {reference_signature.mean(0).cpu().numpy()}")
+            logger.debug(f"[Spectral Guidance] Loss: {spectral_guidance_loss.item():.6f}")
+
+        # Total loss computation
+        total_loss = losses['mse']
+        
+        # Add SAM loss if enabled
+        if self.use_sam_loss and 'sam' in losses:
+            total_loss = total_loss + 0.1 * losses['sam']  # Weight SAM loss
+        
+        # Add spectral guidance loss if available
+        if reference_signature is not None and 'spectral_guidance' in losses:
+            total_loss = total_loss + self.spectral_guidance_weight * losses['spectral_guidance']
+        
+        losses['total_loss'] = total_loss
+        
         return losses
 
     @apply_forward_hook
@@ -309,9 +442,10 @@ class AutoencoderMSBenchmark(AutoencoderKL):
         return_dict: bool = True,
         generator: Optional[torch.Generator] = None,
         mask: Optional[torch.Tensor] = None,
+        reference_signature: Optional[torch.Tensor] = None,
     ) -> Union[DecoderOutput, torch.Tensor, Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """
-        Forward pass with minimal 5-channel processing.
+        Forward pass with minimal 5-channel processing, SAM loss, and spectral guidance.
         
         If training mode and mask is provided, returns (reconstruction, losses).
         Otherwise returns reconstruction only.
@@ -324,9 +458,9 @@ class AutoencoderMSBenchmark(AutoencoderKL):
             z = posterior.mode()
         dec = self.decode(z).sample
 
-        # Training mode with mask support
+        # Training mode with loss computation
         if self.training and mask is not None:
-            losses = self.compute_losses(x, dec, mask)
+            losses = self.compute_losses(x, dec, mask, reference_signature)
             return dec, losses
         
         # Inference mode

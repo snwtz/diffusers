@@ -178,7 +178,8 @@ import numpy as np  # Ensure numpy is imported
 from skimage.metrics import structural_similarity as ssim
 import time # Added for timing
 
-# from diffusers import AutoencoderKLMultispectralAdapter  # <-- Commented out sophisticated VAE
+"""ATTENTION ---------------------------------------------"""
+# from diffusers import AutoencoderKLMultispectralAdapter  
 from diffusers.models.autoencoders.autoencoder_ms_benchmark import AutoencoderMSBenchmark as AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
@@ -857,6 +858,7 @@ def train(args: argparse.Namespace) -> None:
             backbone_in_channels=3, # Refactored: backbone input channels
             backbone_out_channels=3, # Refactored: backbone output channels
             use_saturation_penalty=args.use_saturation_penalty,
+            spectral_guidance_weight=args.spectral_guidance_weight,
         )
         logger.info("Successfully loaded base model")
         
@@ -907,6 +909,8 @@ def train(args: argparse.Namespace) -> None:
             0.31,   # Band 3 (730.635 nm): mean of 0.26–0.36
             0.325   # Band 4 (850.59 nm): mean of 0.26–0.39
         ], dtype=torch.float32)
+    # Normalize reference signature to [-1, 1] for model compatibility
+    reference_signature = reference_signature * 2 - 1
     reference_signature = reference_signature.to(device)
 
     # Log parameter counts before training
@@ -1460,6 +1464,7 @@ def main():
     help="Weight for spectral signature guidance loss")
     parser.add_argument("--reference_signature_path", type=str, default=None,
     help="Path to .npy file containing reference spectral signature (5-element array)")
+    parser.add_argument("--spectral_guidance_weight", type=float, default=0.1, help="Weight for spectral signature guidance loss (default: 0.1)")
 
     args = parser.parse_args()
 

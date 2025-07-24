@@ -317,13 +317,18 @@ class MultispectralDataset(Dataset):
         self.use_cache = use_cache
         self.return_mask = return_mask
         self.prompt = prompt
-        self.image_paths = [
-            os.path.join(data_root, f) for f in os.listdir(data_root)
-            if f.lower().endswith('.tiff') or f.lower().endswith('.tif')
-        ]
+        # If data_root is a .txt file, load image paths from it; else treat as directory
+        if data_root.lower().endswith('.txt'):
+            with open(data_root, 'r') as f:
+                self.image_paths = [line.strip() for line in f if line.strip()]
+        else:
+            self.image_paths = [
+                os.path.join(data_root, f) for f in os.listdir(data_root)
+                if f.lower().endswith('.tiff') or f.lower().endswith('.tif')
+            ]
         if not self.image_paths:
             raise FileNotFoundError(
-                f"No TIFF files found in {data_root}. Please ensure the directory contains .tiff or .tif files with at least 55 spectral bands."
+                f"No TIFF files found in {data_root}. Please ensure the directory contains .tiff or .tif files with at least 55 spectral bands, or provide a .txt file list."
             )
         self.cache = {} if use_cache else None
     def __getitem__(self, idx: int):

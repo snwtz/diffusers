@@ -373,6 +373,7 @@ from multispectral_dataloader import create_multispectral_dataloader
 # Import for logging setup
 import transformers
 import diffusers
+import json
 
 if is_wandb_available():
     import wandb
@@ -387,6 +388,20 @@ def create_dreambooth_logger(output_dir, model_name, vae):
     # Use the comprehensive DreamBooth logger from dreambooth_logger.py
     from dreambooth_logger import create_dreambooth_logger as create_comprehensive_logger
     return create_comprehensive_logger(output_dir, model_name, vae)
+
+def write_model_index_json(output_dir, pipeline_class="StableDiffusion3Pipeline"):
+    model_index = {
+        "_class_name": pipeline_class,
+        "_diffusers_version": "0.25.0",
+        "transformer": ["transformer"],
+        "vae": ["vae"],
+        "text_encoder": ["text_encoder"],
+        "text_encoder_2": ["text_encoder_2"],
+        "text_encoder_3": ["text_encoder_3"],
+        "scheduler": ["scheduler"]
+    }
+    with open(os.path.join(output_dir, "model_index.json"), "w") as f:
+        json.dump(model_index, f, indent=2)
 
 def load_text_encoders(args):
     """Load the three text encoders for SD3."""
@@ -1976,6 +1991,7 @@ def main(args):
                         try:
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
+                            write_model_index_json(save_path)
                         except Exception as e:
                             logger.error(f"Could not save accelerator state to {save_path}: {e}")
 
@@ -2056,15 +2072,41 @@ def main(args):
                                         }
                                         for l, t, m, r, c in zip(latents, targets, mask, decoded_imgs, decoded_imgs_clamped)
                                     ]
-                                # Log validation images and metrics using logger
+
+                                    # Save validation images as PNG and log to wandb if available
+                                    from PIL import Image
+                                    import numpy as np
+                                    val_images_pil = []
+                                    for i, v in enumerate(validation_data):
+                                        # Use decoded_clamped for visualization
+                                        img = v["decoded_clamped"]
+                                        # Convert to (C, H, W) numpy, then to (H, W, C) and scale to 0-255
+                                        arr = (img.detach().cpu().numpy()[:3] + 1) / 2  # Use first 3 channels for RGB
+                                        arr = np.clip(arr, 0, 1)
+                                        arr = (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
+                                        pil_img = Image.fromarray(arr)
+                                        val_images_pil.append(pil_img)
+                                        # Save as PNG
+                                        val_img_path = os.path.join(args.output_dir, f"validation_epoch{global_step}_img{i}.png")
+                                        pil_img.save(val_img_path)
+
+                                    # Log to wandb if available
+                                    try:
+                                        import wandb
+                                        if wandb.run is not None:
+                                            wandb_images = [wandb.Image(img, caption=f"val_{global_step}_{i}") for i, img in enumerate(val_images_pil)]
+                                            wandb.log({"validation_images": wandb_images}, step=global_step)
+                                    except Exception as e:
+                                        logger.warning(f"wandb logging failed: {e}")
+
+                                # Log validation with comprehensive spectral metrics
                                 val_metrics = {"val_loss": loss.detach().item()}
                                 val_mse_per_channel = None
                                 if "losses" in locals():
                                     val_mse_per_channel = losses.get("mse_per_channel", None)
-                                # Log validation with comprehensive spectral metrics
                                 dreambooth_logger.log_validation(
                                     epoch=global_step,
-                                    images=validation_data,
+                                    images=val_images_pil,
                                     prompt=args.validation_prompt,
                                     validation_metrics=val_metrics,
                                     mse_per_channel=val_mse_per_channel
@@ -2111,6 +2153,7 @@ def main(args):
                 try:
                     accelerator.save_state(checkpoint_path)
                     logger.info(f"Checkpoint saved to: {checkpoint_path}")
+                    write_model_index_json(checkpoint_path)
                 except Exception as e:
                     logger.error(f"Could not save checkpoint to {checkpoint_path}: {e}")
             
@@ -2187,6 +2230,7 @@ def main(args):
                     args.pretrained_model_name_or_path, transformer=transformer
                 )
             pipeline.save_pretrained(args.output_dir)
+            write_model_index_json(args.output_dir)
             logger.info(f"Final model saved to: {args.output_dir}")
         except Exception as e:
             logger.error(f"Could not save final model to {args.output_dir}: {e}")
