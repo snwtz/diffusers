@@ -206,7 +206,7 @@ def preprocess_multispectral_image(
     - Band selection
     - NaN (background) handling
     - Per-band normalization
-    - Per-band mean fill for NaNs
+    - NaN set to 0.0 (not per-band mean fill)
     - Padding to square
     - Resizing
     - Mask generation (1=leaf, 0=background)
@@ -227,9 +227,6 @@ def preprocess_multispectral_image(
             normalized_image = np.zeros_like(image)
             for i in range(image.shape[0]):
                 band = image[i]
-                nan_mask = np.isnan(band)
-                mean_val = np.nanmean(band)
-                band[nan_mask] = mean_val
                 # Per-channel normalization to [-1, 1] (valid pixels only)
                 valid_mask = ~np.isnan(band)
                 if not np.any(valid_mask):
@@ -247,9 +244,8 @@ def preprocess_multispectral_image(
                         norm = (band - min_val) / (max_val - min_val)
                         normalized_image[i] = 2 * norm - 1
             image_tensor = torch.from_numpy(normalized_image)
+            # Set all NaNs to 0.0 (nan=0 policy)
             if torch.isnan(image_tensor).any():
-                if logger:
-                    logger.info(f"[Sanitize] Replacing NaNs in input tensor with 0.0 to avoid propagation into model.")
                 image_tensor = torch.nan_to_num(image_tensor, nan=0.0)
             # Compute fill_value as mean of valid (foreground) pixels per band for padding
             foreground_mask = torch.from_numpy(leaf_mask).unsqueeze(0).bool()  # (1, H, W)
@@ -304,12 +300,13 @@ class MultispectralDataset(Dataset):
     REQUIRED_BANDS = [9, 18, 32, 42, 55]  # 1-based indices for rasterio.read
     def __init__(
         self,
-        data_root: str,
+        data_root: str = None,
         resolution: int = 512,
         transform: Optional[transforms.Compose] = None,
         use_cache: bool = True,
         return_mask: bool = True,  # Always True for DreamBooth
         prompt: str = "sks leaf",
+        file_list_path: str = None,  # New: path to .txt file listing image paths
     ):
         self.data_root = data_root
         self.resolution = resolution
@@ -317,13 +314,18 @@ class MultispectralDataset(Dataset):
         self.use_cache = use_cache
         self.return_mask = return_mask
         self.prompt = prompt
-        self.image_paths = [
-            os.path.join(data_root, f) for f in os.listdir(data_root)
-            if f.lower().endswith('.tiff') or f.lower().endswith('.tif')
-        ]
+        # If file_list_path is provided, use it to load image paths
+        if file_list_path is not None:
+            with open(file_list_path, 'r') as f:
+                self.image_paths = [line.strip() for line in f.readlines() if line.strip()]
+        else:
+            self.image_paths = [
+                os.path.join(data_root, f) for f in os.listdir(data_root)
+                if f.lower().endswith('.tiff') or f.lower().endswith('.tif')
+            ]
         if not self.image_paths:
             raise FileNotFoundError(
-                f"No TIFF files found in {data_root}. Please ensure the directory contains .tiff or .tif files with at least 55 spectral bands."
+                f"No TIFF files found in {data_root if data_root else file_list_path}. Please ensure the directory or file list contains .tiff or .tif files with at least 55 spectral bands."
             )
         self.cache = {} if use_cache else None
     def __getitem__(self, idx: int):
@@ -389,7 +391,7 @@ def multispectral_collate_fn(batch, prompt=None):
     return batch_dict
 
 def create_multispectral_dataloader(
-    data_root: str,
+    data_root: str = None,
     batch_size: int = 4,
     resolution: int = 512,
     num_workers: int = 4,
@@ -398,15 +400,12 @@ def create_multispectral_dataloader(
     persistent_workers: bool = True,
     return_mask: bool = False,  # New flag
     prompt: str = "sks leaf",  # Default prompt
+    file_list_path: str = None,  # New: path to .txt file listing image paths
 ) -> DataLoader:
     """
     Create a DataLoader for multispectral images with optimized settings.
     Returns batches as dictionaries with pixel_values, mask (optional), and prompts.
-    
-    Channel Configuration:
-    - Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
-    - Output: pixel_values tensor of shape (B, 5, 512, 512) normalized to [-1, 1]
-    - VAE Processing: 5-channel input → 16-channel latent (SD3's default expectation)
+    Now supports loading from a .txt file listing image paths (file_list_path) or from a directory (data_root).
     """
     dataset = MultispectralDataset(
         data_root=data_root,
@@ -414,6 +413,7 @@ def create_multispectral_dataloader(
         use_cache=use_cache,
         return_mask=return_mask,
         prompt=prompt, # Pass the prompt to the dataset
+        file_list_path=file_list_path, # New
     )
     
     # Only use prefetch_factor if num_workers > 0

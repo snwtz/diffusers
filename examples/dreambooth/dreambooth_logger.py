@@ -61,6 +61,7 @@ from typing import Dict, Any, Optional, List
 import torch
 import numpy as np
 from pathlib import Path
+import math
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -167,8 +168,8 @@ JSON File: {self.json_file}
         with open(self.json_file, 'w') as f:
             json.dump(self.log_data, f, indent=2)
 
-    def log_step(self, step: int, epoch: int, loss: float, learning_rate: float, grad_norm: Optional[float] = None, mse_per_channel: Optional[Any] = None):
-        """Log step-level metrics, including per-channel MSE if provided."""
+    def log_step(self, step: int, epoch: int, loss: float, learning_rate: float, grad_norm: Optional[float] = None, mse_per_channel: Optional[Any] = None, sam_loss: Optional[float] = None, mse_per_channel_global: Optional[Any] = None, sam_loss_global: Optional[float] = None):
+        """Log step-level metrics, including per-channel MSE and SAM loss (both mask-only and global if provided)."""
         step_data = {
             "step": step,
             "epoch": epoch,
@@ -177,12 +178,26 @@ JSON File: {self.json_file}
             "learning_rate": learning_rate,
             "grad_norm": grad_norm,
         }
-        # Handle per-channel MSE
+        # Handle per-channel MSE (mask-only)
         if mse_per_channel is not None:
             if hasattr(mse_per_channel, 'detach'):
                 mse_per_channel = mse_per_channel.detach().cpu().tolist()
             for idx, val in enumerate(mse_per_channel):
-                step_data[f"mse_channel_{idx}"] = float(val)
+                step_data[f"mse_channel_{idx}_mask"] = float(val)
+        # Handle per-channel MSE (global)
+        if mse_per_channel_global is not None:
+            if hasattr(mse_per_channel_global, 'detach'):
+                mse_per_channel_global = mse_per_channel_global.detach().cpu().tolist()
+            for idx, val in enumerate(mse_per_channel_global):
+                step_data[f"mse_channel_{idx}_global"] = float(val)
+        # Handle SAM loss (mask-only)
+        if sam_loss is not None:
+            step_data["sam_loss_rad_mask"] = float(sam_loss)
+            step_data["sam_loss_deg_mask"] = float(sam_loss * 180.0 / math.pi)
+        # Handle SAM loss (global)
+        if sam_loss_global is not None:
+            step_data["sam_loss_rad_global"] = float(sam_loss_global)
+            step_data["sam_loss_deg_global"] = float(sam_loss_global * 180.0 / math.pi)
         self.log_data["steps"].append(step_data)
         self._check_alert_thresholds(step_data, step, mode="step")
         # Write to text file every 100 steps
@@ -248,8 +263,8 @@ JSON File: {self.json_file}
         with open(self.log_file, 'a') as f:
             f.write(line + "\n")
 
-    def log_validation(self, epoch: int, images: List[Any], prompt: str, validation_metrics: Dict[str, Any], mse_per_channel: Optional[Any] = None):
-        """Log validation results, including images and per-channel MSE."""
+    def log_validation(self, epoch: int, images: List[Any], prompt: str, validation_metrics: Dict[str, Any], mse_per_channel: Optional[Any] = None, sam_loss: Optional[float] = None, mse_per_channel_global: Optional[Any] = None, sam_loss_global: Optional[float] = None):
+        """Log validation results, including images, per-channel MSE, and SAM loss (both mask-only and global if provided)."""
         validation_data = {
             "epoch": epoch,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -257,12 +272,26 @@ JSON File: {self.json_file}
             "num_images": len(images),
             "validation_metrics": validation_metrics,
         }
-        # Handle per-channel MSE
+        # Handle per-channel MSE (mask-only)
         if mse_per_channel is not None:
             if hasattr(mse_per_channel, 'detach'):
                 mse_per_channel = mse_per_channel.detach().cpu().tolist()
             for idx, val in enumerate(mse_per_channel):
-                validation_data[f"mse_channel_{idx}"] = float(val)
+                validation_data[f"mse_channel_{idx}_mask"] = float(val)
+        # Handle per-channel MSE (global)
+        if mse_per_channel_global is not None:
+            if hasattr(mse_per_channel_global, 'detach'):
+                mse_per_channel_global = mse_per_channel_global.detach().cpu().tolist()
+            for idx, val in enumerate(mse_per_channel_global):
+                validation_data[f"mse_channel_{idx}_global"] = float(val)
+        # Handle SAM loss (mask-only)
+        if sam_loss is not None:
+            validation_data["sam_loss_rad_mask"] = float(sam_loss)
+            validation_data["sam_loss_deg_mask"] = float(sam_loss * 180.0 / math.pi)
+        # Handle SAM loss (global)
+        if sam_loss_global is not None:
+            validation_data["sam_loss_rad_global"] = float(sam_loss_global)
+            validation_data["sam_loss_deg_global"] = float(sam_loss_global * 180.0 / math.pi)
         self.log_data["validations"].append(validation_data)
         # Save validation images
         validation_dir = self.log_dir / "validation_images"
@@ -292,15 +321,24 @@ JSON File: {self.json_file}
                 for k, v in range_stats_clamped.items():
                     validation_data["validation_metrics"][f"range_clamped/{k}"] = v
 
-                # Compute per-band SSIM
+                # Compute per-band SSIM (mask-only)
                 if SSIM_AVAILABLE:
-                    ssim_per_band = compute_per_band_ssim(decoded_imgs, val_images, val_mask)
-                    for i, score in enumerate(ssim_per_band):
-                        validation_data["validation_metrics"][f"ssim_channel_{i}"] = score
+                    ssim_per_band_mask = compute_per_band_ssim(decoded_imgs, val_images, val_mask)
+                    for i, score in enumerate(ssim_per_band_mask):
+                        validation_data["validation_metrics"][f"ssim_channel_{i}_mask"] = score
                 else:
-                    # Fallback when SSIM is not available
                     for i in range(decoded_imgs.shape[1]):
-                        validation_data["validation_metrics"][f"ssim_channel_{i}"] = 0.0
+                        validation_data["validation_metrics"][f"ssim_channel_{i}_mask"] = 0.0
+
+                # Compute per-band SSIM (global)
+                if SSIM_AVAILABLE:
+                    ones_mask = torch.ones_like(val_mask)
+                    ssim_per_band_global = compute_per_band_ssim(decoded_imgs, val_images, ones_mask)
+                    for i, score in enumerate(ssim_per_band_global):
+                        validation_data["validation_metrics"][f"ssim_channel_{i}_global"] = score
+                else:
+                    for i in range(decoded_imgs.shape[1]):
+                        validation_data["validation_metrics"][f"ssim_channel_{i}_global"] = 0.0
 
                 # Optionally compute latent stats (if available)
                 if "latent" in images[0]:
@@ -309,29 +347,42 @@ JSON File: {self.json_file}
                     for k, v in latent_stats.items():
                         validation_data["validation_metrics"][f"latent/{k}"] = v
 
-                # Compute SAM on all 5 channels
+                # Compute SAM on all 5 channels (mask-only)
                 pred_vectors = decoded_imgs.permute(0, 2, 3, 1).reshape(-1, 5)
                 gt_vectors = val_images.permute(0, 2, 3, 1).reshape(-1, 5)
                 mask_flat = val_mask.reshape(-1)
                 valid = mask_flat > 0
-                pred_vectors = pred_vectors[valid]
-                gt_vectors = gt_vectors[valid]
+                pred_vectors_mask = pred_vectors[valid]
+                gt_vectors_mask = gt_vectors[valid]
+                cos_sim_mask = torch.nn.functional.cosine_similarity(pred_vectors_mask, gt_vectors_mask, dim=1, eps=1e-8)
+                cos_sim_mask = cos_sim_mask.clamp(-1.0, 1.0)
+                angles_mask = torch.acos(cos_sim_mask)
+                sam_score_mask = angles_mask.mean().item()
+                validation_data["validation_metrics"]["SAM_mask"] = sam_score_mask
 
-                cos_sim = torch.nn.functional.cosine_similarity(pred_vectors, gt_vectors, dim=1, eps=1e-8)
-                cos_sim = cos_sim.clamp(-1.0, 1.0)
-                angles = torch.acos(cos_sim)
-                sam_score = angles.mean().item()
-                validation_data["validation_metrics"]["SAM"] = sam_score
+                # Compute SAM on all 5 channels (global)
+                cos_sim_global = torch.nn.functional.cosine_similarity(pred_vectors, gt_vectors, dim=1, eps=1e-8)
+                cos_sim_global = cos_sim_global.clamp(-1.0, 1.0)
+                angles_global = torch.acos(cos_sim_global)
+                sam_score_global = angles_global.mean().item()
+                validation_data["validation_metrics"]["SAM_global"] = sam_score_global
 
-                # Per-channel masked MSE logging
+                # Per-channel masked MSE logging (mask-only)
                 diff = decoded_imgs - val_images
                 mask_exp = val_mask.expand_as(diff)
                 diff_masked = diff * mask_exp
-                mse_num = (diff_masked ** 2).flatten(2).sum(dim=2)
-                valid_pixels = mask_exp.flatten(2).sum(dim=2)
-                channel_mse = (mse_num / (valid_pixels + 1e-8)).mean(dim=0)
-                for idx, val in enumerate(channel_mse):
-                    validation_data[f"mse_channel_{idx}"] = float(val)
+                mse_num_mask = (diff_masked ** 2).flatten(2).sum(dim=2)
+                valid_pixels_mask = mask_exp.flatten(2).sum(dim=2)
+                channel_mse_mask = (mse_num_mask / (valid_pixels_mask + 1e-8)).mean(dim=0)
+                for idx, val in enumerate(channel_mse_mask):
+                    validation_data[f"mse_channel_{idx}_mask"] = float(val)
+
+                # Per-channel global MSE logging
+                mse_num_global = (diff ** 2).flatten(2).sum(dim=2)
+                valid_pixels_global = torch.ones_like(mask_exp).flatten(2).sum(dim=2)
+                channel_mse_global = (mse_num_global / (valid_pixels_global + 1e-8)).mean(dim=0)
+                for idx, val in enumerate(channel_mse_global):
+                    validation_data[f"mse_channel_{idx}_global"] = float(val)
 
                 # Visualize clamped vs raw output in wandb
                 if WANDB_AVAILABLE and wandb.run:
@@ -345,11 +396,15 @@ JSON File: {self.json_file}
                     wandb.log({"val/raw_vs_clamped_outputs": wandb_images}, step=epoch)
             except Exception as e:
                 self.log_warning(f"VAE metric computation failed: {e}")
-                sam_score = None
-                channel_mse = None
+                sam_score_mask = None
+                channel_mse_mask = None
+                sam_score_global = None
+                channel_mse_global = None
         else:
-            sam_score = None
-            channel_mse = None
+            sam_score_mask = None
+            channel_mse_mask = None
+            sam_score_global = None
+            channel_mse_global = None
 
         # Write validation summary
         self._write_validation_summary(validation_data)
@@ -359,20 +414,24 @@ JSON File: {self.json_file}
             json.dump(self.log_data, f, indent=2)
         # Log to wandb
         if WANDB_AVAILABLE and wandb.run:
-            wandb_images = [wandb.Image(image, caption=f"{i}: {prompt}") for i, image in enumerate(images)]
-            wandb_log = {"validation_images": wandb_images}
+            wandb_log = {}
             # Add per-channel MSE and metrics
-            if channel_mse is not None:
-                for idx, val in enumerate(channel_mse):
-                    wandb_log[f"val/mse_channel_{idx}"] = float(val)
+            if channel_mse_mask is not None:
+                for idx, val in enumerate(channel_mse_mask):
+                    wandb_log[f"val/mse_channel_{idx}_mask"] = float(val)
+                for idx, val in enumerate(channel_mse_global):
+                    wandb_log[f"val/mse_channel_{idx}_global"] = float(val)
             elif mse_per_channel is not None:
                 for idx, val in enumerate(mse_per_channel or []):
-                    wandb_log[f"val/mse_channel_{idx}"] = float(val)
+                    wandb_log[f"val/mse_channel_{idx}_mask"] = float(val)
+                for idx, val in enumerate(mse_per_channel_global or []):
+                    wandb_log[f"val/mse_channel_{idx}_global"] = float(val)
             # Add all validation metrics (including range, SSIM, latent, SAM)
             for k, v in validation_data["validation_metrics"].items():
                 wandb_log[f"val/{k}"] = v
-            if sam_score is not None:
-                wandb_log["val/SAM"] = sam_score
+            if sam_score_mask is not None:
+                wandb_log["val/SAM_mask"] = sam_score_mask
+                wandb_log["val/SAM_global"] = sam_score_global
             wandb.log(wandb_log, step=epoch)
 
     def _check_alert_thresholds(self, metrics: Dict[str, float], step_or_epoch: int, mode: str = "step"):

@@ -373,6 +373,7 @@ from multispectral_dataloader import create_multispectral_dataloader
 # Import for logging setup
 import transformers
 import diffusers
+import json
 
 if is_wandb_available():
     import wandb
@@ -985,6 +986,23 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    parser.add_argument(
+        "--spectral_signature_weight",
+        type=float,
+        default=0.1,
+        help="Weight for spectral signature guidance loss",
+    )
+    parser.add_argument(
+        "--use_sam_loss",
+        action="store_true",
+        help="Whether to include masked SAM loss in the total loss."
+    )
+    parser.add_argument(
+        "--sam_weight",
+        type=float,
+        default=1.0,
+        help="Weight for the masked SAM loss term."
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -1755,7 +1773,9 @@ def main(args):
                 # Multispectral data: 5-channel input (bands 9, 18, 32, 42, 55) instead of 3-channel RGB
                 # FIXED: Use vae.dtype (fp32) for pixel_values, following original DreamBooth SD3 pattern
                 # This ensures VAE input is in fp32, then we convert model_input to weight_dtype after encoding
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)  # vae.dtype is fp32
+                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)  # (B, 5, H, W)
+                mask = batch["mask"].to(dtype=vae.dtype)  # (B, 1, H, W)
+
                 prompts = batch["prompts"]
 
                 # encode batch prompts when custom prompts are provided for each image
@@ -1764,9 +1784,7 @@ def main(args):
                     tokens_two = tokenize_prompt(tokenizer_two, prompts)
                     tokens_three = tokenize_prompt(tokenizer_three, prompts)
 
-                # Convert images to latent space using multispectral VAE
-                # Input: (B, 5, H, W) multispectral data -> Output: (B, 16, H/8, W/8) latent representation
-                # The multispectral VAE preserves spectral information in the latent space
+                # Convert images+mask to latent space using multispectral VAE
                 model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
@@ -1833,7 +1851,7 @@ def main(args):
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # --- Masked MSE: focus loss on leaf region only (background zeroed) ---
+                # --- MSE: compute over the entire image (no masking) ---
                 if args.precondition_outputs:
                     target = model_input
                 else:
@@ -1844,33 +1862,15 @@ def main(args):
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
 
-                    # Compute prior loss (masked MSE over class images)
-                    mask_prior = batch["mask"].to(model_pred_prior.device)
-                    mask_prior_resized = torch.nn.functional.interpolate(
-                        mask_prior, size=model_pred_prior.shape[-2:], mode="nearest"
-                    )
+                    # Compute prior loss (MSE over class images, no masking)
                     loss_map_prior = (model_pred_prior.float() - target_prior.float()) ** 2
-                    masked_loss_per_sample_prior = (
-                        (loss_map_prior * mask_prior_resized).reshape(loss_map_prior.size(0), -1).sum(dim=1)
-                        / mask_prior_resized.reshape(mask_prior_resized.size(0), -1).sum(dim=1)
-                    )
-                    prior_loss = masked_loss_per_sample_prior.mean()
+                    loss_per_sample_prior = loss_map_prior.reshape(loss_map_prior.size(0), -1).mean(dim=1)
+                    prior_loss = loss_per_sample_prior.mean()
 
-                # Masked MSE over instance images: zero out background to focus loss on leaf
-                mask = batch["mask"].to(model_pred.device)  # shape (B,1,H,W)
-                # Resize mask to match model_pred spatial dims
-                mask_resized = torch.nn.functional.interpolate(
-                    mask, size=model_pred.shape[-2:], mode="nearest"
-                )
-                # Compute per-pixel MSE map
+                # MSE over instance images (no masking)
                 loss_map = (model_pred.float() - target.float()) ** 2  # (B,C,H',W')
-                
-                # Apply mask (broadcasting over channels)
-                masked_loss_per_sample = (
-                    (loss_map * mask_resized).reshape(loss_map.size(0), -1).sum(dim=1)
-                    / mask_resized.reshape(mask_resized.size(0), -1).sum(dim=1)
-                )
-                loss = masked_loss_per_sample.mean()
+                loss_per_sample = loss_map.reshape(loss_map.size(0), -1).mean(dim=1)
+                loss = loss_per_sample.mean()
 
                 # Compute per-channel MSE for multispectral analysis from INPUT channels (5 channels)
                 # This gives us the MSE for each of the 5 spectral bands
@@ -1888,6 +1888,58 @@ def main(args):
                 if args.with_prior_preservation:
                     # Add the prior loss to the instance loss
                     loss = loss + args.prior_loss_weight * prior_loss
+
+                # Load and normalize reference spectral signature
+                device = accelerator.device if hasattr(accelerator, 'device') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+                reference_signature = torch.tensor([
+                        0.055,  # Band 0 (474.73 nm)
+                        0.12,   # Band 1 (538.71 nm)
+                        0.05,   # Band 2 (650.665 nm)
+                        0.31,   # Band 3 (730.635 nm)
+                        0.325   # Band 4 (850.59 nm)
+                    ], dtype=torch.float32)
+                # Linearly transform from [0, 1] to [-1, 1]
+                reference_signature = 2 * reference_signature - 1
+                reference_signature = reference_signature.to(device)
+
+                # After decoding the current latents back to input space for comparison
+                with torch.no_grad():
+                    decoded_input = vae.decode(model_input).sample
+                # --- Spectral signature loss is computed across the whole image (no masking) ---
+                # Compute mean spectrum across all pixels
+                # recon_mean_spectrum = decoded_input.mean(dim=(0, 2, 3))
+                # spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
+                # Add to total loss
+                # loss = loss + args.spectral_signature_weight * spectral_signature_loss
+                # Store for epoch logging
+                # spectral_signature_loss_epoch = spectral_signature_loss.detach().cpu().item()
+                # recon_mean_spectrum_epoch = recon_mean_spectrum.detach().cpu().numpy()
+                # Optionally log
+                # if accelerator.sync_gradients and global_step % args.log_steps == 0:
+                #     logger.info(f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
+                #     logger.info(f"Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
+                #     logger.info(f"Spectral signature loss: {spectral_signature_loss.item():.6f}")
+
+                # SAM loss: compute across the whole image (no masking)
+                # with torch.no_grad():
+                #     decoded_input = vae.decode(model_input).sample
+                # # Flatten batch and spatial dims for all pixels
+                # B, C, H, W = decoded_input.shape
+                # flat_decoded = decoded_input.permute(0, 2, 3, 1).reshape(-1, C)  # (B*H*W, 5)
+                # flat_target = pixel_values.permute(0, 2, 3, 1).reshape(-1, C)    # (B*H*W, 5)
+                # # Compute SAM per pixel
+                # dot = (flat_decoded * flat_target).sum(dim=1)
+                # pred_norm = flat_decoded.norm(dim=1)
+                # target_norm = flat_target.norm(dim=1)
+                # eps = 1e-8
+                # cos_sim = dot / (pred_norm * target_norm + eps)
+                # cos_sim = cos_sim.clamp(-1.0, 1.0)
+                # angles = torch.acos(cos_sim)
+                # sam_loss = angles.mean()
+                # # Add SAM loss to total loss (optionally weighted)
+                # sam_loss_weight = getattr(args, 'sam_loss_weight', 1.0)
+                # loss = loss + sam_loss_weight * sam_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1937,7 +1989,7 @@ def main(args):
                         if getattr(args, "use_wandb", False):
                             import wandb
                             wandb.log(latent_stats, step=global_step)
-                        # Log to DreamBooth logger with comprehensive metrics
+                        # Log to DreamBooth logger
                         dreambooth_logger.log_step(
                             step=global_step, 
                             epoch=epoch,
@@ -2010,75 +2062,6 @@ def main(args):
                             except Exception as e:
                                 logger.error(f"Could not save pipeline to {pipeline_save_path}: {e}")
 
-                    # Run validation and log images every 100 steps
-                    if args.validation_prompt is not None and global_step % 100 == 0:
-                        skip_val_pipeline = False
-                        if not args.train_text_encoder:
-                            try:
-                                text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                                text_encoder_one.to(weight_dtype)
-                                text_encoder_two.to(weight_dtype)
-                                text_encoder_three.to(weight_dtype)
-                            except Exception as e:
-                                logger.error(f"Could not load text encoders for validation pipeline: {e}")
-                                skip_val_pipeline = True
-                        if not skip_val_pipeline:
-                            try:
-                                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                                    args.pretrained_model_name_or_path,
-                                    vae=vae,
-                                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                                    transformer=accelerator.unwrap_model(transformer),
-                                    revision=args.revision,
-                                    variant=args.variant,
-                                    torch_dtype=weight_dtype,
-                                )
-                                pipeline_args = {"prompt": args.validation_prompt}
-                                # --- DREAMBOOTH VALIDATION STEP: decode latents and log both raw and clamped outputs ---
-                                with torch.no_grad():
-                                    # Use the current batch latents for validation (example, or use generated latents)
-                                    latents = vae.encode(pixel_values).latent_dist.sample()
-                                    targets = pixel_values
-                                    mask = batch["mask"]
-                                    decoded_imgs = vae.decode(latents).sample
-                                    decoded_imgs_clamped = torch.clamp(decoded_imgs, -1.0, 1.0)  # Create clamped version
-
-                                    # Prepare logging data with both raw and clamped decoded outputs
-                                    validation_data = [
-                                        {
-                                            "latent": l,
-                                            "target": t,
-                                            "mask": m,
-                                            "decoded_raw": r,
-                                            "decoded_clamped": c
-                                        }
-                                        for l, t, m, r, c in zip(latents, targets, mask, decoded_imgs, decoded_imgs_clamped)
-                                    ]
-                                # Log validation images and metrics using logger
-                                val_metrics = {"val_loss": loss.detach().item()}
-                                val_mse_per_channel = None
-                                if "losses" in locals():
-                                    val_mse_per_channel = losses.get("mse_per_channel", None)
-                                # Log validation with comprehensive spectral metrics
-                                dreambooth_logger.log_validation(
-                                    epoch=global_step,
-                                    images=validation_data,
-                                    prompt=args.validation_prompt,
-                                    validation_metrics=val_metrics,
-                                    mse_per_channel=val_mse_per_channel
-                                )
-                                logger.info(f"Validation pipeline and logging succeeded at step {global_step}")
-                            except Exception as e:
-                                logger.error(f"Could not run validation pipeline or log validation at step {global_step}: {e}")
-                        if not args.train_text_encoder:
-                            try:
-                                del text_encoder_one, text_encoder_two, text_encoder_three
-                                free_memory()
-                            except Exception as e:
-                                logger.warning(f"Could not free text encoder memory: {e}")
-
             logs = {"loss": loss.detach().item()}
             # Step-level logging every `log_steps`
             if global_step % args.log_steps == 0 and grad_norm is not None:
@@ -2113,58 +2096,6 @@ def main(args):
                     logger.info(f"Checkpoint saved to: {checkpoint_path}")
                 except Exception as e:
                     logger.error(f"Could not save checkpoint to {checkpoint_path}: {e}")
-            
-            # --- VALIDATION DATA LOGGING FOR DREAMBOOTH LOGGER ---
-            if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                skip_val_pipeline = False
-                if not args.train_text_encoder:
-                    try:
-                        text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                        text_encoder_one.to(weight_dtype)
-                        text_encoder_two.to(weight_dtype)
-                        text_encoder_three.to(weight_dtype)
-                    except Exception as e:
-                        logger.error(f"Could not load text encoders for validation pipeline: {e}")
-                        skip_val_pipeline = True
-                if not skip_val_pipeline:
-                    try:
-                        pipeline = StableDiffusion3Pipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            vae=vae,
-                            text_encoder=accelerator.unwrap_model(text_encoder_one),
-                            text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                            text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                            transformer=accelerator.unwrap_model(transformer),
-                            revision=args.revision,
-                            variant=args.variant,
-                            torch_dtype=weight_dtype,
-                        )
-                        # --- Validation data: log latent, target, mask for logger ---
-                        try:
-                            val_batch = next(iter(train_dataloader))
-                            with torch.no_grad():
-                                inputs = val_batch["pixel_values"].to(accelerator.device)
-                                mask = val_batch["mask"].to(accelerator.device)
-                                targets = val_batch["target"].to(accelerator.device) if "target" in val_batch else inputs
-                                # Use the frozen VAE for encoding
-                                latents = vae.encode(inputs).latent_dist.sample()
-                                # Build validation data dicts
-                                val_data = [
-                                    {"latent": l, "target": t, "mask": m}
-                                    for l, t, m in zip(latents, targets, mask)
-                                ]
-                                # Log with DreamBooth logger
-                                dreambooth_logger.log_validation(
-                                    epoch=global_step,
-                                    images=val_data,
-                                    prompt=args.validation_prompt,
-                                    validation_metrics={"val_loss": loss.detach().item()}
-                                )
-                        except Exception as e:
-                            logger.warning(f"Could not log validation data for DreamBooth logger: {e}")
-                        logger.info(f"Validation pipeline and logging succeeded at epoch {epoch}")
-                    except Exception as e:
-                        logger.error(f"Could not run validation pipeline or log validation at epoch {epoch}: {e}")
 
     # Save the final model
     accelerator.wait_for_everyone()

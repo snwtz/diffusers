@@ -4,6 +4,7 @@ Multispectral VAE Adapter for Stable Diffusion 3: Core Methodological Contributi
 https://huggingface.co/docs/diffusers/v0.6.0/en/api/models
 https://huggingface.co/docs/diffusers/en/api/models/autoencoderkl
 
+
 This module implements the central methodological contribution of the thesis: a lightweight
 adapter-based multispectral autoencoder architecture built on a pretrained SD3 backbone.
 The design enables efficient processing of 5-channel spectral plant imagery while maintaining
@@ -19,17 +20,17 @@ Data Flow Summary:
 
 NOTE ON INPUT FORMAT:
 ---------------------
-This training script expects raw tensor input of shape (B, 5, H, W) during training. In contrast,
+This training script currently expects raw tensor input of shape (B, 5, H, W) during training. In contrast,
 standard SD3 inference pipelines typically expect `dict`-style conditioning input format, e.g. {"sample": x, "mask": y}.
 This discrepancy can impact integration with SD pipelines if later applying this model in generation tasks.
 Adjustments may be required for compatibility with diffusers pipelines or script-based inference.
 
-Thanks to working with a raw tensor, the model has direct control over the input format, 
-normalization, and masking, which is important for custom loss computation
-
-By using raw tensors the model/modules have direct control over the input format (e.g. The forward() and compute_losses() methods). 
-So it can apply masks, compute per-channel losses, and perform spectral operations efficiently. 
-By using tensors, the model avoids the overhead and ambiguity of dict-based inputs, which can vary between pipelines and tasks.
+NOTE: This version includes defensive coding for numerical stability.
+- Applies nan/inf detection after transforming inputs.
+- Replaces NaNs/Infs with default clamped values to prevent decoder failures.
+- This is necessary due to observed NaNs early in the model pipeline, traced to potential data anomalies or instability.
+- IMPORTANT: The decoder output contains significant nonlinear transformations that may 
+produce values outside typical image ranges (range not constrained to [-1,1]).
 
 Thesis Context and Scientific Innovation:
 ---------------------------------------
@@ -58,13 +59,13 @@ Architectural Design Decisions:
 ----------------------------
 1. Adapter Architecture:
    a) SpectralAdapter:
-      - 3x3 convolutions: Balance spatial feature modeling with efficiency
+      - 3×3 convolutions: Balance spatial feature modeling with efficiency
       - GroupNorm: Stable training with small batch sizes typical in hyperspectral data (nonlinear normalization)
       - SiLU activation: Gradient-friendly nonlinearity better suited than ReLU (nonlinear activation)
       - Three-layer design: Progressive feature extraction and channel adaptation with nonlinear transformations
 
    b) SpectralAttention:
-      - 1x1 convolution: Learn band importance weights (linear transformation)
+      - 1×1 convolution: Learn band importance weights (linear transformation)
       - Sigmoid activation: Ensure interpretable [0,1] importance scores (nonlinear activation)
       - Element-wise multiplication: Apply learned weights to input (nonlinear due to sigmoid weights)
       - Wavelength mapping: Enable scientific visualization of band contributions
@@ -169,21 +170,23 @@ Scientific Contributions and Future Work:
 TODOs:
 ------
 1. For convergence stability:
-   - ✓ COMPLETED: Consider scaling/weighting loss terms
-   - ✓ COMPLETED: Implement loss = mse_weight * mse + sam_weight * sam
-   - ✓ COMPLETED: Allow tuning of loss contributions (via sam_loss_weight parameter)
+   - Consider scaling/weighting loss terms
+   - Implement loss = mse_weight * mse + sam_weight * sam
+   - Allow tuning of loss contributions
 
 2. For overfitting prevention:
    - Add dropout layer to each input/output adapter
    - Implement if overfitting to spectral patterns becomes an issue
 
 3. For implementation:
-   - ✓ COMPLETED: Add get_trainable_params() method
-   - ✓ COMPLETED: Implement compute_losses() in model
-   - ✓ COMPLETED: Add per-band loss tracking
+   - Add get_trainable_params() method
+   - Implement compute_losses() in model
+   - Add per-band loss tracking
 
 
    CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
+   NOTE: enable Tanh output bounding via --force_output_tanh on the CLI.
+    -> disable during training and apply only during inference
 
 Usage:
     # Initialize with pretrained SD3 VAE
@@ -200,6 +203,20 @@ Usage:
     # Train only adapter layers
     optimizer = torch.optim.AdamW(vae.get_trainable_params(), lr=1e-4)
     
+    # Note: Output range is unconstrained due to nonlinear transformations
+    # TODO nonlinearities introduce range warping, making it likely that even properly normalized 
+    # [–1, 1] input will produce non-symmetric output.
+    Fix Options:
+	•	(Recommended) Clamp output of output adapter to [–1, 1].
+	•	(Optional) Add Tanh() at the very end of SpectralAdapter.forward() (only for output adapter).
+    -> Add final Tanh activation to force [–1, 1] output
+    self.output_norm = nn.Tanh()
+
+    Then in forward()
+    x = self.output_norm(x)
+    
+    # For downstream usage requiring [-1, 1] range, apply post-processing normalization
+
     
 """
 
@@ -228,7 +245,6 @@ Usage:
 # ------------------------------------------------------------
 
 from typing import Dict, Optional, Tuple, Union
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -340,7 +356,6 @@ class SpectralAttention(nn.Module):
 # produces near-zero outputs, while scale explosion (output_scale > 5.0) indicates potential
 # gradient instability. Convergence to near-identity values demonstrates successful preservation
 # of biological spectral signatures with minimal range distortion.
-# NOTE: No clamping is performed in the model; output range is not guaranteed to be [-1, 1].
 #
 class SpectralAdapter(nn.Module):
     """
@@ -355,7 +370,7 @@ class SpectralAdapter(nn.Module):
     -----------------------------------------
     - Tanh and adaptive normalization were removed. These nonlinearities, while useful for bounding outputs, can distort the spectral signature in ways that are difficult to interpret and may compromise scientific analysis.
     - Instead, a single global learnable scale parameter is introduced. This provides linear, interpretable range control and preserves the relative relationships between spectral bands.
-    - No clamping is performed in the model; output range is not guaranteed to be [-1, 1].
+    - torch.clamp(x, -1.0, 1.0) is applied during both training and inference for safety, ensuring no extreme values propagate, but the transformation remains linear.
     - This approach aligns with the scientific goal of preserving spectral signature fidelity, allowing post-hoc calibration and interpretation.
     - Global scaling is biologically plausible, as real plant reflectance spectra can vary in magnitude due to illumination, but the *shape* (ratios) is most important for analysis.
     """
@@ -673,7 +688,6 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
     normalized_reconstructed = safe_normalize(reconstructed, dim=1)
 
     # Compute cosine similarity and clamp for stability
-    # Clamp cosine similarity to just inside [-1, 1] to avoid NaNs in torch.acos due to floating point errors
     cos_sim = F.cosine_similarity(normalized_original, normalized_reconstructed, dim=1)
     cos_sim = cos_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
 
@@ -717,7 +731,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         adapter_placement (str, optional): Where to place adapters ("input", "output", or "both")
         use_spectral_attention (bool, optional): Whether to use spectral attention (default: True)
         use_sam_loss (bool, optional): Whether to use SAM loss (default: True)
-        sam_loss_weight (float, optional): Weight for SAM loss in total loss (default: 0.1)
         subfolder (str, optional): Subfolder for SD3 compatibility
         revision (str, optional): Revision for SD3 compatibility
         variant (str, optional): Variant for SD3 compatibility
@@ -746,7 +759,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         variant: str = None,
         torch_dtype: torch.dtype = None,
         use_saturation_penalty: bool = False,
-        sam_loss_weight: float = 0.1,
     ):
         # Adapter config: these are for the adapters only, not the backbone
         self.adapter_placement = adapter_placement
@@ -756,7 +768,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         self.adapter_out_channels = adapter_out_channels  # Refactored: adapter output channels
         self.adapter_channels = adapter_channels
         self.use_saturation_penalty = use_saturation_penalty
-        self.sam_loss_weight = sam_loss_weight
         self.backbone_in_channels = backbone_in_channels  # Refactored: backbone input channels
         self.backbone_out_channels = backbone_out_channels  # Refactored: backbone output channels
         # The backbone (SD3 VAE) is always 3->3 channels, regardless of adapter config
@@ -781,7 +792,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             "torch_dtype",
             "variant",
             "use_saturation_penalty",
-            "sam_loss_weight",
             "adapter_in_channels",
             "adapter_out_channels",
             "backbone_in_channels",
@@ -830,6 +840,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # Load the full state dict (including adapters) if available
         # instantiate adapter->full state dict load : 
         # ensures that all trained adapter weights are restored when loading pretrained multispectral VAE
+        import os
+        import torch
         # Try to find the state dict file (HuggingFace convention)
         state_dict_path = None
         for fname in ["pytorch_model.bin", "diffusion_pytorch_model.bin"]:
@@ -925,7 +937,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         
         return monitoring_info
 
-    # Multi-objective Loss
+    # Design Rationale: Multi-objective Loss
     # --------------------------------------
     # Combines per-channel MSE (spatial fidelity) with optional SAM (spectral similarity).
     # - MSE ensures accurate reconstruction pixel-wise.
@@ -1010,8 +1022,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         if self.use_sam_loss:
             # Apply mask before computing SAM loss
             if mask is not None:
-                # For SAM, handle the case where some pixels have zero spectral magnitude
-                # after masking. compute SAM only on pixels with sufficient spectral content.
+                # For SAM, we need to handle the case where some pixels have zero spectral magnitude
+                # after masking. We'll compute SAM only on pixels with sufficient spectral content.
                 spectral_magnitude = torch.norm(masked_original, dim=1, keepdim=True)  # (B, 1, H, W)
                 valid_spectral_mask = (spectral_magnitude > 1e-6) & (mask[:, :1, :, :] > 0.5)
                 
@@ -1037,13 +1049,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             if torch.isnan(losses['sam']):
                 logger.debug("[NaN DEBUG] SAM loss returned NaN")
 
-        # Total loss: Combine MSE and SAM losses with appropriate weighting
-        # MSE loss focuses on spatial accuracy, SAM loss preserves spectral fidelity
-        if self.use_sam_loss and 'sam' in losses:
-            # Use configurable SAM weight to balance spectral vs spatial fidelity
-            losses['total_loss'] = losses['mse'] + self.sam_loss_weight * losses['sam']
-        else:
-            losses['total_loss'] = losses['mse']
+        # Total loss (currently just MSE, but could be weighted combination)
+        losses['total_loss'] = losses['mse']
 
         # Saturation penalty: softly discourages outputs from nearing ±1 extremes,
         # which can compress spectral details important in plant stress analysis.
@@ -1073,12 +1080,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # compatibility, while this saturation penalty handles the scientific constraint of
         # preserving spectral detail and avoiding hard nonlinearities.
         if self.use_saturation_penalty:
-            # Saturation penalty explanation:
-            # - torch.abs(reconstructed) - 0.95 computes how much each value in the output exceeds 0.95 in magnitude.
-            # - F.relu(...) sets all negative values to zero, so only values with |x| > 0.95 contribute.
-            # - torch.mean(...) averages this excess across all elements.
-            # - This mean is added (with a small weight) to the total loss.
-            # Effect: If the output is within [-0.95, 0.95], the penalty is zero. If the output exceeds this range, the penalty increases proportionally to the excess.
             saturation_penalty = torch.mean(F.relu(torch.abs(reconstructed) - 0.95))
             losses["saturation_penalty"] = saturation_penalty
             losses["total_loss"] = losses["total_loss"] + 0.05 * saturation_penalty
@@ -1089,6 +1090,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # based on Hugging Face config and user-provided overrides.
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
+        # Refactored: Use explicit adapter and backbone channel config
         config = AutoencoderKL.load_config(
             pretrained_model_name_or_path,
             subfolder=kwargs.get("subfolder", "vae"),
@@ -1110,9 +1112,10 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             variant=kwargs.get("variant", None),
             torch_dtype=kwargs.get("torch_dtype", None),
             use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
-            sam_loss_weight=kwargs.get("sam_loss_weight", 0.1),
         )
         # After instantiation, load the full state dict (including adapters)
+        import os
+        import torch
         state_dict_path = None
         for fname in ["pytorch_model.bin", "diffusion_pytorch_model.bin"]:
             candidate = os.path.join(pretrained_model_name_or_path, fname)
@@ -1140,7 +1143,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):
-        # Save explicit adapter and backbone channel config fields
+        # Refactored: Save explicit adapter and backbone channel config fields
         self.register_to_config(
             adapter_in_channels=self.adapter_in_channels,
             adapter_out_channels=self.adapter_out_channels,
@@ -1151,7 +1154,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             use_sam_loss=self.use_sam_loss,
             adapter_channels=self.adapter_channels,
             use_saturation_penalty=self.use_saturation_penalty,
-            sam_loss_weight=self.sam_loss_weight,
         )
         super().save_pretrained(save_directory, *args, **kwargs)
 
@@ -1258,7 +1260,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         """
         Forward pass through the entire network with optional masking for leaf-focused training.
 
-        This forward method avoids using AutoencoderKLOutput for decoding output, in compliance with Hugging Face's class definition.
+        NOTE: This forward method avoids using AutoencoderKLOutput for decoding output, in compliance with Hugging Face's class definition.
         The previously encountered error ("AutoencoderKLOutput.__init__() got an unexpected keyword argument") has been resolved
         by ensuring decode() returns only raw tensors, not structured outputs.
 
@@ -1313,7 +1315,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 logger.debug(f"[DEBUG] Mask stats — coverage: {stats['coverage']:.4f}, valid_pixels: {stats['valid_pixels']}/{stats['total_pixels']}")
 
             # Global scale monitoring: logs the learned scalar after each forward pass during training.
-            # This is for ensuring the output magnitude remains biologically meaningful.
+            # This is critical for ensuring the output magnitude remains biologically meaningful.
             # A scale too small (<0.1) or too large (>3.0) can indicate loss of spectral fidelity.
             # Log and check global scale if output_adapter exists
             if hasattr(self, "output_adapter"):
