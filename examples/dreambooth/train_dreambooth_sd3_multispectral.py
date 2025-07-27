@@ -77,13 +77,9 @@ Implementation Decisions:
 
 2. Loss Function Design:
    - Standard DreamBooth loss (currently implemented)
-   - TODO: Per-band MSE: Preserves spatial structure
-   - TODO: SAM loss: Maintains spectral signatures
    - Prior preservation: Retains concept learning
-   - TODO: Cross-modal alignment: Links text and spectral features
 
 3. Latent Space Handling:
-   - log_latent_shape() validates SD3 compatibility
    - Expects 16 latent channels (SD3's default, beneficial for multispectral data)
    - Maintains generative capabilities
    - Preserves spectral information with increased capacity
@@ -103,26 +99,16 @@ Data Handling:
    - Memory-efficient loading
    - Band selection and validation
 
-3. Visualization Adaptation:
-   - adapt_visualization_for_multispectral() converts 5-channel data to RGB
-   - Enables compatibility with standard visualization tools
-   - Preserves spectral information in logging
-   - Supports wandb integration
-
 Training Strategy:
 ---------------
 1. VAE Integration:
    - Pretrained and frozen multispectral VAE
-   - Latent space validation via log_latent_shape()
    - Expects 16 latent channels (SD3's default, optimal for multispectral data)
-   - TODO: Spectral attention for band importance
+
 
 2. Loss Functions:
    - Standard DreamBooth loss (currently implemented)
-   - TODO: Per-band MSE for spatial fidelity
-   - TODO: Spectral Angle Mapper (SAM) for spectral signatures
    - Prior preservation loss
-   - TODO: Cross-modal alignment loss
 
 3. Optimization:
    - Gradient accumulation for memory efficiency
@@ -138,7 +124,7 @@ Text Encoder Handling:
    - CLIP: Visual-semantic alignment
    - T5: Detailed concept understanding
    - Concatenated embeddings for rich representation
-   - TODO: Spectral concept grounding
+
 
 2. Encoding Functions:
    - _encode_prompt_with_clip(): Visual-semantic features
@@ -150,8 +136,6 @@ Logging and Evaluation:
 --------------------
 1. Validation Pipeline:
    - log_validation() for model assessment
-   - TODO: Spectral fidelity metrics
-   - TODO: Per-band reconstruction quality
    - Concept preservation evaluation
 
 2. Integration:
@@ -200,14 +184,10 @@ Thesis Discussion Points:
    a) Architecture Design:
       - Lightweight adapter approach for spectral adaptation
       - Parameter-efficient fine-tuning strategy
-      - TODO: Spectral attention mechanism
-      - TODO: Dual loss function design
+      
    
    b) Training Strategy:
-      - TODO: Spectral-aware optimization
-      - TODO: Cross-modal alignment
       - Concept preservation
-      - TODO: Spectral fidelity maintenance
 
 2. Scientific Implications:
    a) Plant Health Analysis:
@@ -249,33 +229,23 @@ Thesis Discussion Points:
 1. Methodology Chapter:
    - Parameter-efficient design rationale
    - Band selection methodology
-   - TODO: Loss function design
-   - TODO: Text encoder integration
+
 
 2. Results Chapter:
-   - TODO: Spectral fidelity metrics
+
    - Concept preservation analysis
-   - TODO: Band importance visualization
-   - TODO: Cross-modal alignment results
+
 
 TODOs and Future Features:
 ------------------------
-1. Loss Functions:
-   - [ ] Implement spectral-aware prior preservation loss
-   - [ ] Add spectral cross-modal loss
-   - [ ] Improve spectral reconstruction metrics
-   - [ ] Add per-band loss tracking
-   - [ ] Implement masked loss using background masks
-
-2. Data Handling:
+1. Data Handling:
    - [ ] Add support for reading train/val splits from .txt files
    - [ ] Implement spectral data augmentation
    - [ ] Add data validation pipeline
    - [ ] Implement spectral quality checks
 
-3. Evaluation:
+2. Evaluation:
    - [ ] Add comprehensive unit tests
-   - [ ] Implement spectral fidelity metrics
    - [ ] Add visualization tools
    - [ ] Create evaluation pipeline
 
@@ -296,7 +266,7 @@ Usage:
         --learning_rate 1e-4 \
         --mixed_precision fp16
 
-# TODO: Research questions for multispectral DreamBooth
+# Research questions for multispectral DreamBooth
 # 1. How does the text encoder handle multispectral concepts?
 # 2. Should we modify the prior preservation loss for multispectral data?
 # 3. Do we need to adjust the learning rate for 5-channel inputs?
@@ -354,7 +324,7 @@ from diffusers import (
 # Import the multispectral VAE adapter
 from src.diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter
 # --- Import ControlNetModel for spatial conditioning integration ---
-from diffusers import ControlNetModel
+# from diffusers import ControlNetModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3, free_memory
 from diffusers.utils import (
@@ -374,6 +344,21 @@ from multispectral_dataloader import create_multispectral_dataloader
 import transformers
 import diffusers
 
+# Import spectral fidelity metrics
+try:
+    from skimage.metrics import structural_similarity as ssim
+    SSIM_AVAILABLE = True
+except ImportError:
+    SSIM_AVAILABLE = False
+    logger.warning("skimage not available, SSIM will be disabled")
+
+try:
+    from torchmetrics.image import SpectralAngleMapper
+    SAM_AVAILABLE = True
+except ImportError:
+    SAM_AVAILABLE = False
+    logger.warning("torchmetrics not available, SAM will be disabled")
+
 if is_wandb_available():
     import wandb
 
@@ -383,10 +368,10 @@ check_min_version("0.34.0.dev0")
 logger = get_logger(__name__)
 
 # --- DreamBooth logger creation (ensure frozen VAE is passed in for validation decoding) ---
-def create_dreambooth_logger(output_dir, model_name, vae):
+def create_dreambooth_logger(output_dir, model_name):
     # Use the comprehensive DreamBooth logger from dreambooth_logger.py
     from dreambooth_logger import create_dreambooth_logger as create_comprehensive_logger
-    return create_comprehensive_logger(output_dir, model_name, vae)
+    return create_comprehensive_logger(output_dir, model_name)
 
 def load_text_encoders(args):
     """Load the three text encoders for SD3."""
@@ -1041,51 +1026,7 @@ def validate_dataloader_output(dataloader, num_channels):
     except Exception as e:
         raise ValueError(f"Failed to validate dataloader output: {str(e)}")
 
-def log_latent_shape(latent_tensor, batch_size):
-    """
-    Log the shape of the latent tensor to verify VAE output compatibility.
-    The latent space should maintain SD3's requirements (16 channels by default) despite 5-channel input.
-    
-    Args:
-        latent_tensor: The latent tensor from VAE encoding
-        batch_size: Current batch size for shape verification
-    """
-    # SD3 transformer expects 16 channels by default, which is beneficial for multispectral data
-    # as it provides more capacity to encode the additional spectral information
-    logger.info(f"Latent tensor shape: {latent_tensor.shape}")
-    
-    # Check if the shape is reasonable (should be square)
-    if latent_tensor.shape[2] != latent_tensor.shape[3]:
-        logger.warning(
-            f"Non-square latent spatial dimensions: {latent_tensor.shape[2]}x{latent_tensor.shape[3]}"
-        )
-    
-    # Log the channel count for debugging
-    latent_channels = latent_tensor.shape[1]
-    logger.info(f"Latent channels: {latent_channels}")
-    
-    # Provide informative feedback about the channel count
-    if latent_channels == 16:
-        logger.info("✓ Using 16 latent channels - optimal for SD3 and multispectral data")
-    elif latent_channels == 4:
-        logger.info("✓ Using 4 latent channels - compatible with SD3 but may limit spectral capacity")
-    else:
-        logger.warning(f"⚠ Using {latent_channels} latent channels - verify SD3 compatibility")
 
-def adapt_visualization_for_multispectral(image_tensor):
-    """
-    Adapt multispectral images for visualization by using first 3 channels as RGB.
-    This is a workaround for logging purposes, since visualization tools expect RGB images.
-    
-    Args:
-        image_tensor: 5-channel multispectral image tensor
-    
-    Returns:
-        RGB image tensor for visualization
-    """
-    # Use first 3 channels as RGB
-    rgb_tensor = image_tensor[:, :3, :, :]
-    return rgb_tensor
 
 def main(args):
     print("Starting DreamBooth multispectral training...")
@@ -1097,7 +1038,7 @@ def main(args):
     This function orchestrates the training process, including:
     1. Model initialization with pretrained VAE
     2. Data loading and preprocessing
-    3. Training loop with spectral-aware losses (TODO: implement spectral-specific losses)
+    3. Training loop with standard DreamBooth loss
     4. Validation and logging
     
     Args:
@@ -1174,7 +1115,7 @@ def main(args):
         use_cache=True,
         prefetch_factor=None if args.dataloader_num_workers == 0 else 2,  # Disable prefetch for local testing
         persistent_workers=args.dataloader_num_workers > 0,  # Only enable for multi-worker setup
-        return_mask=True,  # Enable mask output for future masked loss
+        return_mask=False,  # No longer using masked loss
         prompt=args.instance_prompt if hasattr(args, 'instance_prompt') else "sks leaf",  # Use provided prompt
     )
 
@@ -1199,8 +1140,6 @@ def main(args):
         first_batch = next(iter(train_dataloader))
         logger.info(f"First batch keys: {list(first_batch.keys())}")
         logger.info(f"pixel_values shape: {first_batch['pixel_values'].shape}, dtype: {first_batch['pixel_values'].dtype}")
-        if 'mask' in first_batch:
-            logger.info(f"mask shape: {first_batch['mask'].shape}, dtype: {first_batch['mask'].dtype}")
         logger.info(f"prompts: {first_batch['prompts']}")
     except Exception as e:
         logger.error(f"Error validating first batch from dataloader: {e}")
@@ -1672,13 +1611,12 @@ def main(args):
     best_val_loss = float('inf')
     best_epoch = 0
 
-    # --- DREAMBOOTH LOGGER INIT: pass in frozen VAE for validation decoding ---
+    # --- DREAMBOOTH LOGGER INIT ---
     # Use a shorter model name for log files to avoid path length issues
     model_name_for_logs = "sd3_multispectral_dreambooth"
     dreambooth_logger = create_dreambooth_logger(
         output_dir=args.output_dir,
-        model_name=model_name_for_logs,
-        vae=vae  # pass the frozen VAE for validation decoding
+        model_name=model_name_for_logs
     )
 
     # Potentially load in the weights and states from a previous save
@@ -1771,9 +1709,7 @@ def main(args):
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                # Log latent tensor shape for verification only every `log_steps`
-                if accelerator.sync_gradients and global_step % args.log_steps == 0:
-                    log_latent_shape(model_input, pixel_values.shape[0])
+
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -1833,61 +1769,90 @@ def main(args):
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # --- Masked MSE: focus loss on leaf region only (background zeroed) ---
+                # flow matching loss
                 if args.precondition_outputs:
                     target = model_input
                 else:
                     target = noise - model_input
 
                 if args.with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately
+                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
 
-                    # Compute prior loss (masked MSE over class images)
-                    mask_prior = batch["mask"].to(model_pred_prior.device)
-                    mask_prior_resized = torch.nn.functional.interpolate(
-                        mask_prior, size=model_pred_prior.shape[-2:], mode="nearest"
+                    # Compute prior loss
+                    prior_loss = torch.mean(
+                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
+                            target_prior.shape[0], -1
+                        ),
+                        1,
                     )
-                    loss_map_prior = (model_pred_prior.float() - target_prior.float()) ** 2
-                    masked_loss_per_sample_prior = (
-                        (loss_map_prior * mask_prior_resized).reshape(loss_map_prior.size(0), -1).sum(dim=1)
-                        / mask_prior_resized.reshape(mask_prior_resized.size(0), -1).sum(dim=1)
-                    )
-                    prior_loss = masked_loss_per_sample_prior.mean()
+                    prior_loss = prior_loss.mean()
 
-                # Masked MSE over instance images: zero out background to focus loss on leaf
-                mask = batch["mask"].to(model_pred.device)  # shape (B,1,H,W)
-                # Resize mask to match model_pred spatial dims
-                mask_resized = torch.nn.functional.interpolate(
-                    mask, size=model_pred.shape[-2:], mode="nearest"
+                # Compute regular loss.
+                loss = torch.mean(
+                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    1,
                 )
-                # Compute per-pixel MSE map
-                loss_map = (model_pred.float() - target.float()) ** 2  # (B,C,H',W')
-                
-                # Apply mask (broadcasting over channels)
-                masked_loss_per_sample = (
-                    (loss_map * mask_resized).reshape(loss_map.size(0), -1).sum(dim=1)
-                    / mask_resized.reshape(mask_resized.size(0), -1).sum(dim=1)
-                )
-                loss = masked_loss_per_sample.mean()
+                loss = loss.mean()
 
-                # Compute per-channel MSE for multispectral analysis from INPUT channels (5 channels)
-                # This gives us the MSE for each of the 5 spectral bands
-                input_mse_map = (pixel_values.float() - pixel_values.float()) ** 2  # Placeholder - we'll compute actual input MSE
-                # For now, let's compute MSE between original and reconstructed input
-                with torch.no_grad():
-                    # Decode the current latents back to input space for comparison
-                    decoded_input = vae.decode(model_input).sample
-                    # Compute MSE between original input and decoded input (5 channels)
-                    input_mse_per_channel = ((pixel_values - decoded_input) ** 2).mean(dim=(0, 2, 3))  # (5,) - mean MSE per input channel
 
-                # Store losses for logging
-                losses = {"mse_per_channel": input_mse_per_channel}
 
                 if args.with_prior_preservation:
                     # Add the prior loss to the instance loss
                     loss = loss + args.prior_loss_weight * prior_loss
+
+                # Compute per-channel MSE, SSIM, and SAM for spectral fidelity monitoring (every 100 steps)
+                if global_step % 100 == 0:
+                    with torch.no_grad():  # Don't track gradients for analysis
+                        # Decode the current latents back to pixel space
+                        decoded_latents = model_input / vae.config.scaling_factor + vae.config.shift_factor
+                        decoded_pixels = vae.decode(decoded_latents).sample  # Shape: (B, 5, H, W)
+                        
+                        # Compute per-channel MSE
+                        mse_per_channel = torch.mean((decoded_pixels - pixel_values) ** 2, dim=(0, 2, 3))
+                        # Shape: (5,) - one MSE value per channel
+                        
+                        # Compute per-channel SSIM
+                        if SSIM_AVAILABLE:
+                            ssim_per_channel = []
+                            for i in range(5):  # 5 channels
+                                # Convert to numpy and normalize to [0, 1] for SSIM
+                                orig_band = (pixel_values[0, i].cpu().numpy() + 1.0) / 2.0
+                                decoded_band = (decoded_pixels[0, i].cpu().numpy() + 1.0) / 2.0
+                                ssim_score = ssim(orig_band, decoded_band, data_range=1.0)
+                                ssim_per_channel.append(ssim_score)
+                        else:
+                            ssim_per_channel = [0.0] * 5
+                        
+                        # Compute SAM (Spectral Angle Mapper)
+                        if SAM_AVAILABLE:
+                            sam = SpectralAngleMapper()
+                            # Reshape for SAM: (B, C, H, W) -> (B, H*W, C)
+                            orig_flat = pixel_values[0].permute(1, 2, 0).reshape(-1, 5)  # (H*W, 5)
+                            decoded_flat = decoded_pixels[0].permute(1, 2, 0).reshape(-1, 5)  # (H*W, 5)
+                            sam_score = sam(decoded_flat.unsqueeze(0), orig_flat.unsqueeze(0)).item()
+                        else:
+                            sam_score = 0.0
+                        
+                        # Log all metrics with band information
+                        band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
+                                     "Band 42 (731nm)", "Band 55 (851nm)"]
+                        logger.info(f"Step {global_step} - Spectral Fidelity Metrics:")
+                        logger.info(f"  SAM Score: {sam_score:.6f}")
+                        for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
+                            logger.info(f"  {band_name}: MSE={mse.item():.6f}, SSIM={ssim_val:.6f}")
+                        
+                        # Log to wandb if available
+                        if is_wandb_available() and wandb.run:
+                            wandb_log = {
+                                "spectral/sam_score": sam_score,
+                            }
+                            for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
+                                band_id = band_name.split()[1]  # Extract wavelength
+                                wandb_log[f"spectral/mse_channel_{i}_{band_id}"] = mse.item()
+                                wandb_log[f"spectral/ssim_channel_{i}_{band_id}"] = ssim_val
+                            wandb.log(wandb_log, step=global_step)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1919,33 +1884,25 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                # --- LATENT STATISTICS LOGGING (every validation_steps) ---
-                if hasattr(args, "validation_steps") and args.validation_steps > 0:
-                    val_steps = args.validation_steps
-                else:
-                    val_steps = 100
-                if global_step % val_steps == 0:
-                    with torch.no_grad():
-                        # Log latent statistics using frozen VAE
-                        latents = vae.encode(pixel_values).latent_dist.sample()
-                        latent_stats = {
-                            "train/latent_mean": latents.mean().item(),
-                            "train/latent_std": latents.std().item(),
-                            "train/latent_min": latents.min().item(),
-                            "train/latent_max": latents.max().item()
+                # Log to DreamBooth logger every 100 steps
+                if global_step % 100 == 0:
+                    # Prepare spectral metrics for logging
+                    spectral_metrics = None
+                    if 'mse_per_channel' in locals() and 'ssim_per_channel' in locals() and 'sam_score' in locals():
+                        spectral_metrics = {
+                            "sam_score": sam_score,
+                            "mse_per_channel": [mse.item() for mse in mse_per_channel],
+                            "ssim_per_channel": ssim_per_channel
                         }
-                        if getattr(args, "use_wandb", False):
-                            import wandb
-                            wandb.log(latent_stats, step=global_step)
-                        # Log to DreamBooth logger with comprehensive metrics
-                        dreambooth_logger.log_step(
-                            step=global_step, 
-                            epoch=epoch,
-                            loss=loss.detach().item(),
-                            learning_rate=lr_scheduler.get_last_lr()[0],
-                            grad_norm=grad_norm,
-                            mse_per_channel=None
-                        )
+                    
+                    dreambooth_logger.log_step(
+                        step=global_step, 
+                        epoch=epoch,
+                        loss=loss.detach().item(),
+                        learning_rate=lr_scheduler.get_last_lr()[0],
+                        grad_norm=grad_norm,
+                        spectral_metrics=spectral_metrics
+                    )
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
@@ -2011,7 +1968,7 @@ def main(args):
                                 logger.error(f"Could not save pipeline to {pipeline_save_path}: {e}")
 
                     # Run validation and log images every 100 steps
-                    if args.validation_prompt is not None and global_step % 100 == 0:
+                    if args.validation_prompt is not None and global_step % 500 == 0:
                         skip_val_pipeline = False
                         if not args.train_text_encoder:
                             try:
@@ -2041,7 +1998,6 @@ def main(args):
                                     # Use the current batch latents for validation (example, or use generated latents)
                                     latents = vae.encode(pixel_values).latent_dist.sample()
                                     targets = pixel_values
-                                    mask = batch["mask"]
                                     decoded_imgs = vae.decode(latents).sample
                                     decoded_imgs_clamped = torch.clamp(decoded_imgs, -1.0, 1.0)  # Create clamped version
 
@@ -2050,24 +2006,19 @@ def main(args):
                                         {
                                             "latent": l,
                                             "target": t,
-                                            "mask": m,
                                             "decoded_raw": r,
                                             "decoded_clamped": c
                                         }
-                                        for l, t, m, r, c in zip(latents, targets, mask, decoded_imgs, decoded_imgs_clamped)
+                                        for l, t, r, c in zip(latents, targets, decoded_imgs, decoded_imgs_clamped)
                                     ]
                                 # Log validation images and metrics using logger
                                 val_metrics = {"val_loss": loss.detach().item()}
-                                val_mse_per_channel = None
-                                if "losses" in locals():
-                                    val_mse_per_channel = losses.get("mse_per_channel", None)
-                                # Log validation with comprehensive spectral metrics
+                                # Log validation
                                 dreambooth_logger.log_validation(
                                     epoch=global_step,
                                     images=validation_data,
                                     prompt=args.validation_prompt,
-                                    validation_metrics=val_metrics,
-                                    mse_per_channel=val_mse_per_channel
+                                    validation_metrics=val_metrics
                                 )
                                 logger.info(f"Validation pipeline and logging succeeded at step {global_step}")
                             except Exception as e:
@@ -2085,17 +2036,13 @@ def main(args):
                 logs.update({
                     "grad_norm": grad_norm,
                 })
-            # Log step metrics using logger
-            mse_per_channel = None
-            if "losses" in locals():
-                mse_per_channel = losses.get("mse_per_channel", None)
+            # Log step metrics using logger (basic metrics only, no spectral metrics here)
             dreambooth_logger.log_step(
                 step=global_step,
                 epoch=epoch,
                 loss=loss.detach().item(),
                 learning_rate=lr_scheduler.get_last_lr()[0],
-                grad_norm=grad_norm,
-                mse_per_channel=mse_per_channel
+                grad_norm=grad_norm
             )
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -2139,19 +2086,18 @@ def main(args):
                             variant=args.variant,
                             torch_dtype=weight_dtype,
                         )
-                        # --- Validation data: log latent, target, mask for logger ---
+                        # --- Validation data: log latent and target for logger ---
                         try:
                             val_batch = next(iter(train_dataloader))
                             with torch.no_grad():
                                 inputs = val_batch["pixel_values"].to(accelerator.device)
-                                mask = val_batch["mask"].to(accelerator.device)
                                 targets = val_batch["target"].to(accelerator.device) if "target" in val_batch else inputs
                                 # Use the frozen VAE for encoding
                                 latents = vae.encode(inputs).latent_dist.sample()
                                 # Build validation data dicts
                                 val_data = [
-                                    {"latent": l, "target": t, "mask": m}
-                                    for l, t, m in zip(latents, targets, mask)
+                                    {"latent": l, "target": t}
+                                    for l, t in zip(latents, targets)
                                 ]
                                 # Log with DreamBooth logger
                                 dreambooth_logger.log_validation(
