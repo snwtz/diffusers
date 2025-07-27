@@ -238,7 +238,7 @@ Note: This file is overwritten for each training run to reduce clutter
         for i, image in enumerate(images):
             image_path = validation_dir / f"step_{epoch:06d}_image_{i:02d}.png"
             image.save(image_path)
-        
+
         # Write validation summary
         self._write_validation_summary(validation_data)
         self._check_alert_thresholds(validation_data["validation_metrics"], epoch, mode="val")

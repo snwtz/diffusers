@@ -1,4 +1,6 @@
 """
+TODO: from skimage.metrics import structural_similarity as ssim
+
 python examples/multispectral/eval_multispectral_vae.py \
   --model_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/test_run/final_model" \
   --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" \
@@ -6,7 +8,7 @@ python examples/multispectral/eval_multispectral_vae.py \
   --batch_size 1 \
   --num_samples 10
 
-Note: This evaluation script now properly handles [-1, 1] normalized data throughout the pipeline.
+Note: This evaluation script  handles [-1, 1] normalized data throughout the pipeline.
 The dataloader normalizes to [-1, 1], the model expects [-1, 1], and visualization converts to [0, 1] for display.
 
 AutoencoderKL is not imported or defined anywhere. All evaluated configs are from adapters only 

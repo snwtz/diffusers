@@ -309,6 +309,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
+import matplotlib.pyplot as plt
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
@@ -344,6 +346,11 @@ from multispectral_dataloader import create_multispectral_dataloader
 import transformers
 import diffusers
 
+# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
+check_min_version("0.34.0.dev0")
+
+logger = get_logger(__name__)
+
 # Import spectral fidelity metrics
 try:
     from skimage.metrics import structural_similarity as ssim
@@ -362,10 +369,39 @@ except ImportError:
 if is_wandb_available():
     import wandb
 
-# Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.34.0.dev0")
-
-logger = get_logger(__name__)
+def create_pseudo_rgb_from_multispectral(bands_tensor):
+    """
+    Create pseudo-RGB visualization from 5-channel multispectral data.
+    
+    Maps specific spectral bands to RGB channels for human visualization:
+    - Red channel: Band 2 (650.665nm - Red) 
+    - Green channel: Band 1 (538.71nm - Green)
+    - Blue channel: Band 0 (474.73nm - Blue)
+    
+    Args:
+        bands_tensor: Tensor of shape (5, H, W) in [-1, 1] range
+        
+    Returns:
+        PIL Image in RGB format
+    """
+    # Convert to numpy and normalize from [-1, 1] to [0, 1]
+    bands_np = bands_tensor.cpu().numpy()
+    bands_norm = (bands_np + 1) / 2
+    
+    # Create RGB channels using specific band mappings
+    r = bands_norm[2]  # Red channel (650.665nm)
+    g = bands_norm[1]  # Green channel (538.71nm) 
+    b = bands_norm[0]  # Blue channel (474.73nm)
+    
+    # Stack channels and ensure proper range
+    rgb = np.stack([r, g, b], axis=0)
+    rgb = np.clip(rgb, 0, 1)
+    
+    # Convert to PIL Image
+    rgb_uint8 = (rgb * 255).astype(np.uint8)
+    rgb_pil = Image.fromarray(rgb_uint8.transpose(1, 2, 0))
+    
+    return rgb_pil
 
 # --- DreamBooth logger creation (ensure frozen VAE is passed in for validation decoding) ---
 def create_dreambooth_logger(output_dir, model_name):
@@ -1092,7 +1128,7 @@ def main(args):
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        level=logging.INFO,  # Back to INFO level
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
@@ -1596,14 +1632,12 @@ def main(args):
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
-    logger.info(f"  Multispectral configuration:")
-    logger.info(f"    - Input channels: {args.num_channels} (bands 9, 18, 32, 42, 55)")
+    logger.info(f"  Multispectral configuration:"),
     logger.info(f"    - VAE latent channels: {vae.config.latent_channels}")
     logger.info(f"    - VAE adapter_in_channels: {getattr(vae.config, 'adapter_in_channels', 'N/A')}")
     logger.info(f"    - VAE adapter_out_channels: {getattr(vae.config, 'adapter_out_channels', 'N/A')}")
     logger.info(f"    - VAE backbone_in_channels: {getattr(vae.config, 'backbone_in_channels', 'N/A')}")
     logger.info(f"    - VAE backbone_out_channels: {getattr(vae.config, 'backbone_out_channels', 'N/A')}")
-    logger.info(f"    - Spectral data type: Multispectral plant tissue")
     global_step = 0
     first_epoch = 0
     
@@ -1827,27 +1861,58 @@ def main(args):
                         
                         # Compute SAM (Spectral Angle Mapper)
                         if SAM_AVAILABLE:
-                            sam = SpectralAngleMapper()
-                            # Reshape for SAM: (B, C, H, W) -> (B, H*W, C)
-                            orig_flat = pixel_values[0].permute(1, 2, 0).reshape(-1, 5)  # (H*W, 5)
-                            decoded_flat = decoded_pixels[0].permute(1, 2, 0).reshape(-1, 5)  # (H*W, 5)
-                            sam_score = sam(decoded_flat.unsqueeze(0), orig_flat.unsqueeze(0)).item()
+                            try:
+                                # metric needs to be on the same device as the input tensors (default is CPU)
+                                sam = SpectralAngleMapper().to(decoded_pixels.device)
+                                
+                                # Clip outliers using 95th percentile for SAM compatibility (monitoring only)
+                                decoded_pixels_clipped = decoded_pixels.clone()
+                                for i in range(decoded_pixels_clipped.shape[1]):  # For each channel
+                                    channel_data = decoded_pixels_clipped[0, i]  # Shape: (H, W)
+                                    q_05 = torch.quantile(channel_data, 0.05)  # 5th percentile
+                                    q_95 = torch.quantile(channel_data, 0.95)  # 95th percentile
+                                    decoded_pixels_clipped[0, i] = torch.clamp(channel_data, q_05, q_95)
+                                
+                                # Debug: Check tensor shapes and values
+                                logger.info(f"SAM input shapes: decoded_pixels[0:1]={decoded_pixels_clipped[0:1].shape}, pixel_values[0:1]={pixel_values[0:1].shape}")
+                                logger.info(f"SAM input ranges: decoded_pixels=[{decoded_pixels_clipped[0:1].min():.4f}, {decoded_pixels_clipped[0:1].max():.4f}], pixel_values=[{pixel_values[0:1].min():.4f}, {pixel_values[0:1].max():.4f}]")
+                                logger.info(f"SAM device: decoded_pixels={decoded_pixels_clipped[0:1].device}, pixel_values={pixel_values[0:1].device}, sam_metric={sam.device}")
+                                
+                                sam_score = sam(decoded_pixels_clipped[0:1], pixel_values[0:1]).item()
+                                
+                                # Debug: Check output
+                                logger.info(f"SAM raw output: {sam_score}")
+                                
+                                # Check for invalid values
+                                if math.isnan(sam_score) or math.isinf(sam_score):
+                                    logger.warning(f"SAM computation failed: VAE output range [{decoded_pixels[0:1].min():.4f}, {decoded_pixels[0:1].max():.4f}] incompatible with SpectralAngleMapper expectations")
+                                    sam_score = None  # Use None to indicate "not computable"
+                                    
+                            except Exception as e:
+                                logger.error(f"SAM computation failed with error: {e}")
+                                logger.error(f"SAM input details: decoded_pixels dtype={decoded_pixels[0:1].dtype}, pixel_values dtype={pixel_values[0:1].dtype}")
+                                sam_score = None  # Use None to indicate "not computable"
                         else:
-                            sam_score = 0.0
+                            sam_score = None  # Use None to indicate "not available"
                         
                         # Log all metrics with band information
                         band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
                                      "Band 42 (731nm)", "Band 55 (851nm)"]
                         logger.info(f"Step {global_step} - Spectral Fidelity Metrics:")
-                        logger.info(f"  SAM Score: {sam_score:.6f}")
+                        if sam_score is not None:
+                            logger.info(f"  SAM Score: {sam_score:.6f} (95th percentile clipped)")
+                        else:
+                            logger.info(f"  SAM Score: Not computable (VAE output range incompatible)")
                         for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
                             logger.info(f"  {band_name}: MSE={mse.item():.6f}, SSIM={ssim_val:.6f}")
                         
                         # Log to wandb if available
                         if is_wandb_available() and wandb.run:
-                            wandb_log = {
-                                "spectral/sam_score": sam_score,
-                            }
+                            wandb_log = {}
+                            if sam_score is not None:
+                                wandb_log["spectral/sam_score"] = sam_score
+                            else:
+                                wandb_log["spectral/sam_score"] = -1.0  # Use -1 to indicate "not computable"
                             for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
                                 band_id = band_name.split()[1]  # Extract wavelength
                                 wandb_log[f"spectral/mse_channel_{i}_{band_id}"] = mse.item()
@@ -1936,99 +2001,50 @@ def main(args):
                         except Exception as e:
                             logger.error(f"Could not save accelerator state to {save_path}: {e}")
 
-                        # Save full pipeline for inference
-                        pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{global_step}")
-                        # Ensure text encoders are loaded if not training them
-                        skip_pipeline_save = False
-                        if not args.train_text_encoder:
-                            try:
-                                text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                                text_encoder_one.to(weight_dtype)
-                                text_encoder_two.to(weight_dtype)
-                                text_encoder_three.to(weight_dtype)
-                            except Exception as e:
-                                logger.error(f"Could not load text encoders for pipeline saving: {e}")
-                                skip_pipeline_save = True
-                        if not skip_pipeline_save:
-                            try:
-                                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                                    args.pretrained_model_name_or_path,
-                                    vae=vae,
-                                    transformer=accelerator.unwrap_model(transformer),
-                                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                                    revision=args.revision,
-                                    variant=args.variant,
-                                    torch_dtype=weight_dtype,
-                                )
-                                pipeline.save_pretrained(pipeline_save_path)
-                                logger.info(f"Pipeline saved to: {pipeline_save_path}")
-                            except Exception as e:
-                                logger.error(f"Could not save pipeline to {pipeline_save_path}: {e}")
+                        # Save individual components for inference (multispectral VAE compatibility)
+                        components_save_path = os.path.join(args.output_dir, f"components-{global_step}")
+                        os.makedirs(components_save_path, exist_ok=True)
+                        try:
+                            # Save transformer
+                            transformer_save_path = os.path.join(components_save_path, "transformer")
+                            accelerator.unwrap_model(transformer).save_pretrained(transformer_save_path)
+                            
+                            # Save VAE
+                            vae_save_path = os.path.join(components_save_path, "vae")
+                            vae.save_pretrained(vae_save_path)
+                            
+                            logger.info(f"Model components saved to: {components_save_path}")
+                        except Exception as e:
+                            logger.error(f"Could not save model components to {components_save_path}: {e}")
 
-                    # Run validation and log images every 100 steps
+                    # Run validation and log images every 500 steps
                     if args.validation_prompt is not None and global_step % 500 == 0:
-                        skip_val_pipeline = False
-                        if not args.train_text_encoder:
-                            try:
-                                text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                                text_encoder_one.to(weight_dtype)
-                                text_encoder_two.to(weight_dtype)
-                                text_encoder_three.to(weight_dtype)
-                            except Exception as e:
-                                logger.error(f"Could not load text encoders for validation pipeline: {e}")
-                                skip_val_pipeline = True
-                        if not skip_val_pipeline:
-                            try:
-                                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                                    args.pretrained_model_name_or_path,
-                                    vae=vae,
-                                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                                    transformer=accelerator.unwrap_model(transformer),
-                                    revision=args.revision,
-                                    variant=args.variant,
-                                    torch_dtype=weight_dtype,
-                                )
-                                pipeline_args = {"prompt": args.validation_prompt}
-                                # --- DREAMBOOTH VALIDATION STEP: decode latents and log both raw and clamped outputs ---
-                                with torch.no_grad():
-                                    # Use the current batch latents for validation (example, or use generated latents)
-                                    latents = vae.encode(pixel_values).latent_dist.sample()
-                                    targets = pixel_values
-                                    decoded_imgs = vae.decode(latents).sample
-                                    decoded_imgs_clamped = torch.clamp(decoded_imgs, -1.0, 1.0)  # Create clamped version
+                        try:
+                            # Use existing VAE directly for validation (no pipeline needed)
+                            with torch.no_grad():
+                                # Use the current batch for validation
+                                latents = vae.encode(pixel_values).latent_dist.sample()
+                                decoded_imgs = vae.decode(latents).sample
 
-                                    # Prepare logging data with both raw and clamped decoded outputs
-                                    validation_data = [
-                                        {
-                                            "latent": l,
-                                            "target": t,
-                                            "decoded_raw": r,
-                                            "decoded_clamped": c
-                                        }
-                                        for l, t, r, c in zip(latents, targets, decoded_imgs, decoded_imgs_clamped)
-                                    ]
-                                # Log validation images and metrics using logger
-                                val_metrics = {"val_loss": loss.detach().item()}
-                                # Log validation
-                                dreambooth_logger.log_validation(
-                                    epoch=global_step,
-                                    images=validation_data,
-                                    prompt=args.validation_prompt,
-                                    validation_metrics=val_metrics
-                                )
-                                logger.info(f"Validation pipeline and logging succeeded at step {global_step}")
-                            except Exception as e:
-                                logger.error(f"Could not run validation pipeline or log validation at step {global_step}: {e}")
-                        if not args.train_text_encoder:
-                            try:
-                                del text_encoder_one, text_encoder_two, text_encoder_three
-                                free_memory()
-                            except Exception as e:
-                                logger.warning(f"Could not free text encoder memory: {e}")
+                                # Convert tensors to pseudo-RGB PIL images for logging
+                                validation_images = []
+                                for i in range(len(decoded_imgs)):
+                                    # Create pseudo-RGB from all 5 channels
+                                    multispectral_tensor = decoded_imgs[i]  # Shape: (5, H, W)
+                                    pil_image = create_pseudo_rgb_from_multispectral(multispectral_tensor)
+                                    validation_images.append(pil_image)
+                                
+                            # Log validation images and metrics using logger
+                            val_metrics = {"val_loss": loss.detach().item()}
+                            dreambooth_logger.log_validation(
+                                epoch=global_step,
+                                images=validation_images,
+                                prompt=args.validation_prompt,
+                                validation_metrics=val_metrics
+                            )
+                            logger.info(f"Validation logging succeeded at step {global_step}")
+                        except Exception as e:
+                            logger.error(f"Could not log validation at step {global_step}: {e}")
 
             logs = {"loss": loss.detach().item()}
             # Step-level logging every `log_steps`
@@ -2037,13 +2053,15 @@ def main(args):
                     "grad_norm": grad_norm,
                 })
             # Log step metrics using logger (basic metrics only, no spectral metrics here)
-            dreambooth_logger.log_step(
-                step=global_step,
-                epoch=epoch,
-                loss=loss.detach().item(),
-                learning_rate=lr_scheduler.get_last_lr()[0],
-                grad_norm=grad_norm
-            )
+            # Only log if not already logged with spectral metrics (every 100 steps)
+            if global_step % 100 != 0:
+                dreambooth_logger.log_step(
+                    step=global_step,
+                    epoch=epoch,
+                    loss=loss.detach().item(),
+                    learning_rate=lr_scheduler.get_last_lr()[0],
+                    grad_norm=grad_norm
+                )
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -2063,77 +2081,60 @@ def main(args):
             
             # --- VALIDATION DATA LOGGING FOR DREAMBOOTH LOGGER ---
             if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                skip_val_pipeline = False
-                if not args.train_text_encoder:
-                    try:
-                        text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                        text_encoder_one.to(weight_dtype)
-                        text_encoder_two.to(weight_dtype)
-                        text_encoder_three.to(weight_dtype)
-                    except Exception as e:
-                        logger.error(f"Could not load text encoders for validation pipeline: {e}")
-                        skip_val_pipeline = True
-                if not skip_val_pipeline:
-                    try:
-                        pipeline = StableDiffusion3Pipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            vae=vae,
-                            text_encoder=accelerator.unwrap_model(text_encoder_one),
-                            text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                            text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                            transformer=accelerator.unwrap_model(transformer),
-                            revision=args.revision,
-                            variant=args.variant,
-                            torch_dtype=weight_dtype,
+                try:
+                    # Use existing VAE and transformer directly for validation (no pipeline like in RGB DB needed)
+                    val_batch = next(iter(train_dataloader))
+                    with torch.no_grad():
+                        inputs = val_batch["pixel_values"].to(accelerator.device)
+                        # Use the frozen VAE for encoding/decoding
+                        latents = vae.encode(inputs).latent_dist.sample()
+                        # Convert tensors to pseudo-RGB PIL images for logging
+                        validation_images = []
+                        for i in range(len(latents)):
+                            # Decode and create pseudo-RGB from all 5 channels
+                            decoded_img = vae.decode(latents[i:i+1] / vae.config.scaling_factor + vae.config.shift_factor).sample
+                            multispectral_tensor = decoded_img[0]  # Shape: (5, H, W)
+                            pil_image = create_pseudo_rgb_from_multispectral(multispectral_tensor)
+                            validation_images.append(pil_image)
+                        
+                        # Log with DreamBooth logger
+                        dreambooth_logger.log_validation(
+                            epoch=global_step,
+                            images=validation_images,
+                            prompt=args.validation_prompt,
+                            validation_metrics={"val_loss": loss.detach().item()}
                         )
-                        # --- Validation data: log latent and target for logger ---
-                        try:
-                            val_batch = next(iter(train_dataloader))
-                            with torch.no_grad():
-                                inputs = val_batch["pixel_values"].to(accelerator.device)
-                                targets = val_batch["target"].to(accelerator.device) if "target" in val_batch else inputs
-                                # Use the frozen VAE for encoding
-                                latents = vae.encode(inputs).latent_dist.sample()
-                                # Build validation data dicts
-                                val_data = [
-                                    {"latent": l, "target": t}
-                                    for l, t in zip(latents, targets)
-                                ]
-                                # Log with DreamBooth logger
-                                dreambooth_logger.log_validation(
-                                    epoch=global_step,
-                                    images=val_data,
-                                    prompt=args.validation_prompt,
-                                    validation_metrics={"val_loss": loss.detach().item()}
-                                )
-                        except Exception as e:
-                            logger.warning(f"Could not log validation data for DreamBooth logger: {e}")
-                        logger.info(f"Validation pipeline and logging succeeded at epoch {epoch}")
-                    except Exception as e:
-                        logger.error(f"Could not run validation pipeline or log validation at epoch {epoch}: {e}")
+                    logger.info(f"Validation logging succeeded at epoch {epoch}")
+                except Exception as e:
+                    logger.error(f"Could not log validation data at epoch {epoch}: {e}")
 
     # Save the final model
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         try:
             transformer = unwrap_model(transformer)
+            
+            # Save individual components instead of full pipeline (multispectral VAE compatibility)
+            transformer_save_path = os.path.join(args.output_dir, "transformer")
+            transformer.save_pretrained(transformer_save_path)
+            logger.info(f"Final transformer saved to: {transformer_save_path}")
+            
+            # Save VAE separately
+            vae_save_path = os.path.join(args.output_dir, "vae")
+            vae.save_pretrained(vae_save_path)
+            logger.info(f"Final VAE saved to: {vae_save_path}")
+            
             if args.train_text_encoder:
                 text_encoder_one = unwrap_model(text_encoder_one)
                 text_encoder_two = unwrap_model(text_encoder_two)
                 text_encoder_three = unwrap_model(text_encoder_three)
-                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                    args.pretrained_model_name_or_path,
-                    transformer=transformer,
-                    text_encoder=text_encoder_one,
-                    text_encoder_2=text_encoder_two,
-                    text_encoder_3=text_encoder_three,
-                )
-            else:
-                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                    args.pretrained_model_name_or_path, transformer=transformer
-                )
-            pipeline.save_pretrained(args.output_dir)
-            logger.info(f"Final model saved to: {args.output_dir}")
+                
+                text_encoder_one.save_pretrained(os.path.join(args.output_dir, "text_encoder"))
+                text_encoder_two.save_pretrained(os.path.join(args.output_dir, "text_encoder_2"))
+                text_encoder_three.save_pretrained(os.path.join(args.output_dir, "text_encoder_3"))
+                logger.info(f"Final text encoders saved to: {args.output_dir}")
+            
+            logger.info(f"Final model components saved to: {args.output_dir}")
         except Exception as e:
             logger.error(f"Could not save final model to {args.output_dir}: {e}")
 
