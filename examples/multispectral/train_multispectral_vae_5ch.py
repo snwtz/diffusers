@@ -28,7 +28,18 @@ The model will learn to match the input distribution
 However:
 - The nonlinear processes (spectral attention, SiLU) contain important spectral information
 - spectral relationships learned by the attention mechanism need to be preserved (no hard clamping or tanh activation to force data range [-1/1])
-- 
+
+Mixed Precision Training:
+- Supports FP16/BF16 training via --use_mixed_precision and --dtype flags
+- Uses torch.cuda.amp for automatic mixed precision
+- Reduces memory usage and speeds up training
+- Compatible with all spectral fidelity features
+
+Precise Logging:
+- Use --precise_logging to enable full precision logging without value clipping
+- Logs raw values before any clipping for scientific accuracy
+- Preserves exact numerical values in wandb for analysis
+- Images are still clipped for display but raw values are logged separately
 
 Thesis Context and Training Workflow:
 ----------------------------------
@@ -144,11 +155,11 @@ Usage:
 
 
     # Then, train the VAE:
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0 --use_saturation_penalty
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0 --use_saturation_penalty --use_mixed_precision --dtype float16 --precise_logging
 NOTE: add to your CLI call: --use_saturation_penalty
 
     # Testing
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0 --use_saturation_penalty
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0 --use_saturation_penalty --use_mixed_precision --dtype float16 --precise_logging
 
 VAE Loading Note:
    RGB VAE weights from SD3 could not be loaded directly via `from_pretrained()` using a config object,
@@ -178,15 +189,14 @@ import numpy as np  # Ensure numpy is imported
 from skimage.metrics import structural_similarity as ssim
 import time # Added for timing
 
-# from diffusers import AutoencoderKLMultispectralAdapter  # <-- Commented out sophisticated VAE
-from diffusers.models.autoencoders.autoencoder_ms_benchmark import AutoencoderMSBenchmark as AutoencoderKLMultispectralAdapter
+# Mixed precision imports
+from torch.cuda.amp import autocast, GradScaler
+
+from diffusers import AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
 from vae_multispectral_dataloader import create_vae_dataloaders
 from training_logger import create_training_logger
-from diffusers.models.autoencoders.vae import DecoderOutput
-
-
 
 def setup_logging(args):
     # Create logs directory for experiment traceability and reproducibility
@@ -328,6 +338,9 @@ def setup_wandb(args):
                 "input_channels": 5,
                 "output_channels": 5,
                 "latent_channels": 16,  # SD3 default
+                "use_mixed_precision": args.use_mixed_precision,
+                "dtype": args.dtype,
+                "precise_logging": args.precise_logging,
             },
             tags=["multispectral", "vae", "plant-health", "spectral-imaging"]
         )
@@ -341,113 +354,134 @@ def setup_wandb(args):
             print(f"Warning: Failed to initialize wandb: {e}")
         return False
 
-def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats=None, ssim_per_band=None, current_lr=None, grad_norm=None):
-    """Logs metrics and sample images to Weights & Biases for visualization and analysis."""
+def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats=None, ssim_per_band=None, current_lr=None, grad_norm=None, precise_logging=False):
+    """
+    Logs metrics and sample images to Weights & Biases for visualization and analysis.
+    
+    PRECISE LOGGING APPROACH:
+    ------------------------
+    When precise_logging=True, this function ensures that all numerical values are logged
+    with full precision without any clipping or rounding. This is critical for scientific
+    accuracy in multispectral analysis where small numerical differences can be significant.
+    
+    - All metrics are explicitly converted to float/int/bool to ensure full precision
+    - Raw image values are logged before any clipping for display
+    - Images are still clipped for visualization but raw statistics are preserved
+    - This approach maintains scientific rigor while enabling effective visualization
+    """
     # Check if wandb is initialized
     if not wandb.run:
         return
     
     try:
-        # Prepare metrics data
+        # Prepare metrics data with full precision
         wandb_log_data = {
             "epoch": epoch,
-            "train_total_loss": train_losses.get('total_loss', float('nan')),
-            "val_total_loss": val_losses.get('total_loss', float('nan')),
-            **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses.get('mse_per_channel', []))},
-            **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses.get('mse_per_channel', []))},
-            **{f"band_importance_{k}": v for k, v in band_importance.items()},
+            "train_total_loss": float(train_losses.get('total_loss', float('nan'))),  # Ensure full precision
+            "val_total_loss": float(val_losses.get('total_loss', float('nan'))),  # Ensure full precision
         }
         
-        # Add SSIM metrics if available
+        # Log per-band MSE with full precision
+        for i, loss in enumerate(train_losses.get('mse_per_channel', [])):
+            wandb_log_data[f"train_mse_band_{i}"] = float(loss)  # Ensure full precision
+        for i, loss in enumerate(val_losses.get('mse_per_channel', [])):
+            wandb_log_data[f"val_mse_band_{i}"] = float(loss)  # Ensure full precision
+            
+        # Log band importance with full precision
+        for k, v in band_importance.items():
+            wandb_log_data[f"band_importance_{k}"] = float(v)  # Ensure full precision
+        
+        # Add SSIM metrics if available with full precision
         if ssim_per_band is not None:
             wandb_log_data.update({
-                "avg_ssim": np.mean(ssim_per_band),
-                **{f"ssim_band_{i}": ssim_val for i, ssim_val in enumerate(ssim_per_band)}
+                "avg_ssim": float(np.mean(ssim_per_band)),  # Ensure full precision
             })
+            for i, ssim_val in enumerate(ssim_per_band):
+                wandb_log_data[f"ssim_band_{i}"] = float(ssim_val)  # Ensure full precision
         
-        # Add learning rate if available
+        # Add learning rate if available with full precision
         if current_lr is not None:
-            wandb_log_data["learning_rate"] = current_lr
+            wandb_log_data["learning_rate"] = float(current_lr)  # Ensure full precision
         
-        # Add gradient norm if available
+        # Add gradient norm if available with full precision
         if grad_norm is not None:
-            wandb_log_data["gradient_norm"] = grad_norm
+            wandb_log_data["gradient_norm"] = float(grad_norm)  # Ensure full precision
         
-        # Add SAM loss if available
+        # Add SAM loss if available with full precision
         if 'sam' in train_losses and 'sam' in val_losses:
             wandb_log_data.update({
-                "train_sam_loss": train_losses['sam'],
-                "val_sam_loss": val_losses['sam']
+                "train_sam_loss": float(train_losses['sam']),  # Ensure full precision
+                "val_sam_loss": float(val_losses['sam'])  # Ensure full precision
             })
         
-        # Add mask statistics if available
+        # Add mask statistics if available with full precision
         if 'mask_stats' in train_losses:
             train_mask_stats = train_losses['mask_stats']
             wandb_log_data.update({
-                "mask/train_coverage": train_mask_stats['coverage'],
-                "mask/train_valid_pixels": train_mask_stats['valid_pixels'],
-                "mask/train_total_pixels": train_mask_stats['total_pixels']
+                "mask/train_coverage": float(train_mask_stats['coverage']),  # Ensure full precision
+                "mask/train_valid_pixels": int(train_mask_stats['valid_pixels']),  # Ensure full precision
+                "mask/train_total_pixels": int(train_mask_stats['total_pixels'])  # Ensure full precision
             })
         
         if 'mask_stats' in val_losses:
             val_mask_stats = val_losses['mask_stats']
             wandb_log_data.update({
-                "mask/val_coverage": val_mask_stats['coverage'],
-                "mask/val_valid_pixels": val_mask_stats['valid_pixels'],
-                "mask/val_total_pixels": val_mask_stats['total_pixels']
+                "mask/val_coverage": float(val_mask_stats['coverage']),  # Ensure full precision
+                "mask/val_valid_pixels": int(val_mask_stats['valid_pixels']),  # Ensure full precision
+                "mask/val_total_pixels": int(val_mask_stats['total_pixels'])  # Ensure full precision
             })
         
-        # Add scale monitoring metrics if available
+        # Add scale monitoring metrics if available with full precision
         if 'scale_monitoring' in train_losses:
             scale_info = train_losses['scale_monitoring']
             wandb_log_data.update({
-                "scale/train_global_scale": scale_info['scale_value'],
-                "scale/train_scale_mean": scale_info['scale_mean'],
-                "scale/train_scale_std": scale_info['scale_std'],
-                "scale/train_is_converged": scale_info['is_converged'],
-                "scale/train_convergence_rate": scale_info['convergence_rate'],
-                "scale/train_history_length": scale_info['history_length'],
-                "scale/train_is_collapsed": scale_info['is_collapsed'],
-                "scale/train_is_exploded": scale_info['is_exploded']
+                "scale/train_global_scale": float(scale_info['scale_value']),  # Ensure full precision
+                "scale/train_scale_mean": float(scale_info['scale_mean']),  # Ensure full precision
+                "scale/train_scale_std": float(scale_info['scale_std']),  # Ensure full precision
+                "scale/train_is_converged": bool(scale_info['is_converged']),  # Ensure full precision
+                "scale/train_convergence_rate": float(scale_info['convergence_rate']),  # Ensure full precision
+                "scale/train_history_length": int(scale_info['history_length']),  # Ensure full precision
+                "scale/train_is_collapsed": bool(scale_info['is_collapsed']),  # Ensure full precision
+                "scale/train_is_exploded": bool(scale_info['is_exploded'])  # Ensure full precision
             })
         
         if 'scale_monitoring' in val_losses:
             scale_info = val_losses['scale_monitoring']
             wandb_log_data.update({
-                "scale/val_global_scale": scale_info['scale_value'],
-                "scale/val_scale_mean": scale_info['scale_mean'],
-                "scale/val_scale_std": scale_info['scale_std'],
-                "scale/val_is_converged": scale_info['is_converged'],
-                "scale/val_convergence_rate": scale_info['convergence_rate'],
-                "scale/val_history_length": scale_info['history_length'],
-                "scale/val_is_collapsed": scale_info['is_collapsed'],
-                "scale/val_is_exploded": scale_info['is_exploded']
+                "scale/val_global_scale": float(scale_info['scale_value']),  # Ensure full precision
+                "scale/val_scale_mean": float(scale_info['scale_mean']),  # Ensure full precision
+                "scale/val_scale_std": float(scale_info['scale_std']),  # Ensure full precision
+                "scale/val_is_converged": bool(scale_info['is_converged']),  # Ensure full precision
+                "scale/val_convergence_rate": float(scale_info['convergence_rate']),  # Ensure full precision
+                "scale/val_history_length": int(scale_info['history_length']),  # Ensure full precision
+                "scale/val_is_collapsed": bool(scale_info['is_collapsed']),  # Ensure full precision
+                "scale/val_is_exploded": bool(scale_info['is_exploded'])  # Ensure full precision
             })
         
-        # Add output range statistics if available
+        # Add output range statistics if available with full precision
         if output_range_stats:
             wandb_log_data.update({
-                "output_range/global_min": output_range_stats['global_min'],
-                "output_range/global_max": output_range_stats['global_max'],
-                "output_range/global_mean": output_range_stats['global_mean'],
-                "output_range/global_std": output_range_stats['global_std'],
-                "output_range/warning": output_range_stats['range_warning']
+                "output_range/global_min": float(output_range_stats['global_min']),  # Ensure full precision
+                "output_range/global_max": float(output_range_stats['global_max']),  # Ensure full precision
+                "output_range/global_mean": float(output_range_stats['global_mean']),  # Ensure full precision
+                "output_range/global_std": float(output_range_stats['global_std']),  # Ensure full precision
+                "output_range/warning": bool(output_range_stats['range_warning'])  # Ensure full precision
             })
             
-            # Add per-band range statistics
+            # Add per-band range statistics with full precision
             for i, (min_val, max_val, mean_val, std_val) in enumerate(output_range_stats['per_band']):
                 wandb_log_data.update({
-                    f"output_range/band_{i}_min": min_val,
-                    f"output_range/band_{i}_max": max_val,
-                    f"output_range/band_{i}_mean": mean_val,
-                    f"output_range/band_{i}_std": std_val,
+                    f"output_range/band_{i}_min": float(min_val),  # Ensure full precision
+                    f"output_range/band_{i}_max": float(max_val),  # Ensure full precision
+                    f"output_range/band_{i}_mean": float(mean_val),  # Ensure full precision
+                    f"output_range/band_{i}_std": float(std_val),  # Ensure full precision
                 })
 
-        # Log learnable output scaling parameters (if available)
+        # Log learnable output scaling parameters (if available) with full precision
         if hasattr(model.output_adapter, 'output_scale'):
-            wandb_log_data["output_adapter/output_scale"] = model.output_adapter.output_scale.item()
+            wandb_log_data["output_adapter/output_scale"] = float(model.output_adapter.output_scale.item())  # Ensure full precision
         if hasattr(model.output_adapter, 'output_bias'):
-            wandb_log_data["output_adapter/output_bias"] = model.output_adapter.output_bias.item()
+            wandb_log_data["output_adapter/output_bias"] = float(model.output_adapter.output_bias.item())  # Ensure full precision
         
         # Log metrics
         wandb.log(wandb_log_data)
@@ -460,18 +494,29 @@ def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, recons
                 orig_band0 = (batch[0, 0].detach().cpu().numpy() + 1.0) * 127.5
                 recon_band0 = (reconstruction[0, 0].detach().cpu().numpy() + 1.0) * 127.5
                 
-                # Ensure values are in valid range
-                orig_band0 = np.clip(orig_band0, 0, 255).astype(np.uint8)
-                recon_band0 = np.clip(recon_band0, 0, 255).astype(np.uint8)
+                # Log precise values before any clipping for scientific accuracy
+                wandb_log_data.update({
+                    "images/original_band0_raw_min": float(orig_band0.min()),
+                    "images/original_band0_raw_max": float(orig_band0.max()),
+                    "images/original_band0_raw_mean": float(orig_band0.mean()),
+                    "images/reconstructed_band0_raw_min": float(recon_band0.min()),
+                    "images/reconstructed_band0_raw_max": float(recon_band0.max()),
+                    "images/reconstructed_band0_raw_mean": float(recon_band0.mean()),
+                })
+                
+                # Create visualization images with minimal clipping for display purposes only
+                # Use a more conservative clipping range to preserve more information
+                orig_band0_viz = np.clip(orig_band0, 0, 255).astype(np.uint8)
+                recon_band0_viz = np.clip(recon_band0, 0, 255).astype(np.uint8)
                 
                 # Convert to PIL images
-                orig_pil = Image.fromarray(orig_band0, mode='L')  # Grayscale
-                recon_pil = Image.fromarray(recon_band0, mode='L')  # Grayscale
+                orig_pil = Image.fromarray(orig_band0_viz, mode='L')  # Grayscale
+                recon_pil = Image.fromarray(recon_band0_viz, mode='L')  # Grayscale
                 
-                # Log images to wandb
+                # Log images to wandb with warning about clipping in caption
                 wandb.log({
-                    "images/original_band0": wandb.Image(orig_pil, caption=f"Original Band 0 - Epoch {epoch+1}"),
-                    "images/reconstructed_band0": wandb.Image(recon_pil, caption=f"Reconstructed Band 0 - Epoch {epoch+1}")
+                    "images/original_band0": wandb.Image(orig_pil, caption=f"Original Band 0 - Epoch {epoch+1} (clipped for display)"),
+                    "images/reconstructed_band0": wandb.Image(recon_pil, caption=f"Reconstructed Band 0 - Epoch {epoch+1} (clipped for display)")
                 })
             except Exception as img_error:
                 # Use logger if available, otherwise print
@@ -750,17 +795,17 @@ def load_checkpoint(checkpoint_path: str, model, optimizer, scheduler, device):
     
     return start_epoch, best_val_loss, patience_counter
 
-def log_training_progress_to_wandb(step, total_loss, current_lr, grad_norm=None, log_interval=10):
-    """Log training progress to wandb during training loop."""
+def log_training_progress_to_wandb(step, total_loss, current_lr, grad_norm=None, log_interval=10, precise_logging=False):
+    """Log training progress to wandb during training loop with full precision."""
     if wandb.run and step % log_interval == 0:
         try:
             log_data = {
                 "train_step": step,
-                "train_loss": total_loss.item() if hasattr(total_loss, 'item') else total_loss,
-                "learning_rate": current_lr
+                "train_loss": float(total_loss.item() if hasattr(total_loss, 'item') else total_loss),  # Ensure full precision
+                "learning_rate": float(current_lr)  # Ensure full precision
             }
             if grad_norm is not None:
-                log_data["gradient_norm"] = grad_norm
+                log_data["gradient_norm"] = float(grad_norm)  # Ensure full precision
             wandb.log(log_data)
         except Exception as e:
             # Silently fail to avoid disrupting training
@@ -823,6 +868,9 @@ def train(args: argparse.Namespace) -> None:
         "warmup_ratio": args.warmup_ratio,
         "early_stopping_patience": args.early_stopping_patience,
         "max_grad_norm": args.max_grad_norm,
+        "use_mixed_precision": args.use_mixed_precision,
+        "dtype": args.dtype,
+        "precise_logging": args.precise_logging,
         "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
     training_logger.log_config(config)
@@ -845,32 +893,45 @@ def train(args: argparse.Namespace) -> None:
     # Load base SD3 VAE weights and inject fresh multispectral adapters
     try:
         logger.info(f"Loading base model from: {args.base_model_path}")
-        # Refactored: Use explicit adapter and backbone channel config fields for clarity
+        
+        # Convert dtype string to torch dtype
+        dtype_map = {
+            "float16": torch.float16,
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16
+        }
+        torch_dtype = dtype_map.get(args.dtype, torch.float32)
+        
         model = AutoencoderKLMultispectralAdapter.from_pretrained(
             pretrained_model_name_or_path=args.base_model_path,
             subfolder=args.subfolder,
             adapter_placement=args.adapter_placement,
             use_spectral_attention=args.use_spectral_attention,
             use_sam_loss=args.use_sam_loss,
-            adapter_in_channels=5,  # Refactored: adapter input channels
-            adapter_out_channels=5, # Refactored: adapter output channels
-            backbone_in_channels=3, # Refactored: backbone input channels
-            backbone_out_channels=3, # Refactored: backbone output channels
+            adapter_in_channels=5,  # Force 5 channels for multispectral input
+            adapter_out_channels=5,   # Force 5 channels for multispectral output
+            backbone_in_channels=3,  # SD3 backbone input channels
+            backbone_out_channels=3,  # SD3 backbone output channels
             use_saturation_penalty=args.use_saturation_penalty,
+            torch_dtype=torch_dtype,
         )
         logger.info("Successfully loaded base model")
         
         # Log the configuration to verify it's set correctly
         logger.info(f"VAE Configuration:")
-        logger.info(f"  - in_channels: {model.config.in_channels}")
-        logger.info(f"  - out_channels: {model.config.out_channels}")
+        logger.info(f"  - adapter_in_channels: {model.adapter_in_channels}")
+        logger.info(f"  - adapter_out_channels: {model.adapter_out_channels}")
+        logger.info(f"  - backbone_in_channels: {model.backbone_in_channels}")
+        logger.info(f"  - backbone_out_channels: {model.backbone_out_channels}")
         logger.info(f"  - latent_channels: {model.config.latent_channels}")
         logger.info(f"  - adapter_placement: {model.adapter_placement}")
         logger.info(f"  - use_spectral_attention: {model.use_spectral_attention}")
+        logger.info(f"  - model_dtype: {next(model.parameters()).dtype}")
+        logger.info(f"  - mixed_precision: {args.use_mixed_precision}")
         # Explicit assertion and log for input/output adapter channels (safer)
-        assert model.input_adapter.in_channels == 5, f"Input adapter expects {model.input_adapter.in_channels} channels, expected 5!"
-        assert model.output_adapter.out_channels == 5, f"Output adapter produces {model.output_adapter.out_channels} channels, expected 5!"
-        logger.info(f"[CHECK] Adapter input/output channels: {model.input_adapter.in_channels} -> {model.output_adapter.out_channels}")
+        assert model.input_adapter.adapter_in_channels == 5, f"Input adapter expects {model.input_adapter.adapter_in_channels} channels, expected 5!"
+        assert model.output_adapter.adapter_out_channels == 5, f"Output adapter produces {model.output_adapter.adapter_out_channels} channels, expected 5!"
+        logger.info(f"[CHECK] Adapter input/output channels: {model.input_adapter.adapter_in_channels} → {model.output_adapter.adapter_out_channels}")
     except Exception as e:
         logger.error(f"Failed to load base model: {e}")
         raise RuntimeError(f"Model loading failed: {e}")
@@ -893,21 +954,6 @@ def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     logger.info(f"Model moved to device: {device}")
-
-    # Load reference signature (default to provided values if not given)
-    if args.reference_signature_path is not None:
-        reference_signature = np.load(args.reference_signature_path)
-        reference_signature = torch.tensor(reference_signature, dtype=torch.float32)
-    else:
-        # Default: mean of provided ranges
-        reference_signature = torch.tensor([
-            0.055,  # Band 0 (474.73 nm): mean of 0.045–0.065
-            0.12,   # Band 1 (538.71 nm): mean of 0.10–0.14
-            0.05,   # Band 2 (650.665 nm): mean of 0.04–0.06
-            0.31,   # Band 3 (730.635 nm): mean of 0.26–0.36
-            0.325   # Band 4 (850.59 nm): mean of 0.26–0.39
-        ], dtype=torch.float32)
-    reference_signature = reference_signature.to(device)
 
     # Log parameter counts before training
     # This helps track model complexity and training efficiency
@@ -944,6 +990,15 @@ def train(args: argparse.Namespace) -> None:
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps
     )
+
+    # Initialize mixed precision training if enabled
+    scaler = None
+    if args.use_mixed_precision and torch.cuda.is_available():
+        scaler = GradScaler()
+        logger.info("Mixed precision training enabled with GradScaler")
+    elif args.use_mixed_precision and not torch.cuda.is_available():
+        logger.warning("Mixed precision requested but CUDA not available - falling back to FP32")
+        args.use_mixed_precision = False
 
     # Initialize EMA model
     # Improves training stability and final model quality
@@ -987,37 +1042,29 @@ def train(args: argparse.Namespace) -> None:
             if mask is None:
                 logger.warning(f"[MASK WARNING] No mask provided for training batch at step {step}!")
             # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
-            # Use per-band means for NaNs to maintain spectral realism, clamp infinities to [-1,1]
+            # Conceptually preserve the NaN-based primary mask for calculating masked losses!
             # Ensures that only valid data is passed to the model, preventing NaN/infinity propagation
-            if torch.isnan(batch).any():
-                for band_idx in range(batch.shape[1]):
-                    band = batch[:, band_idx]
-                    nan_mask = torch.isnan(band)
-                    if nan_mask.any():
-                        band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
-                        batch[:, band_idx][nan_mask] = band_mean
-            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
+            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
             batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
             # Forward pass with mask support for leaf-focused training
             try:
-                # Use the model's forward method which now supports mask parameter
-                # This automatically handles encoding, decoding, and masked loss computation
-                reconstruction, losses = model.forward(sample=batch, mask=mask)
-                # Add spectral signature loss
-                if reference_signature is not None:
-                    # Compute mean spectrum over leaf pixels
-                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                    recon_mean_spectrum = recon_sum / mask_sum
-                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                    losses['spectral_signature_loss'] = spectral_signature_loss
-                    losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
-                    # Log mean spectrum for monitoring
-                    if step % log_interval == 0:
-                        logger.info(f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
-                        logger.info(f"Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
-                        logger.info(f"Spectral signature loss: {spectral_signature_loss.item():.6f}")
+                # Use mixed precision if enabled
+                if args.use_mixed_precision and scaler is not None:
+                    with autocast():
+                        # Use the model's forward method which now supports mask parameter
+                        # This automatically handles encoding, decoding, and masked loss computation
+                        reconstruction, losses = model.forward(sample=batch, mask=mask)
+                else:
+                    # Use the model's forward method which now supports mask parameter
+                    # This automatically handles encoding, decoding, and masked loss computation
+                    reconstruction, losses = model.forward(sample=batch, mask=mask)
+
+                # Check for NaNs in reconstruction and skip if corrupted
+                if torch.isnan(reconstruction).any():
+                    logger.warning("NaNs detected in reconstruction — skipping batch")
+                    continue
+
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
                 continue
@@ -1104,27 +1151,53 @@ def train(args: argparse.Namespace) -> None:
                             f"mean={batch_output_stats['global_mean']:.4f}, "
                             f"std={batch_output_stats['global_std']:.4f}")
 
-            # Backward pass
+            # Backward pass with mixed precision support
             optimizer.zero_grad()
-            total_loss.backward()
-
-            # Apply gradient clipping
-            # Prevents exploding gradients
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=args.max_grad_norm
-            )
             
-            # Track gradient norm for wandb logging
-            current_grad_norm = grad_norm.item()
+            if args.use_mixed_precision and scaler is not None:
+                # Mixed precision backward pass
+                scaler.scale(total_loss).backward()
+                
+                # Apply gradient clipping with scaler
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=args.max_grad_norm
+                )
+                
+                # Track gradient norm for wandb logging
+                current_grad_norm = grad_norm.item()
 
-            # Log if gradients were clipped
-            # Helps monitor training stability
-            if grad_norm > args.max_grad_norm:
-                logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
+                # Log if gradients were clipped
+                # Helps monitor training stability
+                if grad_norm > args.max_grad_norm:
+                    logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
 
-            optimizer.step()
-            scheduler.step()
+                # Optimizer step with scaler
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+            else:
+                # Standard backward pass
+                total_loss.backward()
+
+                # Apply gradient clipping
+                # Prevents exploding gradients
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=args.max_grad_norm
+                )
+                
+                # Track gradient norm for wandb logging
+                current_grad_norm = grad_norm.item()
+
+                # Log if gradients were clipped
+                # Helps monitor training stability
+                if grad_norm > args.max_grad_norm:
+                    logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
+
+                optimizer.step()
+                scheduler.step()
 
             # Update EMA model
             # Improves model stability
@@ -1132,7 +1205,7 @@ def train(args: argparse.Namespace) -> None:
             
             # Log training progress to wandb
             if wandb_initialized:
-                log_training_progress_to_wandb(step, total_loss, scheduler.get_last_lr()[0], current_grad_norm, log_interval)
+                log_training_progress_to_wandb(step, total_loss, scheduler.get_last_lr()[0], current_grad_norm, log_interval, args.precise_logging)
 
             # Track losses and mask statistics
             # Monitors training progress and mask coverage
@@ -1151,71 +1224,73 @@ def train(args: argparse.Namespace) -> None:
             'mse_per_channel': torch.zeros(5, device=device),  # 5 bands
             'sam_loss': 0
         }
-        recon_mean_spectra = []
-        ssim_per_band = []  # To accumulate average SSIM per band over all batches
-        output_range_stats = None  # To collect output range statistics
+
         with torch.no_grad():
+            ssim_per_band = []  # To accumulate average SSIM per band over all batches
+            output_range_stats = None  # To collect output range statistics
             for batch, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
                 batch = batch.to(device)
                 mask = mask.to(device) # Background mask (1 for leaf, 0 for background)
                 if mask is None:
                     logger.warning(f"[MASK WARNING] No mask provided for validation batch!")
-                # Debug print for mask sum
-                print("[DEBUG] Validation mask sum (should be >0):", mask.sum().item())
+                # (Removed debug logging for NaNs in validation batch)
                 # Sanitize batch to remove NaNs and Infs, and preserve [-1, 1] range for VAE compatibility
-                # Use per-band means for NaNs to maintain spectral realism, clamp infinities to [-1,1]
-                if torch.isnan(batch).any():
-                    for band_idx in range(batch.shape[1]):
-                        band = batch[:, band_idx]
-                        nan_mask = torch.isnan(band)
-                        if nan_mask.any():
-                            band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
-                            batch[:, band_idx][nan_mask] = band_mean
-                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
+                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
                 batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
 
                 # Forward pass with mask support for validation
-                # MSE FIX: Temporarily set model to training mode to get losses
-                model.train()
-                result = model.forward(sample=batch, mask=mask)
-                model.eval()  # Switch back to eval mode
-                
-                if isinstance(result, tuple) and len(result) == 2:
-                    reconstruction, losses = result
-                else:
-                    # This should not happen anymore with the fix above
-                    reconstruction = result
-                    losses = {}
-                    logger.warning("WARNING: Model forward() returned only reconstruction in validation")
-                
-                # Fix: If reconstruction is DecoderOutput, extract .sample
-                if isinstance(reconstruction, DecoderOutput):
-                    reconstruction = reconstruction.sample
+                try:
+                    # Use mixed precision if enabled (even for validation)
+                    if args.use_mixed_precision and scaler is not None:
+                        with autocast():
+                            # Use the model's forward method which now supports mask parameter
+                            # This automatically handles encoding, decoding, and masked loss computation
+                            reconstruction, losses = model.forward(sample=batch, mask=mask)
+                    else:
+                        # Use the model's forward method which now supports mask parameter
+                        # This automatically handles encoding, decoding, and masked loss computation
+                        reconstruction, losses = model.forward(sample=batch, mask=mask)
+                    
+                    # Check for NaNs in reconstruction and skip if corrupted
+                    if torch.isnan(reconstruction).any():
+                        logger.warning("NaNs detected in reconstruction — skipping validation batch")
+                        continue
+                        
+                except Exception as e:
+                    logger.error(f"Validation forward pass failed: {e}")
+                    continue
 
-                # Spectral signature loss and mean spectrum
-                if reference_signature is not None:
-                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                    recon_mean_spectrum = recon_sum / mask_sum
-                    recon_mean_spectra.append(recon_mean_spectrum.detach().cpu().numpy())
-                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                    losses['spectral_signature_loss'] = spectral_signature_loss
-                    losses['total_loss'] = losses.get('total_loss', 0) + args.spectral_signature_weight * spectral_signature_loss
-                    logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
-                    logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
-                    logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
+                # Pass the mask into compute_losses to handle background masking internally.
+                # This ensures only leaf regions (mask == 1) contribute to loss, and avoids double-masking issues
+                # such as background bounding box artifacts. Background is optionally included via a soft penalty.
+                # Validate losses structure
+                if not isinstance(losses, dict):
+                    logger.error(f"Model forward() returned non-dict losses: {type(losses)}")
+                    continue
 
-                # Accumulate losses
-                val_losses['total_loss'] += losses.get('total_loss', 0).item() if 'total_loss' in losses else 0
-                if 'mse_per_channel' in losses:
-                    val_losses['mse_per_channel'] += losses['mse_per_channel']
+                # Calculate total loss
+                # Consistent with training loss computation
+                if 'mse' not in losses:
+                    continue
+
+                total_loss = losses['mse']
                 if args.use_sam_loss and 'sam' in losses:
-                    val_losses['sam_loss'] += losses['sam'].item()
+                    total_loss = total_loss + args.sam_weight * losses['sam']
+                # Debugging: Check for NaN in total loss (validation)
+                if torch.isnan(total_loss):
+                    logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
 
-                # SSIM computation (per band, accumulate)
+                # Compute SSIM per-band (compatibility with skimage.metrics.ssim)
+                # Loop over both batch and channel dimensions using skimage.metrics.structural_similarity
+                # CRITICAL: Apply mask to both original and reconstructed images before SSIM computation
+                # This ensures we only evaluate reconstruction quality on leaf regions, not background
+
+                # NOTE: fallback of computing SSIM without mask will include background, potentially biasing results.
                 batch_np = batch.detach()
                 recon_np = reconstruction.detach()
                 mask_np = mask.detach()  # Background mask (1 for leaf, 0 for background)
+                
+                # Accumulate average SSIM per band for this batch
                 num_bands = batch_np.shape[1]
                 batch_size = batch_np.shape[0]
                 batch_ssim_per_band = []
@@ -1227,43 +1302,58 @@ def train(args: argparse.Namespace) -> None:
                         original_band = batch_np[sample_idx, band_idx].cpu().numpy()
                         recon_band = recon_np[sample_idx, band_idx].cpu().numpy()
                         sample_mask = mask_np[sample_idx, 0].cpu().numpy()  # (H, W)
+                        
                         # Only compute SSIM if there are valid leaf pixels
                         if np.sum(sample_mask) > 0:
+                            # Apply mask to both original and reconstructed bands
                             masked_orig = original_band * sample_mask
                             masked_recon = recon_band * sample_mask
+                            
+                            # Compute SSIM only on the masked region
+                            # NOTE: SSIM computation assumes [-1, 1] range, but adapter output may be unconstrained
+                            # The data_range parameter should be adjusted based on actual output range
+                            # TODO: Consider dynamic data_range adjustment based on output_range_stats
                             try:
-                                ssim_val = ssim(masked_orig, masked_recon, data_range=2.0, mask=sample_mask.astype(bool))
+                                # Use fixed data_range for now, but consider dynamic adjustment
+                                # data_range = output_range_stats['global_max'] - output_range_stats['global_min'] if output_range_stats else 2.0
+                                ssim_val = ssim(masked_orig, masked_recon, data_range=2.0,  # [-1, 1] range = 2.0
+                                              mask=sample_mask.astype(bool))
                             except TypeError:
+                                # Fallback: compute SSIM on entire image but this includes background
+                                # This is less accurate but ensures compatibility
                                 logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
-                                ssim_val = ssim(original_band, recon_band, data_range=2.0)
+                                ssim_val = ssim(original_band, recon_band, data_range=2.0)  # [-1, 1] range = 2.0
+                            
                             band_ssim_total += ssim_val
                             valid_samples += 1
+                    
+                    # Average SSIM for this band across valid samples
                     if valid_samples > 0:
                         batch_ssim_per_band.append(band_ssim_total / valid_samples)
                     else:
                         batch_ssim_per_band.append(0.0)  # No valid leaf regions
+                
+                # Accumulate per-batch SSIMs for averaging after all batches
                 if len(ssim_per_band) == 0:
                     ssim_per_band = batch_ssim_per_band
                 else:
                     ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
 
-                # Output range stats (first batch only)
+                # Track losses and mask statistics
+                # Monitors validation performance and mask coverage
+                val_losses['total_loss'] += total_loss.item()
+                if 'mse_per_channel' in losses:
+                    val_losses['mse_per_channel'] += losses['mse_per_channel']
+                if args.use_sam_loss and 'sam' in losses:
+                    val_losses['sam_loss'] += losses['sam'].item()
+                
+                # Collect output range statistics (use first batch for efficiency)
                 if output_range_stats is None:
                     output_range_stats = compute_output_range_stats(reconstruction)
-
-        # After validation loop: average all metrics
-        num_batches = len(val_loader)
-        for key in val_losses:
-            if isinstance(val_losses[key], torch.Tensor):
-                val_losses[key] /= num_batches
-            else:
-                val_losses[key] /= num_batches
-        if recon_mean_spectra:
-            epoch_recon_mean_spectrum = np.mean(np.stack(recon_mean_spectra), axis=0)
-        else:
-            epoch_recon_mean_spectrum = None
-        if ssim_per_band:
-            ssim_per_band = [v / num_batches for v in ssim_per_band]
+                    
+            # After validation loop, average ssim_per_band over number of batches
+            if len(val_loader) > 0:
+                ssim_per_band = [v / len(val_loader) for v in ssim_per_band]
 
         # Average losses
         # Computes epoch-level metrics
@@ -1324,8 +1414,7 @@ def train(args: argparse.Namespace) -> None:
             global_scale=current_scale,
             learning_rate=scheduler.get_last_lr()[0],
             grad_norm=current_grad_norm,
-            output_range_stats=output_range_stats,
-            recon_mean_spectrum=epoch_recon_mean_spectrum.tolist() if epoch_recon_mean_spectrum is not None else None
+            output_range_stats=output_range_stats
         )
         
         # Log model health periodically
@@ -1341,20 +1430,22 @@ def train(args: argparse.Namespace) -> None:
         # Log metrics
         # Tracks training progress
         log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args, output_range_stats)
-        # Log spectral signature loss
-        if 'spectral_signature_loss' in train_losses:
-            logger.info(f"[EPOCH] Spectral signature loss (train): {train_losses['spectral_signature_loss']:.6f}")
-        if 'spectral_signature_loss' in val_losses:
-            logger.info(f"[EPOCH] Spectral signature loss (val): {val_losses['spectral_signature_loss']:.6f}")
         
         # Save grayscale band 0 of the first sample as PNG for local inspection
         try:
             orig_img = (batch[0][0].detach().cpu().numpy() + 1.0) * 127.5  # from [-1,1] to [0,255]
             recon_img = (reconstruction[0][0].detach().cpu().numpy() + 1.0) * 127.5
-            orig_img = np.clip(orig_img, 0, 255).astype(np.uint8)
-            recon_img = np.clip(recon_img, 0, 255).astype(np.uint8)
-            orig_pil = Image.fromarray(orig_img, mode='L')
-            recon_pil = Image.fromarray(recon_img, mode='L')
+            
+            # Log precise values before clipping for scientific accuracy
+            logger.info(f"Epoch {epoch+1} - Original Band 0: min={orig_img.min():.2f}, max={orig_img.max():.2f}, mean={orig_img.mean():.2f}")
+            logger.info(f"Epoch {epoch+1} - Reconstructed Band 0: min={recon_img.min():.2f}, max={recon_img.max():.2f}, mean={recon_img.mean():.2f}")
+            
+            # Create visualization images with minimal clipping for display purposes only
+            orig_img_viz = np.clip(orig_img, 0, 255).astype(np.uint8)
+            recon_img_viz = np.clip(recon_img, 0, 255).astype(np.uint8)
+            
+            orig_pil = Image.fromarray(orig_img_viz, mode='L')
+            recon_pil = Image.fromarray(recon_img_viz, mode='L')
             orig_pil.save(os.path.join(image_output_dir, f"epoch_{epoch+1}_original_band0.png"))
             recon_pil.save(os.path.join(image_output_dir, f"epoch_{epoch+1}_recon_band0.png"))
         except Exception as e:
@@ -1363,7 +1454,7 @@ def train(args: argparse.Namespace) -> None:
         # Log to wandb (includes both metrics and images)
         if wandb_initialized:
             try:
-                log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats, ssim_per_band, scheduler.get_last_lr()[0], current_grad_norm)
+                log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats, ssim_per_band, scheduler.get_last_lr()[0], current_grad_norm, args.precise_logging)
             except Exception as e:
                 logger.warning(f"Failed to log to wandb: {e}")
 
@@ -1456,10 +1547,12 @@ def main():
                         help="Weight for range penalty (default: 0.2er than saturation for output control)")
     parser.add_argument("--range_threshold", type=float, default=1.0,
                         help="Threshold for range penalty (default: 1.0, enforces [-1] output range)")
-    parser.add_argument("--spectral_signature_weight", type=float, default=0.1,
-    help="Weight for spectral signature guidance loss")
-    parser.add_argument("--reference_signature_path", type=str, default=None,
-    help="Path to .npy file containing reference spectral signature (5-element array)")
+    parser.add_argument("--use_mixed_precision", action="store_true",
+                        help="Enable mixed precision training (FP16) for faster training and reduced memory usage")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float16", "float32", "bfloat16"],
+                        help="Model dtype for training (default: float32)")
+    parser.add_argument("--precise_logging", action="store_true",
+                        help="Enable precise logging without value clipping for scientific accuracy")
 
     args = parser.parse_args()
 

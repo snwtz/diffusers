@@ -11,8 +11,6 @@ Only the SD3 components are trained during DreamBooth fine-tuning.
 
 CHANNEL CONFIGURATION:
 - Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
-- VAE Adapter: 5-in/5-out (adapter_in_channels/adapter_out_channels)
-- VAE Backbone: 3-in/3-out (backbone_in_channels/backbone_out_channels)
 - VAE Output: 16 latent channels (matching SD3 transformer's default expectation)
 - Transformer Input: 16 latent channels (SD3's default in_channels)
 
@@ -295,13 +293,6 @@ Usage:
         --train_batch_size 4 \
         --learning_rate 1e-4 \
         --mixed_precision fp16
-
-# TODO: Research questions for multispectral DreamBooth
-# 1. How does the text encoder handle multispectral concepts?
-# 2. Should we modify the prior preservation loss for multispectral data?
-# 3. Do we need to adjust the learning rate for 5-channel inputs?
-# 4. How does the latent space distribution change with 5-channel input?
-# 5. What is the optimal way to visualize multispectral training progress?
 """
 
 # Unused imports that were removed:
@@ -323,9 +314,6 @@ Usage:
 # - transformers: Using specific imports instead
 # - diffusers: Using specific imports instead
 
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))) # keep: fixes module import bug
 import argparse
 import copy
 import itertools
@@ -347,14 +335,11 @@ from tqdm.auto import tqdm
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
 
 from diffusers import (
+    AutoencoderKLMultispectralAdapter,
     FlowMatchEulerDiscreteScheduler,
     SD3Transformer2DModel,
     StableDiffusion3Pipeline,
 )
-# Import the multispectral VAE adapter
-from src.diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter
-# --- Import ControlNetModel for spatial conditioning integration ---
-from diffusers import ControlNetModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3, free_memory
 from diffusers.utils import (
@@ -367,7 +352,7 @@ from diffusers.utils.torch_utils import is_compiled_module
 # Import custom multispectral dataloader
 import sys
 import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../..'))) 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from multispectral_dataloader import create_multispectral_dataloader
 
 # Import for logging setup
@@ -382,185 +367,12 @@ check_min_version("0.34.0.dev0")
 
 logger = get_logger(__name__)
 
-# --- DreamBooth logger creation (ensure frozen VAE is passed in for validation decoding) ---
-def create_dreambooth_logger(output_dir, model_name, vae):
-    # Use the comprehensive DreamBooth logger from dreambooth_logger.py
-    from dreambooth_logger import create_dreambooth_logger as create_comprehensive_logger
-    return create_comprehensive_logger(output_dir, model_name, vae)
-
-def load_text_encoders(args):
-    """Load the three text encoders for SD3."""
-    # Import the correct text encoder classes
-    text_encoder_cls_one = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision
-    )
-    text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
-    )
-    text_encoder_cls_three = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_3"
-    )
-    
-    text_encoder_one = text_encoder_cls_one.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
-    )
-    text_encoder_two = text_encoder_cls_two.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
-    )
-    text_encoder_three = text_encoder_cls_three.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant
-    )
-    return text_encoder_one, text_encoder_two, text_encoder_three
-
-def import_model_class_from_model_name_or_path(
-    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
-):
-    text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
-    )
-    model_class = text_encoder_config.architectures[0]
-    if model_class == "CLIPTextModelWithProjection":
-        from transformers import CLIPTextModelWithProjection
-        return CLIPTextModelWithProjection
-    elif model_class == "T5EncoderModel":
-        from transformers import T5EncoderModel
-        return T5EncoderModel
-    else:
-        raise ValueError(f"{model_class} is not supported.")
-
-
-def tokenize_prompt(tokenizer, prompt):
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=77,
-        truncation=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
-    return text_input_ids
-
-
-def _encode_prompt_with_t5(
-    text_encoder,
-    tokenizer,
-    max_sequence_length,
-    prompt=None,
-    num_images_per_prompt=1,
-    device=None,
-):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
-
-    text_inputs = tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=max_sequence_length,
-        truncation=True,
-        add_special_tokens=True,
-        return_tensors="pt",
-    )
-    text_input_ids = text_inputs.input_ids
-    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
-
-    dtype = text_encoder.dtype
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
-    _, seq_len, _ = prompt_embeds.shape
-
-    # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-
-    return prompt_embeds
-
-
-def _encode_prompt_with_clip(
-    text_encoder,
-    tokenizer,
-    prompt: str,
-    device=None,
-    text_input_ids=None,
-    num_images_per_prompt: int = 1,
-):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
-
-    if tokenizer is not None:
-        text_inputs = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=77,
-            truncation=True,
-            return_tensors="pt",
-        )
-
-        text_input_ids = text_inputs.input_ids
-    else:
-        if text_input_ids is None:
-            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
-
-    prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
-
-    pooled_prompt_embeds = prompt_embeds[0]
-    prompt_embeds = prompt_embeds.hidden_states[-2]
-    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
-
-    _, seq_len, _ = prompt_embeds.shape
-    # duplicate text embeddings for each generation per prompt, using mps friendly method
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-
-    return prompt_embeds, pooled_prompt_embeds
-
-
-def encode_prompt(
-    text_encoders,
-    tokenizers,
-    prompt: str,
-    max_sequence_length,
-    device=None,
-    num_images_per_prompt: int = 1,
-    text_input_ids_list=None,
-):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-
-    clip_tokenizers = tokenizers[:2]
-    clip_text_encoders = text_encoders[:2]
-
-    clip_prompt_embeds_list = []
-    clip_pooled_prompt_embeds_list = []
-    for i, (tokenizer, text_encoder) in enumerate(zip(clip_tokenizers, clip_text_encoders)):
-        prompt_embeds, pooled_prompt_embeds = _encode_prompt_with_clip(
-            text_encoder=text_encoder,
-            tokenizer=tokenizer,
-            prompt=prompt,
-            device=device if device is not None else text_encoder.device,
-            num_images_per_prompt=num_images_per_prompt,
-            text_input_ids=text_input_ids_list[i] if text_input_ids_list else None,
-        )
-        clip_prompt_embeds_list.append(prompt_embeds)
-        clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
-
-    clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = torch.cat(clip_pooled_prompt_embeds_list, dim=-1)
-
-    t5_prompt_embed = _encode_prompt_with_t5(
-        text_encoders[-1],
-        tokenizers[-1],
-        max_sequence_length,
-        prompt=prompt,
-        num_images_per_prompt=num_images_per_prompt,
-        device=device if device is not None else text_encoders[-1].device,
-    )
-
-    clip_prompt_embeds = torch.nn.functional.pad(
-        clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
-    )
-    prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
-
-    return prompt_embeds, pooled_prompt_embeds
-
+# TODO: Research questions for multispectral DreamBooth
+# 1. How does the text encoder handle multispectral concepts?
+# 2. Should we modify the prior preservation loss for multispectral data?
+# 3. Do we need to adjust the learning rate for 5-channel inputs?
+# 4. How does the latent space distribution change with 5-channel input?
+# 5. What is the optimal way to visualize multispectral training progress?
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="DreamBooth training script for SD3 with multispectral support.")
@@ -591,13 +403,6 @@ def parse_args(input_args=None):
         type=str,
         required=True,
         help="Path to the pretrained multispectral VAE. Required for multispectral training.",
-    )
-    # --- ControlNet: Add argument for optional ControlNet model path ---
-    parser.add_argument(
-        "--controlnet_model_name_or_path",
-        type=str,
-        default=None,
-        help="Path or identifier for pretrained ControlNet (for spatial conditioning on leaf mask)."
     )
     
     # Add all other standard DreamBooth arguments
@@ -969,12 +774,6 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--log_steps",
-        type=int,
-        default=100,
-        help="Number of steps between detailed logs (loss, lr, grad_norm)."
-    )
-    parser.add_argument(
         "--prior_generation_precision",
         type=str,
         default=None,
@@ -1014,7 +813,6 @@ def parse_args(input_args=None):
             warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
 
     return args
-
 
 def validate_dataloader_output(dataloader, num_channels):
     """
@@ -1088,12 +886,9 @@ def adapt_visualization_for_multispectral(image_tensor):
     return rgb_tensor
 
 def main(args):
-    print("Starting DreamBooth multispectral training...")
-    print(f"Output directory: {args.output_dir}")
-    print(f"VAE path: {args.vae_path}")
-    print(f"Instance data dir: {args.instance_data_dir}")
     """
     Main training function for multispectral DreamBooth fine-tuning.
+    
     This function orchestrates the training process, including:
     1. Model initialization with pretrained VAE
     2. Data loading and preprocessing
@@ -1103,7 +898,6 @@ def main(args):
     Args:
         args: Command line arguments containing training configuration
     """
-    
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -1135,17 +929,6 @@ def main(args):
     if args.report_to == "wandb":
         if not is_wandb_available():
             raise ImportError("Make sure to install wandb if you want to use it for logging during training.")
-        
-        # Use wandb setup from dreambooth_logger
-        from dreambooth_logger import setup_wandb_dreambooth
-        wandb_success = setup_wandb_dreambooth(
-            args=args,
-            instance_prompt=args.instance_prompt,
-            class_prompt=args.class_prompt if args.with_prior_preservation else None
-        )
-        if not wandb_success:
-            logger.warning("Failed to initialize wandb, continuing without wandb logging")
-            args.report_to = "tensorboard"  # Fallback to tensorboard
 
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -1247,20 +1030,18 @@ def main(args):
     
     # Log VAE configuration for debugging
     logger.info(f"VAE config - latent_channels: {vae.config.latent_channels}")
-    logger.info(f"VAE config - adapter_in_channels: {getattr(vae.config, 'adapter_in_channels', 'N/A')}")
-    logger.info(f"VAE config - adapter_out_channels: {getattr(vae.config, 'adapter_out_channels', 'N/A')}")
-    logger.info(f"VAE config - backbone_in_channels: {getattr(vae.config, 'backbone_in_channels', 'N/A')}")
-    logger.info(f"VAE config - backbone_out_channels: {getattr(vae.config, 'backbone_out_channels', 'N/A')}")
+    logger.info(f"VAE config - in_channels: {vae.config.in_channels}")
+    logger.info(f"VAE config - out_channels: {vae.config.out_channels}")
     
     # Check for configuration mismatches
-    if getattr(vae.config, 'adapter_in_channels', None) != args.num_channels:
+    if vae.config.in_channels != args.num_channels:
         logger.error(
-            f"VAE configuration mismatch! VAE adapter expects {getattr(vae.config, 'adapter_in_channels', None)} channels "
+            f"VAE configuration mismatch! VAE expects {vae.config.in_channels} channels "
             f"but dataloader provides {args.num_channels} channels. "
             f"This will cause errors during training."
         )
         raise ValueError(
-            f"VAE adapter_in_channels ({getattr(vae.config, 'adapter_in_channels', None)}) != dataloader channels ({args.num_channels})"
+            f"VAE in_channels ({vae.config.in_channels}) != dataloader channels ({args.num_channels})"
         )
     
     # SD3 transformer expects 16 latent channels by default, which is actually beneficial for multispectral data
@@ -1296,18 +1077,6 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     )
 
-    """ --- Load lightweight ControlNet for mask-based spatial conditioning ---
-    controlnet = None
-    if args.controlnet_model_name_or_path:
-        controlnet = ControlNetModel.from_pretrained(
-            args.controlnet_model_name_or_path,
-            torch_dtype=weight_dtype,
-        )
-        controlnet.to(accelerator.device)
-        controlnet.requires_grad_(False)
-        logger.info(f"Loaded ControlNet from: {args.controlnet_model_name_or_path}")
-    """
-    
     # Set up model training states (matches original DreamBooth)
     transformer.requires_grad_(True)
     if args.train_text_encoder:
@@ -1327,41 +1096,12 @@ def main(args):
         weight_dtype = torch.bfloat16
 
     # Move models to device with appropriate dtypes
-    # CRITICAL FIX: VAE should always be in fp32 for stability with multispectral data
-    # This follows the original DreamBooth SD3 pattern where VAE stays in fp32
-    # while other models use mixed precision for speed benefits
     vae.to(accelerator.device, dtype=torch.float32)
-    # DO NOT manually set transformer/text_encoder dtypes - let accelerator.prepare() handle it
-    # This follows the original DreamBooth SD3 pattern exactly
-    transformer.to(accelerator.device)
+    transformer.to(accelerator.device, dtype=weight_dtype)
     if not args.train_text_encoder:
-        text_encoder_one.to(accelerator.device)
-        text_encoder_two.to(accelerator.device)
-        text_encoder_three.to(accelerator.device)
-
-    # EXPLANATION OF FP32 vs FP16 GRADIENT SCALING ISSUE:
-    # ===================================================
-    # The error "ValueError: Attempting to unscale FP16 gradients" occurs when:
-    # 1. Mixed precision training is enabled (fp16)
-    # 2. Models are manually set to fp16 before accelerator.prepare()
-    # 3. The gradient scaler tries to unscale gradients that are already in fp16
-    #
-    # WHY THIS HAPPENS:
-    # - PyTorch's gradient scaler expects gradients to be in fp32 during unscaling
-    # - When models are manually set to fp16, their gradients are also in fp16
-    # - The scaler cannot unscale fp16 gradients (it expects fp32)
-    #
-    # THE ORIGINAL DREAMBOOTH SD3 SOLUTION:
-    # - VAE always stays in fp32 (line 1130 in original: vae.to(accelerator.device, dtype=torch.float32))
-    # - Other models are moved to device WITHOUT setting dtype
-    # - accelerator.prepare() handles mixed precision setup automatically
-    # - This creates a clean fp32 -> fp16 boundary that the gradient scaler can handle
-    #
-    # OUR FIX:
-    # - Follow the exact same pattern as original DreamBooth SD3
-    # - VAE in fp32, other models moved to device without dtype
-    # - Let accelerator.prepare() handle mixed precision setup
-    # - This maintains numerical stability for multispectral data while enabling mixed precision speed
+        text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+        text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+        text_encoder_three.to(accelerator.device, dtype=weight_dtype)
 
     # Enable gradient checkpointing if requested
     if args.gradient_checkpointing:
@@ -1660,26 +1400,11 @@ def main(args):
     logger.info(f"  Multispectral configuration:")
     logger.info(f"    - Input channels: {args.num_channels} (bands 9, 18, 32, 42, 55)")
     logger.info(f"    - VAE latent channels: {vae.config.latent_channels}")
-    logger.info(f"    - VAE adapter_in_channels: {getattr(vae.config, 'adapter_in_channels', 'N/A')}")
-    logger.info(f"    - VAE adapter_out_channels: {getattr(vae.config, 'adapter_out_channels', 'N/A')}")
-    logger.info(f"    - VAE backbone_in_channels: {getattr(vae.config, 'backbone_in_channels', 'N/A')}")
-    logger.info(f"    - VAE backbone_out_channels: {getattr(vae.config, 'backbone_out_channels', 'N/A')}")
+    logger.info(f"    - VAE input channels: {vae.config.in_channels}")
+    logger.info(f"    - VAE output channels: {vae.config.out_channels}")
     logger.info(f"    - Spectral data type: Multispectral plant tissue")
     global_step = 0
     first_epoch = 0
-    
-    # Initialize checkpoint tracking
-    best_val_loss = float('inf')
-    best_epoch = 0
-
-    # --- DREAMBOOTH LOGGER INIT: pass in frozen VAE for validation decoding ---
-    # Use a shorter model name for log files to avoid path length issues
-    model_name_for_logs = "sd3_multispectral_dreambooth"
-    dreambooth_logger = create_dreambooth_logger(
-        output_dir=args.output_dir,
-        model_name=model_name_for_logs,
-        vae=vae  # pass the frozen VAE for validation decoding
-    )
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -1699,14 +1424,8 @@ def main(args):
             args.resume_from_checkpoint = None
             initial_global_step = 0
         else:
-            # Use the full path directly 
-            if args.resume_from_checkpoint == "latest":
-                resume_path = os.path.join(args.output_dir, path)
-            else:
-                resume_path = args.resume_from_checkpoint
-
-            accelerator.print(f"Resuming from checkpoint {resume_path}")
-            accelerator.load_state(resume_path)
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
@@ -1734,8 +1453,6 @@ def main(args):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    logger.info("About to enter main training loop")
-    
     # Main training loop
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -1745,17 +1462,12 @@ def main(args):
             text_encoder_three.train()
 
         for step, batch in enumerate(train_dataloader): # Access batches of dicts from dataloader
-            # Initialize grad_norm for this step
-            grad_norm = None
-            
             models_to_accumulate = [transformer]
             if args.train_text_encoder:
                 models_to_accumulate.extend([text_encoder_one, text_encoder_two, text_encoder_three])
             with accelerator.accumulate(models_to_accumulate):
                 # Multispectral data: 5-channel input (bands 9, 18, 32, 42, 55) instead of 3-channel RGB
-                # FIXED: Use vae.dtype (fp32) for pixel_values, following original DreamBooth SD3 pattern
-                # This ensures VAE input is in fp32, then we convert model_input to weight_dtype after encoding
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)  # vae.dtype is fp32
+                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
                 prompts = batch["prompts"]
 
                 # encode batch prompts when custom prompts are provided for each image
@@ -1771,9 +1483,8 @@ def main(args):
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
 
-                # Log latent tensor shape for verification only every `log_steps`
-                if accelerator.sync_gradients and global_step % args.log_steps == 0:
-                    log_latent_shape(model_input, pixel_values.shape[0])
+                # Log latent tensor shape for verification
+                log_latent_shape(model_input, pixel_values.shape[0])
 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
@@ -1796,11 +1507,7 @@ def main(args):
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
-
-
                 # Predict the noise residual
-                # Note: SD3 transformer doesn't use down_block_additional_residuals/mid_block_additional_residual
-                # These are UNet-specific parameters. SD3 uses block_controlnet_hidden_states for ControlNet.
                 if not args.train_text_encoder:
                     model_pred = transformer(
                         hidden_states=noisy_model_input,
@@ -1833,7 +1540,7 @@ def main(args):
                 # and instead post-weight the loss
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
-                # --- Masked MSE: focus loss on leaf region only (background zeroed) ---
+                # flow matching loss
                 if args.precondition_outputs:
                     target = model_input
                 else:
@@ -1844,46 +1551,21 @@ def main(args):
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior = torch.chunk(target, 2, dim=0)
 
-                    # Compute prior loss (masked MSE over class images)
-                    mask_prior = batch["mask"].to(model_pred_prior.device)
-                    mask_prior_resized = torch.nn.functional.interpolate(
-                        mask_prior, size=model_pred_prior.shape[-2:], mode="nearest"
+                    # Compute prior loss
+                    prior_loss = torch.mean(
+                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
+                            target_prior.shape[0], -1
+                        ),
+                        1,
                     )
-                    loss_map_prior = (model_pred_prior.float() - target_prior.float()) ** 2
-                    masked_loss_per_sample_prior = (
-                        (loss_map_prior * mask_prior_resized).reshape(loss_map_prior.size(0), -1).sum(dim=1)
-                        / mask_prior_resized.reshape(mask_prior_resized.size(0), -1).sum(dim=1)
-                    )
-                    prior_loss = masked_loss_per_sample_prior.mean()
+                    prior_loss = prior_loss.mean()
 
-                # Masked MSE over instance images: zero out background to focus loss on leaf
-                mask = batch["mask"].to(model_pred.device)  # shape (B,1,H,W)
-                # Resize mask to match model_pred spatial dims
-                mask_resized = torch.nn.functional.interpolate(
-                    mask, size=model_pred.shape[-2:], mode="nearest"
+                # Compute regular loss
+                loss = torch.mean(
+                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    1,
                 )
-                # Compute per-pixel MSE map
-                loss_map = (model_pred.float() - target.float()) ** 2  # (B,C,H',W')
-                
-                # Apply mask (broadcasting over channels)
-                masked_loss_per_sample = (
-                    (loss_map * mask_resized).reshape(loss_map.size(0), -1).sum(dim=1)
-                    / mask_resized.reshape(mask_resized.size(0), -1).sum(dim=1)
-                )
-                loss = masked_loss_per_sample.mean()
-
-                # Compute per-channel MSE for multispectral analysis from INPUT channels (5 channels)
-                # This gives us the MSE for each of the 5 spectral bands
-                input_mse_map = (pixel_values.float() - pixel_values.float()) ** 2  # Placeholder - we'll compute actual input MSE
-                # For now, let's compute MSE between original and reconstructed input
-                with torch.no_grad():
-                    # Decode the current latents back to input space for comparison
-                    decoded_input = vae.decode(model_input).sample
-                    # Compute MSE between original input and decoded input (5 channels)
-                    input_mse_per_channel = ((pixel_values - decoded_input) ** 2).mean(dim=(0, 2, 3))  # (5,) - mean MSE per input channel
-
-                # Store losses for logging
-                losses = {"mse_per_channel": input_mse_per_channel}
+                loss = loss.mean()
 
                 if args.with_prior_preservation:
                     # Add the prior loss to the instance loss
@@ -1902,13 +1584,6 @@ def main(args):
                         else transformer.parameters()
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                    # Compute gradient norm for logging
-                    total_norm = 0.0
-                    for p in transformer.parameters():
-                        if p.grad is not None:
-                            param_norm = p.grad.detach().data.norm(2)
-                            total_norm += param_norm.item() ** 2
-                    grad_norm = total_norm ** 0.5
 
                 optimizer.step()
                 lr_scheduler.step()
@@ -1918,34 +1593,6 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
-
-                # --- LATENT STATISTICS LOGGING (every validation_steps) ---
-                if hasattr(args, "validation_steps") and args.validation_steps > 0:
-                    val_steps = args.validation_steps
-                else:
-                    val_steps = 100
-                if global_step % val_steps == 0:
-                    with torch.no_grad():
-                        # Log latent statistics using frozen VAE
-                        latents = vae.encode(pixel_values).latent_dist.sample()
-                        latent_stats = {
-                            "train/latent_mean": latents.mean().item(),
-                            "train/latent_std": latents.std().item(),
-                            "train/latent_min": latents.min().item(),
-                            "train/latent_max": latents.max().item()
-                        }
-                        if getattr(args, "use_wandb", False):
-                            import wandb
-                            wandb.log(latent_stats, step=global_step)
-                        # Log to DreamBooth logger with comprehensive metrics
-                        dreambooth_logger.log_step(
-                            step=global_step, 
-                            epoch=epoch,
-                            loss=loss.detach().item(),
-                            learning_rate=lr_scheduler.get_last_lr()[0],
-                            grad_norm=grad_norm,
-                            mse_per_channel=None
-                        )
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
@@ -1967,233 +1614,500 @@ def main(args):
 
                                 for removing_checkpoint in removing_checkpoints:
                                     removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    try:
-                                        shutil.rmtree(removing_checkpoint)
-                                    except Exception as e:
-                                        logger.warning(f"Could not remove checkpoint directory {removing_checkpoint}: {e}")
+                                    shutil.rmtree(removing_checkpoint)
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        try:
-                            accelerator.save_state(save_path)
-                            logger.info(f"Saved state to {save_path}")
-                        except Exception as e:
-                            logger.error(f"Could not save accelerator state to {save_path}: {e}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
 
-                        # Save full pipeline for inference
-                        pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{global_step}")
-                        # Ensure text encoders are loaded if not training them
-                        skip_pipeline_save = False
-                        if not args.train_text_encoder:
-                            try:
-                                text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                                text_encoder_one.to(weight_dtype)
-                                text_encoder_two.to(weight_dtype)
-                                text_encoder_three.to(weight_dtype)
-                            except Exception as e:
-                                logger.error(f"Could not load text encoders for pipeline saving: {e}")
-                                skip_pipeline_save = True
-                        if not skip_pipeline_save:
-                            try:
-                                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                                    args.pretrained_model_name_or_path,
-                                    vae=vae,
-                                    transformer=accelerator.unwrap_model(transformer),
-                                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                                    revision=args.revision,
-                                    variant=args.variant,
-                                    torch_dtype=weight_dtype,
-                                )
-                                pipeline.save_pretrained(pipeline_save_path)
-                                logger.info(f"Pipeline saved to: {pipeline_save_path}")
-                            except Exception as e:
-                                logger.error(f"Could not save pipeline to {pipeline_save_path}: {e}")
-
-                    # Run validation and log images every 100 steps
-                    if args.validation_prompt is not None and global_step % 100 == 0:
-                        skip_val_pipeline = False
-                        if not args.train_text_encoder:
-                            try:
-                                text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                                text_encoder_one.to(weight_dtype)
-                                text_encoder_two.to(weight_dtype)
-                                text_encoder_three.to(weight_dtype)
-                            except Exception as e:
-                                logger.error(f"Could not load text encoders for validation pipeline: {e}")
-                                skip_val_pipeline = True
-                        if not skip_val_pipeline:
-                            try:
-                                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                                    args.pretrained_model_name_or_path,
-                                    vae=vae,
-                                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                                    transformer=accelerator.unwrap_model(transformer),
-                                    revision=args.revision,
-                                    variant=args.variant,
-                                    torch_dtype=weight_dtype,
-                                )
-                                pipeline_args = {"prompt": args.validation_prompt}
-                                # --- DREAMBOOTH VALIDATION STEP: decode latents and log both raw and clamped outputs ---
-                                with torch.no_grad():
-                                    # Use the current batch latents for validation (example, or use generated latents)
-                                    latents = vae.encode(pixel_values).latent_dist.sample()
-                                    targets = pixel_values
-                                    mask = batch["mask"]
-                                    decoded_imgs = vae.decode(latents).sample
-                                    decoded_imgs_clamped = torch.clamp(decoded_imgs, -1.0, 1.0)  # Create clamped version
-
-                                    # Prepare logging data with both raw and clamped decoded outputs
-                                    validation_data = [
-                                        {
-                                            "latent": l,
-                                            "target": t,
-                                            "mask": m,
-                                            "decoded_raw": r,
-                                            "decoded_clamped": c
-                                        }
-                                        for l, t, m, r, c in zip(latents, targets, mask, decoded_imgs, decoded_imgs_clamped)
-                                    ]
-                                # Log validation images and metrics using logger
-                                val_metrics = {"val_loss": loss.detach().item()}
-                                val_mse_per_channel = None
-                                if "losses" in locals():
-                                    val_mse_per_channel = losses.get("mse_per_channel", None)
-                                # Log validation with comprehensive spectral metrics
-                                dreambooth_logger.log_validation(
-                                    epoch=global_step,
-                                    images=validation_data,
-                                    prompt=args.validation_prompt,
-                                    validation_metrics=val_metrics,
-                                    mse_per_channel=val_mse_per_channel
-                                )
-                                logger.info(f"Validation pipeline and logging succeeded at step {global_step}")
-                            except Exception as e:
-                                logger.error(f"Could not run validation pipeline or log validation at step {global_step}: {e}")
-                        if not args.train_text_encoder:
-                            try:
-                                del text_encoder_one, text_encoder_two, text_encoder_three
-                                free_memory()
-                            except Exception as e:
-                                logger.warning(f"Could not free text encoder memory: {e}")
-
-            logs = {"loss": loss.detach().item()}
-            # Step-level logging every `log_steps`
-            if global_step % args.log_steps == 0 and grad_norm is not None:
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            
+            # Add multispectral-specific logging information
+            if global_step % 100 == 0:  # Log spectral info every 100 steps to avoid spam
                 logs.update({
-                    "grad_norm": grad_norm,
+                    "multispectral_channels": args.num_channels,
+                    "latent_channels": vae.config.latent_channels,
+                    "spectral_data_type": "multispectral_5ch",
                 })
-            # Log step metrics using logger
-            mse_per_channel = None
-            if "losses" in locals():
-                mse_per_channel = losses.get("mse_per_channel", None)
-            dreambooth_logger.log_step(
-                step=global_step,
-                epoch=epoch,
-                loss=loss.detach().item(),
-                learning_rate=lr_scheduler.get_last_lr()[0],
-                grad_norm=grad_norm,
-                mse_per_channel=mse_per_channel
-            )
+            
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
             if global_step >= args.max_train_steps:
                 break
 
-        # Validation and checkpointing
         if accelerator.is_main_process:
-            # Save checkpoint every checkpointing_steps
-            if global_step % args.checkpointing_steps == 0:
-                checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                try:
-                    accelerator.save_state(checkpoint_path)
-                    logger.info(f"Checkpoint saved to: {checkpoint_path}")
-                except Exception as e:
-                    logger.error(f"Could not save checkpoint to {checkpoint_path}: {e}")
-            
-            # --- VALIDATION DATA LOGGING FOR DREAMBOOTH LOGGER ---
             if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                skip_val_pipeline = False
+                # create pipeline
                 if not args.train_text_encoder:
-                    try:
-                        text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
-                        text_encoder_one.to(weight_dtype)
-                        text_encoder_two.to(weight_dtype)
-                        text_encoder_three.to(weight_dtype)
-                    except Exception as e:
-                        logger.error(f"Could not load text encoders for validation pipeline: {e}")
-                        skip_val_pipeline = True
-                if not skip_val_pipeline:
-                    try:
-                        pipeline = StableDiffusion3Pipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
-                            vae=vae,
-                            text_encoder=accelerator.unwrap_model(text_encoder_one),
-                            text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                            text_encoder_3=accelerator.unwrap_model(text_encoder_three),
-                            transformer=accelerator.unwrap_model(transformer),
-                            revision=args.revision,
-                            variant=args.variant,
-                            torch_dtype=weight_dtype,
-                        )
-                        # --- Validation data: log latent, target, mask for logger ---
-                        try:
-                            val_batch = next(iter(train_dataloader))
-                            with torch.no_grad():
-                                inputs = val_batch["pixel_values"].to(accelerator.device)
-                                mask = val_batch["mask"].to(accelerator.device)
-                                targets = val_batch["target"].to(accelerator.device) if "target" in val_batch else inputs
-                                # Use the frozen VAE for encoding
-                                latents = vae.encode(inputs).latent_dist.sample()
-                                # Build validation data dicts
-                                val_data = [
-                                    {"latent": l, "target": t, "mask": m}
-                                    for l, t, m in zip(latents, targets, mask)
-                                ]
-                                # Log with DreamBooth logger
-                                dreambooth_logger.log_validation(
-                                    epoch=global_step,
-                                    images=val_data,
-                                    prompt=args.validation_prompt,
-                                    validation_metrics={"val_loss": loss.detach().item()}
-                                )
-                        except Exception as e:
-                            logger.warning(f"Could not log validation data for DreamBooth logger: {e}")
-                        logger.info(f"Validation pipeline and logging succeeded at epoch {epoch}")
-                    except Exception as e:
-                        logger.error(f"Could not run validation pipeline or log validation at epoch {epoch}: {e}")
-
-    # Save the final model
-    accelerator.wait_for_everyone()
-    if accelerator.is_main_process:
-        try:
-            transformer = unwrap_model(transformer)
-            if args.train_text_encoder:
-                text_encoder_one = unwrap_model(text_encoder_one)
-                text_encoder_two = unwrap_model(text_encoder_two)
-                text_encoder_three = unwrap_model(text_encoder_three)
+                    text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
+                    text_encoder_one.to(weight_dtype)
+                    text_encoder_two.to(weight_dtype)
+                    text_encoder_three.to(weight_dtype)
                 pipeline = StableDiffusion3Pipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
-                    transformer=transformer,
-                    text_encoder=text_encoder_one,
-                    text_encoder_2=text_encoder_two,
-                    text_encoder_3=text_encoder_three,
+                    vae=vae,
+                    text_encoder=accelerator.unwrap_model(text_encoder_one),
+                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+                    text_encoder_3=accelerator.unwrap_model(text_encoder_three),
+                    transformer=accelerator.unwrap_model(transformer),
+                    revision=args.revision,
+                    variant=args.variant,
+                    torch_dtype=weight_dtype,
                 )
-            else:
-                pipeline = StableDiffusion3Pipeline.from_pretrained(
-                    args.pretrained_model_name_or_path, transformer=transformer
+                pipeline_args = {"prompt": args.validation_prompt}
+                images = log_validation(
+                    pipeline=pipeline,
+                    args=args,
+                    accelerator=accelerator,
+                    pipeline_args=pipeline_args,
+                    epoch=epoch,
+                    torch_dtype=weight_dtype,
                 )
-            pipeline.save_pretrained(args.output_dir)
-            logger.info(f"Final model saved to: {args.output_dir}")
-        except Exception as e:
-            logger.error(f"Could not save final model to {args.output_dir}: {e}")
+                if not args.train_text_encoder:
+                    del text_encoder_one, text_encoder_two, text_encoder_three
+                    free_memory()
+
+    # Save the model
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        transformer = unwrap_model(transformer)
+
+        if args.train_text_encoder:
+            text_encoder_one = unwrap_model(text_encoder_one)
+            text_encoder_two = unwrap_model(text_encoder_two)
+            text_encoder_three = unwrap_model(text_encoder_three)
+            pipeline = StableDiffusion3Pipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                transformer=transformer,
+                text_encoder=text_encoder_one,
+                text_encoder_2=text_encoder_two,
+                text_encoder_3=text_encoder_three,
+            )
+        else:
+            pipeline = StableDiffusion3Pipeline.from_pretrained(
+                args.pretrained_model_name_or_path, transformer=transformer
+            )
+
+        # save the pipeline
+        pipeline.save_pretrained(args.output_dir)
+
+        # Final inference
+        # Load previous pipeline
+        pipeline = StableDiffusion3Pipeline.from_pretrained(
+            args.output_dir,
+            revision=args.revision,
+            variant=args.variant,
+            torch_dtype=weight_dtype,
+        )
+
+        # run inference
+        images = []
+        if args.validation_prompt and args.num_validation_images > 0:
+            pipeline_args = {"prompt": args.validation_prompt}
+            images = log_validation(
+                pipeline=pipeline,
+                args=args,
+                accelerator=accelerator,
+                pipeline_args=pipeline_args,
+                epoch=epoch,
+                is_final_validation=True,
+                torch_dtype=weight_dtype,
+            )
+
+        if args.push_to_hub:
+            save_model_card(
+                args.hub_model_id,
+                images=images,
+                base_model=args.pretrained_model_name_or_path,
+                train_text_encoder=args.train_text_encoder,
+                instance_prompt=args.instance_prompt,
+                validation_prompt=args.validation_prompt,
+                repo_folder=args.output_dir,
+            )
+            upload_folder(
+                repo_id=args.hub_model_id,
+                folder_path=args.output_dir,
+                commit_message="End of training",
+                ignore_patterns=["step_*", "epoch_*"],
+            )
 
     accelerator.end_training()
 
+def save_model_card(
+    repo_id: str,
+    images=None,
+    base_model: str = None,
+    train_text_encoder=False,
+    instance_prompt=None,
+    validation_prompt=None,
+    repo_folder=None,
+):
+    if "large" in base_model:
+        model_variant = "SD3.5-Large"
+        license_url = "https://huggingface.co/stabilityai/stable-diffusion-3.5-large/blob/main/LICENSE.md"
+        variant_tags = ["sd3.5-large", "sd3.5", "sd3.5-diffusers"]
+    else:
+        model_variant = "SD3"
+        license_url = "https://huggingface.co/stabilityai/stable-diffusion-3-medium/blob/main/LICENSE.md"
+        variant_tags = ["sd3", "sd3-diffusers"]
+
+    widget_dict = []
+    if images is not None:
+        for i, image in enumerate(images):
+            image.save(os.path.join(repo_folder, f"image_{i}.png"))
+            widget_dict.append(
+                {"text": validation_prompt if validation_prompt else " ", "output": {"url": f"image_{i}.png"}}
+            )
+
+    model_description = f"""
+# {model_variant} Multispectral DreamBooth - {repo_id}
+
+<Gallery />
+
+## Model description
+
+These are {repo_id} multispectral DreamBooth weights for {base_model}.
+
+The weights were trained using [DreamBooth](https://dreambooth.github.io/) with the [SD3 diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_sd3.md) adapted for multispectral image generation.
+
+**Multispectral Configuration:**
+- Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
+- Spectral bands optimized for plant health monitoring
+- VAE: Custom multispectral AutoencoderKL adapter
+- Latent space: {vae.config.latent_channels} channels for enhanced spectral capacity
+
+Was the text encoder fine-tuned? {train_text_encoder}.
+
+## Trigger words
+
+You should use `{instance_prompt}` to trigger the image generation.
+
+## Use it with the [🧨 diffusers library](https://github.com/huggingface/diffusers)
+
+```py
+from diffusers import AutoPipelineForText2Image
+import torch
+pipeline = AutoPipelineForText2Image.from_pretrained('{repo_id}', torch_dtype=torch.float16).to('cuda')
+image = pipeline('{validation_prompt if validation_prompt else instance_prompt}').images[0]
+```
+
+## License
+
+Please adhere to the licensing terms as described `[here]({license_url})`.
+"""
+    model_card = load_or_create_model_card(
+        repo_id_or_path=repo_id,
+        from_training=True,
+        license="other",
+        base_model=base_model,
+        prompt=instance_prompt,
+        model_description=model_description,
+        widget=widget_dict,
+    )
+    tags = [
+        "text-to-image",
+        "diffusers-training",
+        "diffusers",
+        "template:sd-lora",
+        "multispectral",
+        "plant-health",
+        "spectral-imaging",
+        "agriculture",
+    ]
+    tags += variant_tags
+
+    model_card = populate_model_card(model_card, tags=tags)
+    model_card.save(os.path.join(repo_folder, "README.md"))
+
+def import_model_class_from_model_name_or_path(
+    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+):
+    text_encoder_config = PretrainedConfig.from_pretrained(
+        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+    )
+    model_class = text_encoder_config.architectures[0]
+    if model_class == "CLIPTextModelWithProjection":
+        from transformers import CLIPTextModelWithProjection
+        return CLIPTextModelWithProjection
+    elif model_class == "T5EncoderModel":
+        from transformers import T5EncoderModel
+        return T5EncoderModel
+    else:
+        raise ValueError(f"{model_class} is not supported.")
+
+def load_text_encoders(args):
+    text_encoder_cls_one = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision, "text_encoder"
+    )
+    text_encoder_cls_two = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision, "text_encoder_2"
+    )
+    text_encoder_cls_three = import_model_class_from_model_name_or_path(
+        args.pretrained_model_name_or_path, args.revision, "text_encoder_3"
+    )
+
+    text_encoder_one = text_encoder_cls_one.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+    )
+    text_encoder_two = text_encoder_cls_two.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+    )
+    text_encoder_three = text_encoder_cls_three.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="text_encoder_3", revision=args.revision, variant=args.variant
+    )
+    return text_encoder_one, text_encoder_two, text_encoder_three
+
+def log_validation(
+    pipeline,
+    args,
+    accelerator,
+    pipeline_args,
+    epoch,
+    torch_dtype,
+    is_final_validation=False,
+):
+    """
+    Log validation results including spectral fidelity and concept preservation.
+    
+    This function is crucial for monitoring training progress and ensuring
+    both visual quality and spectral accuracy are maintained.
+    
+    Note: The pipeline generates RGB images from the multispectral VAE,
+    so the validation images are compatible with standard visualization tools.
+    
+    Args:
+        pipeline: The generation pipeline (with multispectral VAE)
+        args: Training arguments
+        accelerator: Accelerator for distributed training
+        pipeline_args: Pipeline configuration
+        epoch: Current training epoch
+        torch_dtype: Data type for tensors
+        is_final_validation: Whether this is the final validation
+    """
+    logger.info(
+        f"Running multispectral validation... \n Generating {args.num_validation_images} images with prompt:"
+        f" {args.validation_prompt}."
+    )
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    # run inference
+    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed is not None else None
+    autocast_ctx = nullcontext()
+
+    with autocast_ctx:
+        images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
+
+    for tracker in accelerator.trackers:
+        phase_name = "test" if is_final_validation else "validation"
+        if tracker.name == "tensorboard":
+            np_images = np.stack([np.asarray(img) for img in images])
+            tracker.writer.add_images(phase_name, np_images, epoch, dataformats="NHWC")
+        if tracker.name == "wandb":
+            tracker.log(
+                {
+                    phase_name: [
+                        wandb.Image(image, caption=f"{i}: {args.validation_prompt}") for i, image in enumerate(images)
+                    ]
+                }
+            )
+
+    del pipeline
+    free_memory()
+
+    return images
+
+def tokenize_prompt(tokenizer, prompt):
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=77,
+        truncation=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    return text_input_ids
+
+def _encode_prompt_with_t5(
+    text_encoder,
+    tokenizer,
+    max_sequence_length,
+    prompt=None,
+    num_images_per_prompt=1,
+    device=None,
+):
+    """
+    Encode text prompt using T5 for detailed concept understanding.
+    
+    T5's language understanding capabilities help capture detailed
+    spectral concepts and their relationships.
+    
+    Args:
+        text_encoder: T5 text encoder
+        tokenizer: T5 tokenizer
+        max_sequence_length: Maximum sequence length
+        prompt: Text prompt
+        num_images_per_prompt: Number of images per prompt
+        device: Device to use
+    
+    Returns:
+        T5 text embeddings
+    """
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+
+    dtype = text_encoder.dtype
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+    _, seq_len, _ = prompt_embeds.shape
+
+    # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+    return prompt_embeds
+
+def _encode_prompt_with_clip(
+    text_encoder,
+    tokenizer,
+    prompt: str,
+    device=None,
+    text_input_ids=None,
+    num_images_per_prompt: int = 1,
+):
+    """
+    Encode text prompt using CLIP for visual-semantic alignment.
+    
+    CLIP's visual-semantic understanding is crucial for mapping between
+    text descriptions and spectral features.
+    
+    Args:
+        text_encoder: CLIP text encoder
+        tokenizer: CLIP tokenizer
+        prompt: Text prompt
+        device: Device to use
+        text_input_ids: Optional pre-computed input IDs
+        num_images_per_prompt: Number of images per prompt
+    
+    Returns:
+        CLIP text embeddings
+    """
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    if tokenizer is not None:
+        text_inputs = tokenizer(
+            prompt,
+            padding="max_length",
+            max_length=77,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        text_input_ids = text_inputs.input_ids
+    else:
+        if text_input_ids is None:
+            raise ValueError("text_input_ids must be provided when the tokenizer is not specified")
+
+    prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
+
+    pooled_prompt_embeds = prompt_embeds[0]
+    prompt_embeds = prompt_embeds.hidden_states[-2]
+    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+
+    _, seq_len, _ = prompt_embeds.shape
+    # duplicate text embeddings for each generation per prompt, using mps friendly method
+    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+
+    return prompt_embeds, pooled_prompt_embeds
+
+def encode_prompt(
+    text_encoders,
+    tokenizers,
+    prompt: str,
+    max_sequence_length,
+    device=None,
+    num_images_per_prompt: int = 1,
+    text_input_ids_list=None,
+):
+    """
+    Encode text prompt using multiple encoders for rich spectral concept representation.
+    
+    Combines CLIP and T5 embeddings to capture both visual-semantic and detailed
+    concept information, crucial for spectral feature learning.
+    
+    Args:
+        text_encoders: Dictionary of text encoders (CLIP and T5)
+        tokenizers: Dictionary of corresponding tokenizers
+        prompt: Text prompt describing spectral features
+        max_sequence_length: Maximum sequence length for T5
+        device: Device to use for encoding
+        num_images_per_prompt: Number of images to generate per prompt
+        text_input_ids_list: Optional pre-computed input IDs
+    
+    Returns:
+        Combined text embeddings for spectral concept learning
+    """
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+
+    clip_tokenizers = tokenizers[:2]
+    clip_text_encoders = text_encoders[:2]
+
+    clip_prompt_embeds_list = []
+    clip_pooled_prompt_embeds_list = []
+    for i, (tokenizer, text_encoder) in enumerate(zip(clip_tokenizers, clip_text_encoders)):
+        prompt_embeds, pooled_prompt_embeds = _encode_prompt_with_clip(
+            text_encoder=text_encoder,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            device=device if device is not None else text_encoder.device,
+            num_images_per_prompt=num_images_per_prompt,
+            text_input_ids=text_input_ids_list[i] if text_input_ids_list else None,
+        )
+        clip_prompt_embeds_list.append(prompt_embeds)
+        clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
+
+    clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)
+    pooled_prompt_embeds = torch.cat(clip_pooled_prompt_embeds_list, dim=-1)
+
+    t5_prompt_embed = _encode_prompt_with_t5(
+        text_encoders[-1],
+        tokenizers[-1],
+        max_sequence_length,
+        prompt=prompt,
+        num_images_per_prompt=num_images_per_prompt,
+        device=device if device is not None else text_encoders[-1].device,
+    )
+
+    clip_prompt_embeds = torch.nn.functional.pad(
+        clip_prompt_embeds, (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1])
+    )
+    prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
+
+    return prompt_embeds, pooled_prompt_embeds
+
+def compute_text_embeddings(prompt, text_encoders, tokenizers):
+    with torch.no_grad():
+        prompt_embeds, pooled_prompt_embeds = encode_prompt(
+            text_encoders, tokenizers, prompt, args.max_sequence_length
+        )
+        prompt_embeds = prompt_embeds.to(accelerator.device)
+        pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
+    return prompt_embeds, pooled_prompt_embeds
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    main(args) 

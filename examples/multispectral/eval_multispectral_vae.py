@@ -8,9 +8,6 @@ python examples/multispectral/eval_multispectral_vae.py \
 
 Note: This evaluation script now properly handles [-1, 1] normalized data throughout the pipeline.
 The dataloader normalizes to [-1, 1], the model expects [-1, 1], and visualization converts to [0, 1] for display.
-
-AutoencoderKL is not imported or defined anywhere. All evaluated configs are from adapters only 
--> inference checks MS VAE model.
 """
 
 import os
@@ -56,6 +53,11 @@ def plot_pseudo_rgb(original, reconstructed, outdir, idx):
     os.makedirs(outdir, exist_ok=True)
     
     # Create pseudo-RGB mapping based on spectral characteristics
+    # Band 1 (Blue 474.73nm) -> Blue channel
+    # Band 2 (Green 538.71nm) -> Green channel
+    # Band 3 (Red 650.665nm) -> Red channel
+    # Band 4 (Red-edge 730.635nm) -> Additional red contribution (stress detection)
+    # Band 5 (NIR 850.59nm) -> Additional green contribution (health indicator)
     
     def create_pseudo_rgb(bands):
         # Normalize from [-1, 1] to [0, 1] for RGB visualization
@@ -526,15 +528,14 @@ def main():
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    # Refactored: Use explicit adapter and backbone channel config fields for clarity
     model = AutoencoderKL.from_pretrained(
         args.model_dir,
-        adapter_in_channels=5,  # Refactored: adapter input channels
-        adapter_out_channels=5, # Refactored: adapter output channels
-        backbone_in_channels=3, # Refactored: backbone input channels
-        backbone_out_channels=3, # Refactored: backbone output channels
+        adapter_in_channels=5,  # for adapters
+        adapter_out_channels=5,  # for adapters
+        backbone_in_channels=3,  # SD3 backbone input channels
+        backbone_out_channels=3,  # SD3 backbone output channels
         latent_channels=16,
-        adapter_placement="both", # match training
+        adapter_placement="both",
         use_spectral_attention=True,
         use_sam_loss=True,
         use_saturation_penalty=True,
@@ -565,9 +566,6 @@ def main():
     all_signature_errors = []
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # After all batches are processed, compute mean reconstructed spectrum and deviation from reference
-    recon_mean_spectra = []
-    reference_signature = np.array([0.055, 0.12, 0.05, 0.31, 0.325], dtype=np.float32)
     for idx, (batch, mask) in enumerate(tqdm(loader, desc='Evaluating')):
         # Handle both tuple and single tensor returns from dataloader
         if isinstance(batch, (tuple, list)):
@@ -578,7 +576,7 @@ def main():
             print(f"[MASK WARNING] No mask provided for evaluation batch {idx}!")
         
         with torch.no_grad():
-            recon = model(batch)
+            recon, _ = model(batch)
             # Extract tensor from DecoderOutput
             if hasattr(recon, "sample"):
                 decoded_tensor = recon.sample
@@ -648,12 +646,6 @@ def main():
             all_ssim_bg.append(ssim_results['background'])
         all_ssim_ov.append(ssim_results['overall'])
 
-        # Compute mean spectrum for this batch (foreground/leaf only)
-        mask_sum = mask.sum(dim=(0,2,3)).cpu().numpy() + 1e-8
-        recon_sum = (decoded_tensor * mask).sum(dim=(0,2,3)).cpu().numpy()
-        recon_mean_spectrum = recon_sum / mask_sum
-        recon_mean_spectra.append(recon_mean_spectrum)
-
     # Aggregate metrics by averaging over all batches
     all_mse_fg = np.stack(all_mse_fg) if all_mse_fg else None
     all_mse_bg = np.stack(all_mse_bg) if all_mse_bg else None
@@ -704,21 +696,6 @@ def main():
 
     # Aggregate and plot spectral signature errors
     aggregate_spectral_errors(all_signature_errors, args.output_dir)
-
-    # After all batches
-    if recon_mean_spectra:
-        eval_recon_mean_spectrum = np.mean(np.stack(recon_mean_spectra), axis=0)
-        deviation = eval_recon_mean_spectrum - reference_signature
-        print(f"\nMean reconstructed spectrum (eval set): {[f'{v:.4f}' for v in eval_recon_mean_spectrum]}")
-        print(f"Reference signature: {[f'{v:.4f}' for v in reference_signature]}")
-        print(f"Deviation from reference: {[f'{v:+.4f}' for v in deviation]}")
-        # Save to file
-        with open(os.path.join(args.output_dir, 'mean_spectrum_eval.json'), 'w') as f:
-            json.dump({
-                'mean_reconstructed_spectrum': eval_recon_mean_spectrum.tolist(),
-                'reference_signature': reference_signature.tolist(),
-                'deviation': deviation.tolist()
-            }, f, indent=2)
 
 if __name__ == '__main__':
     main()

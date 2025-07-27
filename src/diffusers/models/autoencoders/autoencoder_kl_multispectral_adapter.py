@@ -77,6 +77,7 @@ Architectural Design Decisions:
       - Helps identify problematic spectral bands
 
    b) Spectral Angle Mapper (SAM) Loss:
+      - Uses torchmetrics.image.SpectralAngleMapper for standardized implementation
       - Measures spectral similarity through vector angles
       - Invariant to scaling, preserves spectral signatures
       - Weighted combination: loss = α * MSE + β * SAM
@@ -187,14 +188,23 @@ TODOs:
    CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
    NOTE: enable Tanh output bounding via --force_output_tanh on the CLI.
     -> disable during training and apply only during inference
+   
+   DEPENDENCIES:
+   - torchmetrics: Required for SpectralAngleMapper implementation
+     pip install torchmetrics
 
 Usage:
     # Initialize with pretrained SD3 VAE
     vae = AutoencoderKLMultispectralAdapter.from_pretrained(
         "stabilityai/stable-diffusion-3-medium-diffusers",
+        adapter_in_channels=5,  # Multispectral input channels
+        adapter_out_channels=5, # Multispectral output channels
+        backbone_in_channels=3, # SD3 backbone input channels
+        backbone_out_channels=3, # SD3 backbone output channels
         adapter_placement="both",  # or "input" or "output"
         use_spectral_attention=True,
-        use_sam_loss=True
+        use_sam_loss=True,
+        torch_dtype=torch.float16  # For mixed precision training
     )
 
     # Freeze backbone (only adapters will be trained)
@@ -216,6 +226,10 @@ Usage:
     x = self.output_norm(x)
     
     # For downstream usage requiring [-1, 1] range, apply post-processing normalization
+    
+    # SAM Loss Implementation:
+    # Uses torchmetrics.image.SpectralAngleMapper for standardized spectral angle computation
+    # Provides improved numerical stability and follows established metrics standards
 
     
 """
@@ -250,6 +264,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import logging
 import numpy as np # Added for scale monitoring
+from torchmetrics.image import SpectralAngleMapper
 
 # Set up logger for this module
 logger = logging.getLogger(__name__)
@@ -258,10 +273,6 @@ from ...utils.accelerate_utils import apply_forward_hook
 from ..modeling_outputs import AutoencoderKLOutput
 from .autoencoder_kl import AutoencoderKL
 from .vae import DecoderOutput
-
-
-
-
 
 #
 # Design Rationale: Spectral Attention
@@ -319,10 +330,11 @@ class SpectralAttention(nn.Module):
         which bands the model finds most important for the task.
         """
         with torch.no_grad():
-            # Create a dummy input to get attention weights, on the same device as the module
-            device = next(self.parameters()).device
-            dummy_input = torch.ones(1, len(self.wavelengths), 1, 1, device=device)
+            # Create a dummy input to get attention weights
+            # Using ones ensures we get the base attention values
+            dummy_input = torch.ones(1, len(self.wavelengths), 1, 1)
             attention_weights = self.attention(dummy_input).squeeze()
+
             # Map weights to wavelengths for interpretability
             return {self.wavelengths[i]: float(weight)
                    for i, weight in enumerate(attention_weights)}
@@ -341,21 +353,6 @@ class SpectralAttention(nn.Module):
 # 
 # IMPORTANT: The nonlinear transformations (SiLU, GroupNorm, sigmoid attention) mean that
 # the output range is not constrained to [-1, 1] and may require post-processing normalization.
-#
-# Output Scale and Bias Parameters:
-# ---------------------------------
-# The output_scale and output_bias parameters are learnable linear transformation coefficients
-# applied to the SpectralAdapter output (via the formula: )output = input * output_scale + output_bias.
-# These parameters enable trainable calibration of the spectral output dynamic range to align
-# with SD3 pipeline expectations (ideally [-1, 1]) while preserving spectral fidelity. Optimal
-# values are output_scale ≈ 1.0 and output_bias ≈ 0.0, indicating minimal transformation is
-# required and the adapter naturally produces appropriately scaled outputs. Values significantly
-# deviating from these targets (output_scale < 0.1 or > 3.0, |output_bias| > 0.5) may indicate
-# training instability, data normalization issues, or inappropriate hyperparameter settings.
-# Scale collapse (output_scale < 0.001) represents a critical failure mode where the model
-# produces near-zero outputs, while scale explosion (output_scale > 5.0) indicates potential
-# gradient instability. Convergence to near-identity values demonstrates successful preservation
-# of biological spectral signatures with minimal range distortion.
 #
 class SpectralAdapter(nn.Module):
     """
@@ -379,28 +376,28 @@ class SpectralAdapter(nn.Module):
 
     def __init__(
         self,
-        in_channels: int,
-        out_channels: int,
+        adapter_in_channels: int,  # Refactored: adapter input channels
+        adapter_out_channels: int, # Refactored: adapter output channels
         use_attention: bool = True,
         num_bands: int = 5
     ):
         super().__init__()
         # Store channel configuration for validation and logging
-        self.in_channels = in_channels
-        self.out_channels = out_channels
+        self.adapter_in_channels = adapter_in_channels  # Refactored: adapter input channels
+        self.adapter_out_channels = adapter_out_channels  # Refactored: adapter output channels
         self.use_attention = use_attention
         # Tanh and adaptive normalization are removed
 
         # Initialize spectral attention if needed
-        if use_attention and in_channels == num_bands:
+        if use_attention and adapter_in_channels == num_bands:
             self.attention = SpectralAttention(num_bands)
 
         # Three-layer convolutional network for channel adaptation
         # First two layers use 3x3 convolutions with group normalization and nonlinear activation
-        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1)
+        self.conv1 = nn.Conv2d(adapter_in_channels, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
         # Final layer uses 1x1 convolution for channel reduction/expansion (no activation)
-        self.conv3 = nn.Conv2d(32, out_channels, kernel_size=1)
+        self.conv3 = nn.Conv2d(32, adapter_out_channels, kernel_size=1)
 
         # Learnable linear output scaling: aligns the dynamic range of adapter output to the desired range (ideally [-1, 1]).
         # more adaptive and flexible than clamping or fixed postprocessing.
@@ -411,10 +408,14 @@ class SpectralAdapter(nn.Module):
         # This enables smooth, trainable calibration of spectral output without hard clipping or nonlinear warping.
         # Motivation:
         #   - Avoids saturating Tanh or clamping artifacts which can distort spectral shapes.
+        #   - Maintains biological interpretability of band ratios.
         #   - Adapts output to match SD3 pipeline expectations (range ~[-1, 1]).
-   
-        self.output_scale = nn.Parameter(torch.tensor(1.0))  # Global scaling factor
-        self.output_bias = nn.Parameter(torch.tensor(0.0))   # Global shift
+        # Final trained values (e.g., output_scale ≈ 0.9989, output_bias ≈ -0.0010) indicate almost identity behavior, meaning:
+        #   - The adapter outputs are already in the desired range without drastic transformation.
+        #   - Spectral fidelity and output amplitude are preserved, with only a minimal bias shift.
+        # Note: dtype will be set by the parent model's torch_dtype parameter
+        self.output_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))  # Global scaling factor
+        self.output_bias = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))   # Global shift
 
         # Group normalization for better training stability (nonlinear normalization)
         self.norm1 = nn.GroupNorm(8, 32)
@@ -425,7 +426,7 @@ class SpectralAdapter(nn.Module):
 
         # Single global scale parameter for linear range control
         # This replaces both adaptive norm and Tanh, preserving linearity for spectral fidelity
-        self.global_scale = nn.Parameter(torch.tensor(1.0))
+        self.global_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         
         # Global scale convergence monitoring
         self.scale_history = []  # Track scale values during training
@@ -440,17 +441,11 @@ class SpectralAdapter(nn.Module):
         self.collapse_warning_issued = False  # Track if collapse warning was issued
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply background mask: Replace NaNs with per-band means to maintain spectral realism
+        # Apply background mask: Set any NaNs to 0.0 (e.g., padding area)
         # This prevents downstream convolutional layers from propagating invalid values
-        # while preserving realistic spectral signatures in background regions
         if torch.isnan(x).any():
-            logger.debug("[NaN DEBUG] NaNs found in adapter input, replacing with per-band means.")
-            for band_idx in range(x.shape[1]):
-                band = x[:, band_idx]
-                nan_mask = torch.isnan(band)
-                if nan_mask.any():
-                    band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
-                    x[:, band_idx][nan_mask] = band_mean
+            logger.debug("[NaN DEBUG] NaNs found in adapter input, replacing with 0.0 (masked background).")
+        x = torch.nan_to_num(x, nan=0.0)
 
         # Log adapter input stats for NaN debugging
         logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
@@ -650,54 +645,13 @@ class InputAdapter(nn.Module):
         if torch.isinf(x).any():
             logger.debug("[NaN DEBUG] Infs detected in InputAdapter output.")
 
-        # Handle NaN/Inf values: use per-band means for NaNs, clamp infinities
-        if torch.isnan(x).any():
-            for band_idx in range(x.shape[1]):
-                band = x[:, band_idx]
-                nan_mask = torch.isnan(band)
-                if nan_mask.any():
-                    band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
-                    x[:, band_idx][nan_mask] = band_mean
-        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)  # Only handles remaining Infs
+        # Optionally clamp to prevent propagation of small/large values
+        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
         return x
 
 
-# Numerically stable normalization for SAM loss
-def safe_normalize(tensor, dim=1, eps=1e-8):
-    # Numerically stable normalization for SAM loss
-    # Ensures that spectral angle calculations are robust to small values and avoid NaNs.
-    norm = torch.norm(tensor, p=2, dim=dim, keepdim=True)
-    norm = norm.clamp(min=eps)
-    return tensor / norm
-
-def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
-    """
-    Numerically stable Spectral Angle Mapper (SAM) loss between two multispectral images.
-
-    Args:
-        original: Original multispectral image
-        reconstructed: Reconstructed multispectral image
-    Returns:
-        Mean spectral angle in radians
-    
-    - SAM loss is critical for preserving spectral signatures, which is a key scientific goal in plant imaging.
-    - Invariant to scaling, so it focuses on spectral shape rather than intensity.
-    """
-    # Use safe normalization to avoid NaNs
-    normalized_original = safe_normalize(original, dim=1)
-    normalized_reconstructed = safe_normalize(reconstructed, dim=1)
-
-    # Compute cosine similarity and clamp for stability
-    cos_sim = F.cosine_similarity(normalized_original, normalized_reconstructed, dim=1)
-    cos_sim = cos_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-
-    angle = torch.acos(cos_sim)
-    angle = torch.nan_to_num(angle, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if torch.isnan(angle).any():
-        logger.debug("NaNs detected in SAM angle computation.")
-
-    return angle.mean()
+# Note: Custom SAM implementation replaced with torchmetrics.image.SpectralAngleMapper
+# for improved numerical stability and standardization
 
 #
 # Adapter Configuration and Training Design:
@@ -721,12 +675,13 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     3. Keeping backbone frozen during training (parameter-efficient fine-tuning)
     4. Only training the adapter layers (supports rapid adaptation)
     5. Including spectral attention and specialized losses
-    6. **Supports spectral signature guidance**: The training script can now include a reference-based spectral signature loss, encouraging the reconstructed mean spectrum (over leaf pixels) to match a provided healthy leaf signature. This is important for scientific realism and spectral fidelity in generated images.
 
     Parameters:
         pretrained_model_name_or_path (str): Path to pretrained SD3 VAE
-        in_channels (int, optional): Number of input channels (default: 5)
-        out_channels (int, optional): Number of output channels (default: 5)
+        adapter_in_channels (int, optional): Number of adapter input channels (default: 5)
+        adapter_out_channels (int, optional): Number of adapter output channels (default: 5)
+        backbone_in_channels (int, optional): Number of backbone input channels (default: 3)
+        backbone_out_channels (int, optional): Number of backbone output channels (default: 3)
         adapter_channels (int, optional): Number of channels in adapter layers (default: 32)
         adapter_placement (str, optional): Where to place adapters ("input", "output", or "both")
         use_spectral_attention (bool, optional): Whether to use spectral attention (default: True)
@@ -740,12 +695,11 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     #HuggingFace's from_pretrained first loads config.json and then calls __init__ method via from_config.
     # __init__ must be compatible with keyword-based instantiation — not positional-only
 
-    # Refactor: Use explicit adapter and backbone channel config fields for clarity
     @register_to_config
     def __init__(
         self,
-        *,
-        pretrained_model_name_or_path: str = None,
+        *, # forces all arguments to be keyword-only, which is expected by the Diffusers .from_pretrained() logic.
+        pretrained_model_name_or_path: str = None, #CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
         adapter_in_channels: int = 5,  # Refactored: adapter input channels
         adapter_out_channels: int = 5, # Refactored: adapter output channels
         backbone_in_channels: int = 3, # Refactored: backbone input channels
@@ -758,19 +712,21 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         revision: str = None,
         variant: str = None,
         torch_dtype: torch.dtype = None,
-        use_saturation_penalty: bool = False,
+        use_saturation_penalty: bool = False, # set use_saturation_penalty=True when initializing
     ):
         # Adapter config: these are for the adapters only, not the backbone
         self.adapter_placement = adapter_placement
         self.use_spectral_attention = use_spectral_attention
         self.use_sam_loss = use_sam_loss
-        self.adapter_in_channels = adapter_in_channels  # Refactored: adapter input channels
-        self.adapter_out_channels = adapter_out_channels  # Refactored: adapter output channels
+        self.adapter_in_channels = adapter_in_channels  # Refactored: adapter input channels (e.g., 5 for multispectral)
+        self.adapter_out_channels = adapter_out_channels  # Refactored: adapter output channels (e.g., 5 for multispectral)
+        self.backbone_in_channels = backbone_in_channels  # Refactored: backbone input channels (always 3 for SD3)
+        self.backbone_out_channels = backbone_out_channels  # Refactored: backbone output channels (always 3 for SD3)
         self.adapter_channels = adapter_channels
         self.use_saturation_penalty = use_saturation_penalty
-        self.backbone_in_channels = backbone_in_channels  # Refactored: backbone input channels
-        self.backbone_out_channels = backbone_out_channels  # Refactored: backbone output channels
+
         # The backbone (SD3 VAE) is always 3->3 channels, regardless of adapter config
+        # This is critical: the adapters handle 5->3 and 3->5 translation
         if pretrained_model_name_or_path is None:
             raise ValueError("`pretrained_model_name_or_path` must be passed to `from_pretrained()` or stored in config.")
         config = AutoencoderKL.load_config(
@@ -779,6 +735,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             revision=revision,
             variant=variant,
         )
+        # Remove adapter-specific config keys before AutoencoderKL.__init__
         adapter_keys = {
             "pretrained_model_name_or_path",
             "adapter_channels",
@@ -796,10 +753,18 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             "backbone_out_channels",
         }
         config = {k: v for k, v in config.items() if k not in adapter_keys}
-        # Refactored: Use explicit backbone channel config
+        # Force backbone to always use 3 input/output channels
         config["in_channels"] = self.backbone_in_channels
         config["out_channels"] = self.backbone_out_channels
         super().__init__(**config)
+
+        # Initialize SpectralAngleMapper for SAM loss computation
+        if self.use_sam_loss:
+            self.sam_metric = SpectralAngleMapper()
+        else:
+            self.sam_metric = None
+
+        # Adapters handle the translation between multispectral and RGB
         self.load_from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -809,7 +774,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         )
 
     def load_from_pretrained(self, pretrained_model_name_or_path, subfolder=None, revision=None, variant=None, torch_dtype=None):
-        # Refactored: Use explicit adapter channel config for adapters
+        # Load the SD3 VAE backbone with 3 input/output channels (never 5)
         base_model = AutoencoderKL.from_pretrained(
             pretrained_model_name_or_path,
             subfolder=subfolder,
@@ -819,36 +784,27 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             ignore_mismatched_sizes=True,
             low_cpu_mem_usage=False,
         )
-        # Load backbone weights (no adapters)
         self.load_state_dict(base_model.state_dict(), strict=False)
-        # Instantiate adapters
+
+        # Adapters: input_adapter (5->3), output_adapter (3->5)
         if self.adapter_placement in ["input", "both"]:
             self.input_adapter = SpectralAdapter(
-                self.adapter_in_channels, self.backbone_in_channels,  # Refactored: adapter_in_channels -> backbone_in_channels
+                self.adapter_in_channels, self.backbone_in_channels,  # 5->3
                 use_attention=self.use_spectral_attention,
                 num_bands=self.adapter_in_channels
             )
         if self.adapter_placement in ["output", "both"]:
             self.output_adapter = SpectralAdapter(
-                self.backbone_out_channels, self.adapter_out_channels,  # Refactored: backbone_out_channels -> adapter_out_channels
+                self.backbone_out_channels, self.adapter_out_channels,  # 3->5
                 use_attention=self.use_spectral_attention,
                 num_bands=self.adapter_out_channels
             )
-        # Load the full state dict (including adapters) if available
-        # instantiate adapter->full state dict load : 
-        # ensures that all trained adapter weights are restored when loading pretrained multispectral VAE
-        import os
-        import torch
-        # Try to find the state dict file (HuggingFace convention)
-        state_dict_path = None
-        for fname in ["pytorch_model.bin", "diffusion_pytorch_model.bin"]:
-            candidate = os.path.join(pretrained_model_name_or_path, fname)
-            if os.path.isfile(candidate):
-                state_dict_path = candidate
-                break
-        if state_dict_path is not None:
-            state_dict = torch.load(state_dict_path, map_location="cpu")
-            self.load_state_dict(state_dict, strict=False)
+        
+        # Set dtype for adapter parameters if specified
+        if torch_dtype is not None:
+            self._set_adapter_dtype(torch_dtype)
+        
+        # Freeze backbone by default (adapters are trainable)
         self.freeze_backbone()
 
     # Freezing pretrained SD3 VAE ensures latent space remains aligned with pretrained distributions.
@@ -876,6 +832,13 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         if hasattr(self, 'output_adapter'):
             params.extend(self.output_adapter.parameters())
         return params
+
+    def _set_adapter_dtype(self, dtype: torch.dtype):
+        """Set dtype for all adapter parameters to ensure mixed precision compatibility."""
+        if hasattr(self, 'input_adapter'):
+            self.input_adapter = self.input_adapter.to(dtype=dtype)
+        if hasattr(self, 'output_adapter'):
+            self.output_adapter = self.output_adapter.to(dtype=dtype)
 
     def get_scale_monitoring_info(self) -> Dict[str, any]:
         """
@@ -1016,7 +979,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         losses['mse'] = mse_per_channel.mean()
 
         # Spectral Angle Mapper loss for spectral fidelity (masked)
-        if self.use_sam_loss:
+        if self.use_sam_loss and self.sam_metric is not None:
             # Apply mask before computing SAM loss
             if mask is not None:
                 # For SAM, we need to handle the case where some pixels have zero spectral magnitude
@@ -1033,15 +996,19 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                     valid_original = valid_original.view(-1, original.shape[1])
                     valid_reconstructed = valid_reconstructed.view(-1, original.shape[1])
                     
-                    # Compute SAM on valid pixels only
-                    losses['sam'] = compute_sam_loss(valid_original, valid_reconstructed)
+                    # Compute SAM using torchmetrics (expects (N, C) format)
+                    # torchmetrics SpectralAngleMapper returns angle in radians
+                    losses['sam'] = self.sam_metric(valid_reconstructed, valid_original)
                 else:
                     # No valid spectral pixels, set SAM loss to zero
                     losses['sam'] = torch.tensor(0.0, device=original.device, dtype=original.dtype)
                     logger.warning("No valid spectral pixels found for SAM loss computation")
             else:
                 # No mask provided, compute SAM on entire image
-                losses['sam'] = compute_sam_loss(original, reconstructed)
+                # Reshape to (N, C) format for torchmetrics
+                original_flat = original.view(-1, original.shape[1])
+                reconstructed_flat = reconstructed.view(-1, reconstructed.shape[1])
+                losses['sam'] = self.sam_metric(reconstructed_flat, original_flat)
             
             if torch.isnan(losses['sam']):
                 logger.debug("[NaN DEBUG] SAM loss returned NaN")
@@ -1052,9 +1019,9 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         # Saturation penalty: softly discourages outputs from nearing ±1 extremes,
         # which can compress spectral details important in plant stress analysis.
         # Applies penalty only if use_saturation_penalty=True was set during model init.
-        # v12: saturation_penalty immediately reduced output range from
-        # Decoder output range: min=-9.5801, max=9.3622 to
-        # Decoder output range: min=-3.4364, max=5.2877
+        # v12saturation_penalty immediately reduced output range from
+        # Decoder output range: min=-9.581=90.3622
+        # Decoder output range: min=-30.4364max=5.2877
         #
         # ARCHITECTURAL DESIGN RATIONALE: Why Saturation Penalty is in Model Code
         # ----------------------------------------------------------------------
@@ -1087,13 +1054,21 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     # based on Hugging Face config and user-provided overrides.
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        # Refactored: Use explicit adapter and backbone channel config
+        """
+        Custom `from_pretrained` to load weights into AutoencoderKLMultispectralAdapter
+        from base AutoencoderKL weights (e.g., SD3 RGB VAE). This avoids issues with
+        Hugging Face's internal handling of pretrained_model_name_or_path being passed twice.
+        """
+        # Step 1: Load base model config
         config = AutoencoderKL.load_config(
             pretrained_model_name_or_path,
             subfolder=kwargs.get("subfolder", "vae"),
             revision=kwargs.get("revision", None),
             variant=kwargs.get("variant", None),
         )
+
+        # Step 2: Instantiate adapter model with all config + kwargs
+        # Always force adapter_in_channels=5, adapter_out_channels=5 unless explicitly overridden
         model = cls(
             pretrained_model_name_or_path=pretrained_model_name_or_path,
             adapter_in_channels=kwargs.get("adapter_in_channels", 5),
@@ -1110,37 +1085,29 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             torch_dtype=kwargs.get("torch_dtype", None),
             use_saturation_penalty=kwargs.get("use_saturation_penalty", False),
         )
-        # After instantiation, load the full state dict (including adapters)
-        import os
-        import torch
-        state_dict_path = None
-        for fname in ["pytorch_model.bin", "diffusion_pytorch_model.bin"]:
-            candidate = os.path.join(pretrained_model_name_or_path, fname)
-            if os.path.isfile(candidate):
-                state_dict_path = candidate
-                break
-        if state_dict_path is not None:
-            state_dict = torch.load(state_dict_path, map_location="cpu")
-            model.load_state_dict(state_dict, strict=False)
-        # Refactored: Post-load assertion for adapter channels
+        # Post-load assertion: check adapter-level input/output consistency
+        # The config reflects backbone (RGB) channels, but adapter channels are stored in instance variables
         if model.adapter_in_channels != 5:
             raise AssertionError(
                 f"Adapter expected adapter_in_channels=5, got {model.adapter_in_channels}.\n"
-                f"Note: model.config.in_channels is {model.config.in_channels} (backbone, always 3).\n"
-                f"If you are loading from a pretrained RGB VAE, this is expected for the backbone, but the adapter must use 5 channels.\n"
+                f"Note: model.config.adapter_in_channels is {model.config.adapter_in_channels} (adapter).\n"
+                f"If you are loading from a pretrained RGB VAE, this is expected for the adapter, but the adapter must use 5 channels.\n"
                 f"Check that you are passing adapter_in_channels=5 to from_pretrained and that your config is correct."
             )
         if model.adapter_out_channels != 5:
             raise AssertionError(
                 f"Adapter expected adapter_out_channels=5, got {model.adapter_out_channels}.\n"
-                f"Note: model.config.out_channels is {model.config.out_channels} (backbone, always 3).\n"
-                f"If you are loading from a pretrained RGB VAE, this is expected for the backbone, but the adapter must use 5 channels.\n"
+                f"Note: model.config.adapter_out_channels is {model.config.adapter_out_channels} (adapter).\n"
+                f"If you are loading from a pretrained RGB VAE, this is expected for the adapter, but the adapter must use 5 channels.\n"
                 f"Check that you are passing adapter_out_channels=5 to from_pretrained and that your config is correct."
             )
         return model
 
     def save_pretrained(self, save_directory, *args, **kwargs):
-        # Refactored: Save explicit adapter and backbone channel config fields
+        """
+        Override to forcibly register correct config fields before saving.
+        This guarantees adapter_in_channels=5, adapter_out_channels=5 are always written to config.json.
+        """
         self.register_to_config(
             adapter_in_channels=self.adapter_in_channels,
             adapter_out_channels=self.adapter_out_channels,
@@ -1218,10 +1185,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             Union[DecoderOutput, torch.Tensor]: Reconstructed 5-channel image with nonlinear transformations applied.
                          Output range is not guaranteed to be [-1, 1] due to adapter nonlinearities.
         """
-        # Cast input to float32 if it's float16 (for stability with mixed precision pipelines)
-        if z.dtype == torch.float16:
-            z = z.to(torch.float32)
-        
         # Get base decoder output
         raw = super().decode(z, return_dict=True)
         
@@ -1243,8 +1206,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
             # Return DecoderOutput for downstream pipeline compatibility
             return DecoderOutput(sample=adapted_output)
         else:
-            # Return tuple for pipeline compatibility (pipeline expects [0] indexing)
-            return (adapted_output,)
+            # Return raw tensor for training script compatibility
+            return adapted_output
 
     def forward(
         self,
@@ -1270,33 +1233,47 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
 
         Returns:
             Tuple of (decoded_output, losses_dict) where losses_dict is None in eval mode
-
-        - In eval/inference mode: only encodes and decodes, returns decoded tensor (or DecoderOutput), skips all loss computation, mask handling, and logging.
         """
         # Input sample is adapted and encoded
         x = sample
 
+        # Log: NaNs in input
+        if torch.isnan(x).any():
+            logger.debug("[NaN DEBUG] NaNs detected in input")
+
+        # Optional: Print input stats before any adapter/encoder to diagnose anomalies in early pipeline
+        logger.debug(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
+
+        posterior = self.encode(x).latent_dist
+
+        # Log: NaNs in posterior distribution
+        if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+            logger.debug("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
+
+        # Choose whether to sample from posterior or use mode
+        if sample_posterior:
+            z = posterior.sample(generator=generator)
+        else:
+            z = posterior.mode()
+
+        # Log: NaNs in latent z
+        if torch.isnan(z).any():
+            logger.debug("[NaN DEBUG] NaNs detected in latent z")
+
+        # Decode to obtain reconstructed output
+        decoded = self.decode(z)
+        # Ensure decoded is a tensor, not DecoderOutput
+        if isinstance(decoded, DecoderOutput):
+            decoded_tensor = decoded.sample
+        else:
+            decoded_tensor = decoded
+
+        # Log: NaNs in reconstruction
+        if torch.isnan(decoded_tensor).any():
+            logger.debug("[NaN DEBUG] NaNs detected in reconstruction")
+
+        # Compute training losses if in training mode
         if self.training:
-            # Log: NaNs in input
-            if torch.isnan(x).any():
-                logger.debug("[NaN DEBUG] NaNs detected in input")
-            logger.debug(f"[NaN DEBUG] Input stats before encode - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
-            posterior = self.encode(x).latent_dist
-            if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
-                logger.debug("[NaN DEBUG] NaNs detected in posterior mean/logvar after encode")
-            if sample_posterior:
-                z = posterior.sample(generator=generator)
-            else:
-                z = posterior.mode()
-            if torch.isnan(z).any():
-                logger.debug("[NaN DEBUG] NaNs detected in latent z")
-            decoded = self.decode(z)
-            if isinstance(decoded, DecoderOutput):
-                decoded_tensor = decoded.sample
-            else:
-                decoded_tensor = decoded
-            if torch.isnan(decoded_tensor).any():
-                logger.debug("[NaN DEBUG] NaNs detected in reconstruction")
             losses = self.compute_losses(x, decoded_tensor, mask)
             # Log: Loss debugging for NaNs or unusual values
             if torch.isnan(losses['mse']).any():
@@ -1320,18 +1297,24 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 logger.info(f"[Monitor] Global scale: {global_scale_val:.4f}")
                 if global_scale_val < 0.1 or global_scale_val > 3.0:
                     logger.warning(f"[Monitor] Global scale {global_scale_val:.4f} is outside recommended bounds [0.1, 3.0].")
+            
             return decoded_tensor, losses
-        else:
-            # inference only
-            posterior = self.encode(x).latent_dist
-            if sample_posterior:
-                z = posterior.sample(generator=generator)
-            else:
-                z = posterior.mode()
-            decoded = self.decode(z, return_dict=return_dict)
-            if return_dict and isinstance(decoded, DecoderOutput):
-                return decoded
-            elif isinstance(decoded, DecoderOutput):
-                return decoded.sample
-            else:
-                return decoded
+
+        # In evaluation mode, still compute losses for validation tracking
+        losses = self.compute_losses(x, decoded_tensor, mask)
+        
+        # Global scale convergence monitoring (both training and eval modes)
+        # This provides comprehensive tracking of scale behavior for scientific analysis
+        if hasattr(self, "output_adapter") and hasattr(self.output_adapter, "monitor_global_scale_convergence"):
+            scale_info = self.output_adapter.monitor_global_scale_convergence()
+            
+            # Log critical issues immediately
+            if scale_info['is_collapsed']:
+                logger.error(f"[Scale Monitor] CRITICAL: Output scale collapsed to {scale_info['scale_value']:.6f}")
+            elif scale_info['is_exploded']:
+                logger.error(f"[Scale Monitor] CRITICAL: Output scale exploded to {scale_info['scale_value']:.6f}")
+            
+            # Add scale monitoring info to losses for external logging
+            losses['scale_monitoring'] = scale_info
+        
+        return decoded_tensor, losses
