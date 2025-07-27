@@ -8,6 +8,11 @@ python examples/multispectral/eval_multispectral_vae.py \
 
 Note: This evaluation script now properly handles [-1, 1] normalized data throughout the pipeline.
 The dataloader normalizes to [-1, 1], the model expects [-1, 1], and visualization converts to [0, 1] for display.
+
+SAM Loss Implementation:
+- Uses torchmetrics.image.SpectralAngleMapper for standardized spectral angle computation
+- Provides improved numerical stability and follows established metrics standards
+- Compatible with the training script's SAM loss implementation
 """
 
 import os
@@ -22,6 +27,14 @@ import json
 import warnings
 from rasterio.errors import NotGeoreferencedWarning
 warnings.filterwarnings("ignore", category=NotGeoreferencedWarning)
+
+# Import torchmetrics for standardized SAM computation
+try:
+    from torchmetrics.image import SpectralAngleMapper
+    TORCHMETRICS_AVAILABLE = True
+except ImportError:
+    TORCHMETRICS_AVAILABLE = False
+    print("Warning: torchmetrics not available. SAM computation will use fallback implementation.")
 
 from diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter as AutoencoderKL
 # from diffusers import AutoencoderKLMultispectralAdapter
@@ -248,106 +261,179 @@ def aggregate_spectral_errors(all_errors, outdir):
 
 def compute_sam(original, reconstructed, mask=None, eps=1e-8):
     """
-    Compute Spectral Angle Mapper (SAM) between original and reconstructed images.
+    Compute Spectral Angle Mapper (SAM) between original and reconstructed images using torchmetrics.
+    
+    This function uses torchmetrics.image.SpectralAngleMapper for standardized and numerically
+    stable spectral angle computation, ensuring consistency with the training script.
+    
     Computes three sets of metrics if mask is provided:
     - Foreground (mask==1): focuses on leaf fidelity
     - Background (mask==0): provides context on background reconstruction
     - Overall (no mask): global metric over entire image
     
-    Additionally, computes per-band SAM by averaging spectral angles per band.
-    NOTE: SAM is angular, so band-wise breakdown is a bit unconventional, 
-    but here it's computed sensibly: angle between original and reconstructed 
-    vector using a one-hot band vector
-    
     Args:
-        original: Original multispectral image (B, 5, H, W)
-        reconstructed: Reconstructed multispectral image (B, 5, H, W)
+        original: Original multispectral image (B, 5, H, W) as numpy array
+        reconstructed: Reconstructed multispectral image (B, 5, H, W) as numpy array
         mask: Background mask (B, 1, H, W) where 1=leaf, 0=background
-        eps: Small value to prevent division by zero
+        eps: Small value to prevent division by zero (used in fallback only)
     
     Returns:
         Dictionary with keys 'foreground', 'background', and 'overall', each containing:
             - 'mean_angle': Mean spectral angle in radians
             - 'per_band_angle': Per-band mean spectral angle in radians (length 5)
     """
-    def sam_per_mask(m):
-        # m shape: (B,1,H,W) or None
-        if m is not None:
-            mask_expanded = np.repeat(m, 5, axis=1)  # (B,5,H,W)
-            orig_masked = original * mask_expanded
-            recon_masked = reconstructed * mask_expanded
-        else:
-            orig_masked = original
-            recon_masked = reconstructed
+    if TORCHMETRICS_AVAILABLE:
+        # Use torchmetrics for standardized SAM computation
+        sam_metric = SpectralAngleMapper()
         
-        B, C, H, W = orig_masked.shape
-        # Flatten spatial dimensions
-        orig_flat = orig_masked.reshape(B, C, -1)  # (B,5,H*W)
-        recon_flat = recon_masked.reshape(B, C, -1)
-        
-        # Compute dot product and norms per pixel
-        dot = (orig_flat * recon_flat).sum(axis=1)  # (B, H*W)
-        norm_orig = np.linalg.norm(orig_flat, axis=1)  # (B, H*W)
-        norm_recon = np.linalg.norm(recon_flat, axis=1)  # (B, H*W)
-        
-        cos = dot / (norm_orig * norm_recon + eps)
-        cos = np.clip(cos, -1, 1)
-        angles = np.arccos(cos)  # (B, H*W)
-        
-        # Per-band SAM: compute angle per band by considering each band's vector as 1D
-        # Here, we compute SAM per band by comparing original and reconstructed values per band
-        # Since each band is scalar, spectral angle reduces to 0 if values have same sign and magnitude
-        # Instead, we compute mean absolute difference normalized by magnitude for each band
-        per_band_angles = []
-        for band in range(5):
-            orig_band = orig_masked[:, band]  # (B,H,W)
-            recon_band = recon_masked[:, band]  # (B,H,W)
-            # Flatten spatial dims
-            orig_b_flat = orig_band.reshape(B, -1)
-            recon_b_flat = recon_band.reshape(B, -1)
-            dot_b = orig_b_flat * recon_b_flat  # (B,H*W)
-            norm_orig_b = np.abs(orig_b_flat)
-            norm_recon_b = np.abs(recon_b_flat)
-            cos_b = dot_b / (norm_orig_b * norm_recon_b + eps)
-            cos_b = np.clip(cos_b, -1, 1)
-            angles_b = np.arccos(cos_b)  # (B,H*W)
-            # Mask out zero norm pixels to avoid invalid angles
-            valid_mask_b = (norm_orig_b > eps) & (norm_recon_b > eps)
-            if np.any(valid_mask_b):
-                mean_angle_b = np.nanmean(angles_b[valid_mask_b])
+        def sam_per_mask_torchmetrics(m):
+            # m shape: (B,1,H,W) or None
+            if m is not None:
+                mask_expanded = np.repeat(m, 5, axis=1)  # (B,5,H,W)
+                orig_masked = original * mask_expanded
+                recon_masked = reconstructed * mask_expanded
             else:
-                mean_angle_b = 0.0
-            per_band_angles.append(mean_angle_b)
-        per_band_angles = np.array(per_band_angles)
-        
-        if m is not None:
-            mask_flat = m.reshape(B, -1)  # (B,H*W)
-            valid_pixels = mask_flat.sum(axis=1) > 0  # (B,)
-            if np.any(valid_pixels):
-                mean_angle = np.nanmean(angles[valid_pixels])
+                orig_masked = original
+                recon_masked = reconstructed
+            
+            B, C, H, W = orig_masked.shape
+            
+            # Convert to torch tensors for torchmetrics
+            orig_tensor = torch.from_numpy(orig_masked).float()
+            recon_tensor = torch.from_numpy(recon_masked).float()
+            
+            # Reshape to (N, C) format for torchmetrics SpectralAngleMapper
+            orig_flat = orig_tensor.view(B * H * W, C)  # (N, C)
+            recon_flat = recon_tensor.view(B * H * W, C)  # (N, C)
+            
+            # Compute SAM using torchmetrics
+            # torchmetrics expects (preds, target) order
+            sam_values = sam_metric(recon_flat, orig_flat)  # Returns angle in radians
+            
+            # Handle masking for foreground/background
+            if m is not None:
+                mask_flat = m.reshape(B * H * W)  # (N,)
+                valid_pixels = mask_flat > 0
+                if torch.any(valid_pixels):
+                    mean_angle = torch.mean(sam_values[valid_pixels]).item()
+                else:
+                    mean_angle = 0.0
             else:
-                mean_angle = 0.0
-        else:
-            mean_angle = np.nanmean(angles)
+                mean_angle = torch.mean(sam_values).item()
+            
+            # Compute per-band SAM (simplified approach for torchmetrics)
+            # Since torchmetrics computes overall spectral angle, we'll compute
+            # band-wise correlation as a proxy for per-band spectral similarity
+            per_band_angles = []
+            for band in range(5):
+                orig_band = orig_tensor[:, band].view(B * H * W)  # (N,)
+                recon_band = recon_tensor[:, band].view(B * H * W)  # (N,)
+                
+                # Compute correlation coefficient as proxy for spectral similarity
+                # Higher correlation = lower spectral angle
+                corr = torch.corrcoef(torch.stack([orig_band, recon_band]))[0, 1]
+                if torch.isnan(corr):
+                    angle_band = np.pi / 2  # 90 degrees for no correlation
+                else:
+                    # Convert correlation to angle: corr = cos(angle)
+                    angle_band = torch.acos(torch.clamp(corr, -1.0, 1.0)).item()
+                
+                per_band_angles.append(angle_band)
+            
+            return {'mean_angle': mean_angle, 'per_band_angle': np.array(per_band_angles)}
         
-        return {'mean_angle': mean_angle, 'per_band_angle': per_band_angles}
-    
-    results = {}
-    # Foreground metrics (mask==1)
-    if mask is not None:
-        results['foreground'] = sam_per_mask(mask)
-        # Background metrics (mask==0)
-        background_mask = 1 - mask
-        results['background'] = sam_per_mask(background_mask)
+        results = {}
+        # Foreground metrics (mask==1)
+        if mask is not None:
+            results['foreground'] = sam_per_mask_torchmetrics(mask)
+            # Background metrics (mask==0)
+            background_mask = 1 - mask
+            results['background'] = sam_per_mask_torchmetrics(background_mask)
+        else:
+            results['foreground'] = None
+            results['background'] = None
+        # Overall metrics (no mask)
+        results['overall'] = sam_per_mask_torchmetrics(None)
+        
     else:
-        results['foreground'] = None
-        results['background'] = None
-    # Overall metrics (no mask)
-    results['overall'] = sam_per_mask(None)
+        # Fallback to original custom implementation if torchmetrics not available
+        def sam_per_mask(m):
+            # m shape: (B,1,H,W) or None
+            if m is not None:
+                mask_expanded = np.repeat(m, 5, axis=1)  # (B,5,H,W)
+                orig_masked = original * mask_expanded
+                recon_masked = reconstructed * mask_expanded
+            else:
+                orig_masked = original
+                recon_masked = reconstructed
+            
+            B, C, H, W = orig_masked.shape
+            # Flatten spatial dimensions
+            orig_flat = orig_masked.reshape(B, C, -1)  # (B,5,H*W)
+            recon_flat = recon_masked.reshape(B, C, -1)
+            
+            # Compute dot product and norms per pixel
+            dot = (orig_flat * recon_flat).sum(axis=1)  # (B, H*W)
+            norm_orig = np.linalg.norm(orig_flat, axis=1)  # (B, H*W)
+            norm_recon = np.linalg.norm(recon_flat, axis=1)  # (B, H*W)
+            
+            cos = dot / (norm_orig * norm_recon + eps)
+            cos = np.clip(cos, -1, 1)
+            angles = np.arccos(cos)  # (B, H*W)
+            
+            # Per-band SAM: compute angle per band by considering each band's vector as 1D
+            per_band_angles = []
+            for band in range(5):
+                orig_band = orig_masked[:, band]  # (B,H,W)
+                recon_band = recon_masked[:, band]  # (B,H,W)
+                # Flatten spatial dims
+                orig_b_flat = orig_band.reshape(B, -1)
+                recon_b_flat = recon_band.reshape(B, -1)
+                dot_b = orig_b_flat * recon_b_flat  # (B,H*W)
+                norm_orig_b = np.abs(orig_b_flat)
+                norm_recon_b = np.abs(recon_b_flat)
+                cos_b = dot_b / (norm_orig_b * norm_recon_b + eps)
+                cos_b = np.clip(cos_b, -1, 1)
+                angles_b = np.arccos(cos_b)  # (B,H*W)
+                # Mask out zero norm pixels to avoid invalid angles
+                valid_mask_b = (norm_orig_b > eps) & (norm_recon_b > eps)
+                if np.any(valid_mask_b):
+                    mean_angle_b = np.nanmean(angles_b[valid_mask_b])
+                else:
+                    mean_angle_b = 0.0
+                per_band_angles.append(mean_angle_b)
+            per_band_angles = np.array(per_band_angles)
+            
+            if m is not None:
+                mask_flat = m.reshape(B, -1)  # (B,H*W)
+                valid_pixels = mask_flat.sum(axis=1) > 0  # (B,)
+                if np.any(valid_pixels):
+                    mean_angle = np.nanmean(angles[valid_pixels])
+                else:
+                    mean_angle = 0.0
+            else:
+                mean_angle = np.nanmean(angles)
+            
+            return {'mean_angle': mean_angle, 'per_band_angle': per_band_angles}
+        
+        results = {}
+        # Foreground metrics (mask==1)
+        if mask is not None:
+            results['foreground'] = sam_per_mask(mask)
+            # Background metrics (mask==0)
+            background_mask = 1 - mask
+            results['background'] = sam_per_mask(background_mask)
+        else:
+            results['foreground'] = None
+            results['background'] = None
+        # Overall metrics (no mask)
+        results['overall'] = sam_per_mask(None)
+    
     # Add per-band angles for each region
     results['per_band_angle_foreground'] = results['foreground']['per_band_angle'].tolist() if results['foreground'] is not None else None
     results['per_band_angle_background'] = results['background']['per_band_angle'].tolist() if results['background'] is not None else None
     results['per_band_angle_overall'] = results['overall']['per_band_angle'].tolist()
+    
     return results
 
 def compute_bandwise_mse(original, reconstructed, mask=None, eps=1e-8):
@@ -526,6 +612,13 @@ def main():
     parser.add_argument('--output_dir', type=str, default='vae_eval_results')
     parser.add_argument('--num_samples', type=int, default=10, help='Number of samples to visualize')
     args = parser.parse_args()
+
+    # Inform user about SAM implementation
+    if TORCHMETRICS_AVAILABLE:
+        print("✓ Using torchmetrics.image.SpectralAngleMapper for standardized SAM computation")
+    else:
+        print("⚠ Using fallback SAM implementation (torchmetrics not available)")
+        print("  Install torchmetrics for improved numerical stability: pip install torchmetrics")
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = AutoencoderKL.from_pretrained(
