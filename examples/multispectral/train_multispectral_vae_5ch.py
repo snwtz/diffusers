@@ -997,7 +997,7 @@ def train(args: argparse.Namespace) -> None:
                         band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
                         batch[:, band_idx][nan_mask] = band_mean
             batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
-            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
+            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range, CLAMP
 
             # Forward pass with mask support for leaf-focused training
             try:
@@ -1172,7 +1172,7 @@ def train(args: argparse.Namespace) -> None:
                             band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
                             batch[:, band_idx][nan_mask] = band_mean
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
-                batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range
+                batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range, CLAMP
 
                 # Forward pass with mask support for validation
                 # MSE FIX: Temporarily set model to training mode to get losses

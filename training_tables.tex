@@ -1,0 +1,63 @@
+\begin{table}[htbp]
+  \centering
+  \caption{MSVAE Training Hyperparameters and Configuration}
+  \label{tab:msvae-training-hyperparams}
+  \renewcommand{\arraystretch}{1.2}
+  \setlength{\tabcolsep}{10pt}
+  \begin{tabular}{p{5cm} p{7cm}}
+    \toprule
+    \textbf{Parameter} & \textbf{Value / Description} \\
+    \midrule
+    Optimizer & AdamW \\
+    Optimizer $\beta_1$, $\beta_2$ & 0.9, 0.999 \\
+    Optimizer $\epsilon$ & $1 \times 10^{-8}$ \\
+    Weight decay & $1 \times 10^{-4}$ \\
+    Learning rate & $5 \times 10^{-5}$ \\
+    LR scheduler & Cosine annealing with 2\% warmup (\texttt{get\_cosine\_schedule\_with\_warmup()}) \\
+    Warmup ratio & 2\% of total training steps \\
+    Batch size & 4 \\
+    Mixed precision & FP16 for adapters, Float32 for backbone \\
+    Gradient accumulation & 1 \\
+    Gradient clipping norm & 1.0 \\
+    Early stopping patience & 10 epochs (on validation loss) \\
+    Device config & Single-GPU, automatic CUDA/CPU detection \\
+    Trainable parameters & Adapter layers only (backbone frozen) \\
+    Saturation penalty & Weight = 0.05, threshold = 0.95 \\
+    Range penalty & Weight = 0.20, threshold = 1.0 \\
+    SAM loss weight & 0.1 \\
+    Loss function & MSE + SAM (Spectral Angle Mapper) \\
+    Masked training & Pure leaf-focused (background excluded) \\
+    Seed & 42 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+  \centering
+  \caption{MSDB Training Hyperparameters and Configuration}
+  \label{tab:msdb-training-hyperparams}
+  \renewcommand{\arraystretch}{1.2}
+  \setlength{\tabcolsep}{10pt}
+  \begin{tabular}{p{5cm} p{7cm}}
+    \toprule
+    \textbf{Parameter} & \textbf{Value / Description} \\
+    \midrule
+    Optimizer & AdamW \\
+    Optimizer $\beta_1$, $\beta_2$ & 0.9, 0.999 \\
+    Optimizer $\epsilon$ & $1 \times 10^{-8}$ \\
+    Weight decay & $1 \times 10^{-4}$ \\
+    Learning rate & $5 \times 10^{-6}$ \\
+    LR scheduler & Constant with warmup \\
+    Warmup steps & 500 \\
+    Batch size & 5 \\
+    Mixed precision & FP16 \\
+    Gradient accumulation & 1 \\
+    Gradient clipping norm & 1.0 \\
+    Max training steps & 2000 \\
+    Device config & Single-GPU, automatic CUDA/CPU detection \\
+    Trainable parameters & LoRA layers + text encoder \\
+    Instance prompt & "sks leaf" \\
+    Seed & 42 \\
+    \bottomrule
+  \end{tabular}
+\end{table} 

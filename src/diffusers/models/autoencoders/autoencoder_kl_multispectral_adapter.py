@@ -248,6 +248,7 @@ from typing import Dict, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import GroupNorm
 import logging
 import numpy as np # Added for scale monitoring
 
@@ -289,7 +290,8 @@ class SpectralAttention(nn.Module):
 
     def __init__(self, num_bands: int):
         super().__init__()
-        # Simple 1x1 convolution followed by sigmoid to learn band weights
+        # 1x1 convolution learns per-band importance weights
+        # Sigmoid ensures weights are in [0,1] range for interpretable scaling
         self.attention = nn.Sequential(
             nn.Conv2d(num_bands, num_bands, kernel_size=1),  # Linear transformation
             nn.Sigmoid()  # Nonlinear activation: ensures weights are between 0 and 1
@@ -417,14 +419,14 @@ class SpectralAdapter(nn.Module):
         self.output_bias = nn.Parameter(torch.tensor(0.0))   # Global shift
 
         # Group normalization for better training stability (nonlinear normalization)
-        self.norm1 = nn.GroupNorm(8, 32)
-        self.norm2 = nn.GroupNorm(8, 32)
+        # Using torch.nn.GroupNorm for stable training with small batch sizes
+        self.norm1 = GroupNorm(8, 32)
+        self.norm2 = GroupNorm(8, 32)
 
         # SiLU activation (also known as Swish) - nonlinear activation function
         self.activation = nn.SiLU()
 
-        # Single global scale parameter for linear range control
-        # This replaces both adaptive norm and Tanh, preserving linearity for spectral fidelity
+        #  global scale parameter monitoring
         self.global_scale = nn.Parameter(torch.tensor(1.0))
         
         # Global scale convergence monitoring
@@ -455,7 +457,8 @@ class SpectralAdapter(nn.Module):
         # Log adapter input stats for NaN debugging
         logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
 
-        # Apply spectral attention if enabled (nonlinear: sigmoid + element-wise multiplication)
+        # Apply spectral attention: learns per-band importance weights and scales input accordingly
+        # Weights are computed via 1x1 conv + sigmoid, then applied via element-wise multiplication
         if self.use_attention and hasattr(self, 'attention'):
             x = self.attention(x)
 

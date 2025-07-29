@@ -1,0 +1,52 @@
+# Multispectral VAE Training Requirements
+# This file contains all dependencies needed for the multispectral VAE adapter training pipeline
+
+# Core PyTorch and Diffusers
+torch>=2.0.0
+torchvision>=0.15.0
+diffusers>=0.25.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# Data handling and processing
+numpy>=1.24.0
+Pillow>=10.0.0
+rasterio>=1.3.0  # Essential for multispectral TIFF support
+scipy>=1.9.0
+scikit-learn>=1.3.0
+
+# Image metrics and evaluation
+scikit-image>=0.19.0  # For SSIM computation
+torchmetrics>=1.0.0  # For SpectralAngleMapper
+pytorch-msssim>=0.2.1  # Alternative SSIM implementation
+
+# Visualization and plotting
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Progress tracking and logging
+tqdm>=4.65.0
+wandb>=0.16.0  # For experiment tracking
+
+# Hugging Face ecosystem
+huggingface_hub>=0.19.0  # For model uploading and management
+datasets>=2.14.0
+
+# Development and testing (optional)
+black>=23.0.0
+isort>=5.12.0
+flake8>=6.0.0
+pytest>=7.0.0
+pytest-cov>=4.1.0
+pytest-timeout>=2.4.0
+
+# Jupyter development (optional)
+jupyter>=1.0.0
+ipython>=8.0.0
+
+# Additional optional dependencies
+# Uncomment if needed:
+# opencv-python>=4.8.0  # Advanced image processing
+# albumentations>=1.3.0  # Data augmentation
+# tensorboard>=2.13.0  # Alternative to wandb
+# tensorboardX>=2.6.0  # PyTorch tensorboard integration 

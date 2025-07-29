@@ -818,7 +818,7 @@ def parse_args(input_args=None):
         "--gradient_accumulation_steps",
         type=int,
         default=1,
-        help="Number of updates steps to accumulate before performing a backward/update pass.",
+        help="Number of forward/backward passes to accumulate before updating weights. Use >1 to simulate larger batch sizes with less memory.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
@@ -1648,10 +1648,16 @@ def main(args):
     # --- DREAMBOOTH LOGGER INIT ---
     # Use a shorter model name for log files to avoid path length issues
     model_name_for_logs = "sd3_multispectral_dreambooth"
-    dreambooth_logger = create_dreambooth_logger(
-        output_dir=args.output_dir,
-        model_name=model_name_for_logs
-    )
+    try:
+        dreambooth_logger = create_dreambooth_logger(
+            output_dir=args.output_dir,
+            model_name=model_name_for_logs
+        )
+        logger.info("DreamBooth logger initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize DreamBooth logger: {e}")
+        logger.warning("Training will continue without detailed logging")
+        dreambooth_logger = None
 
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
@@ -1838,89 +1844,159 @@ def main(args):
 
                 # Compute per-channel MSE, SSIM, and SAM for spectral fidelity monitoring (every 100 steps)
                 if global_step % 100 == 0:
-                    with torch.no_grad():  # Don't track gradients for analysis
-                        # Decode the current latents back to pixel space
-                        decoded_latents = model_input / vae.config.scaling_factor + vae.config.shift_factor
-                        decoded_pixels = vae.decode(decoded_latents).sample  # Shape: (B, 5, H, W)
-                        
-                        # Compute per-channel MSE
-                        mse_per_channel = torch.mean((decoded_pixels - pixel_values) ** 2, dim=(0, 2, 3))
-                        # Shape: (5,) - one MSE value per channel
-                        
-                        # Compute per-channel SSIM
-                        if SSIM_AVAILABLE:
-                            ssim_per_channel = []
-                            for i in range(5):  # 5 channels
-                                # Convert to numpy and normalize to [0, 1] for SSIM
-                                orig_band = (pixel_values[0, i].cpu().numpy() + 1.0) / 2.0
-                                decoded_band = (decoded_pixels[0, i].cpu().numpy() + 1.0) / 2.0
-                                ssim_score = ssim(orig_band, decoded_band, data_range=1.0)
-                                ssim_per_channel.append(ssim_score)
-                        else:
-                            ssim_per_channel = [0.0] * 5
-                        
-                        # Compute SAM (Spectral Angle Mapper)
-                        if SAM_AVAILABLE:
-                            try:
-                                # metric needs to be on the same device as the input tensors (default is CPU)
-                                sam = SpectralAngleMapper().to(decoded_pixels.device)
-                                
-                                # Clip outliers using 95th percentile for SAM compatibility (monitoring only)
-                                decoded_pixels_clipped = decoded_pixels.clone()
-                                for i in range(decoded_pixels_clipped.shape[1]):  # For each channel
-                                    channel_data = decoded_pixels_clipped[0, i]  # Shape: (H, W)
-                                    q_05 = torch.quantile(channel_data, 0.05)  # 5th percentile
-                                    q_95 = torch.quantile(channel_data, 0.95)  # 95th percentile
-                                    decoded_pixels_clipped[0, i] = torch.clamp(channel_data, q_05, q_95)
-                                
-                                # Debug: Check tensor shapes and values
-                                logger.info(f"SAM input shapes: decoded_pixels[0:1]={decoded_pixels_clipped[0:1].shape}, pixel_values[0:1]={pixel_values[0:1].shape}")
-                                logger.info(f"SAM input ranges: decoded_pixels=[{decoded_pixels_clipped[0:1].min():.4f}, {decoded_pixels_clipped[0:1].max():.4f}], pixel_values=[{pixel_values[0:1].min():.4f}, {pixel_values[0:1].max():.4f}]")
-                                logger.info(f"SAM device: decoded_pixels={decoded_pixels_clipped[0:1].device}, pixel_values={pixel_values[0:1].device}, sam_metric={sam.device}")
-                                
-                                sam_score = sam(decoded_pixels_clipped[0:1], pixel_values[0:1]).item()
-                                
-                                # Debug: Check output
-                                logger.info(f"SAM raw output: {sam_score}")
-                                
-                                # Check for invalid values
-                                if math.isnan(sam_score) or math.isinf(sam_score):
-                                    logger.warning(f"SAM computation failed: VAE output range [{decoded_pixels[0:1].min():.4f}, {decoded_pixels[0:1].max():.4f}] incompatible with SpectralAngleMapper expectations")
-                                    sam_score = None  # Use None to indicate "not computable"
-                                    
-                            except Exception as e:
-                                logger.error(f"SAM computation failed with error: {e}")
-                                logger.error(f"SAM input details: decoded_pixels dtype={decoded_pixels[0:1].dtype}, pixel_values dtype={pixel_values[0:1].dtype}")
-                                sam_score = None  # Use None to indicate "not computable"
-                        else:
-                            sam_score = None  # Use None to indicate "not available"
-                        
-                        # Log all metrics with band information
-                        band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
-                                     "Band 42 (731nm)", "Band 55 (851nm)"]
-                        logger.info(f"Step {global_step} - Spectral Fidelity Metrics:")
-                        if sam_score is not None:
-                            logger.info(f"  SAM Score: {sam_score:.6f} (95th percentile clipped)")
-                        else:
-                            logger.info(f"  SAM Score: Not computable (VAE output range incompatible)")
-                        for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
-                            logger.info(f"  {band_name}: MSE={mse.item():.6f}, SSIM={ssim_val:.6f}")
-                        
-                        # Log to wandb if available
-                        if is_wandb_available() and wandb.run:
-                            wandb_log = {}
-                            if sam_score is not None:
-                                wandb_log["spectral/sam_score"] = sam_score
+                    try:
+                        with torch.no_grad():  # Don't track gradients for analysis
+                            # Decode the current latents back to pixel space
+                            decoded_latents = model_input / vae.config.scaling_factor + vae.config.shift_factor
+                            decoded_pixels = vae.decode(decoded_latents).sample  # Shape: (B, 5, H, W)
+                            
+                            # Compute per-channel MSE
+                            mse_per_channel = torch.mean((decoded_pixels - pixel_values) ** 2, dim=(0, 2, 3))
+                            # Shape: (5,) - one MSE value per channel
+                            
+                            # Compute per-channel SSIM
+                            if SSIM_AVAILABLE:
+                                try:
+                                    ssim_per_channel = []
+                                    for i in range(5):  # 5 channels
+                                        # Convert to numpy and normalize to [0, 1] for SSIM
+                                        orig_band = (pixel_values[0, i].cpu().numpy() + 1.0) / 2.0
+                                        decoded_band = (decoded_pixels[0, i].cpu().numpy() + 1.0) / 2.0
+                                        ssim_score = ssim(orig_band, decoded_band, data_range=1.0)
+                                        ssim_per_channel.append(ssim_score)
+                                except Exception as e:
+                                    logger.warning(f"SSIM computation failed: {e}")
+                                    ssim_per_channel = [0.0] * 5
                             else:
-                                wandb_log["spectral/sam_score"] = -1.0  # Use -1 to indicate "not computable"
-                            for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
-                                band_id = band_name.split()[1]  # Extract wavelength
-                                wandb_log[f"spectral/mse_channel_{i}_{band_id}"] = mse.item()
-                                wandb_log[f"spectral/ssim_channel_{i}_{band_id}"] = ssim_val
-                            wandb.log(wandb_log, step=global_step)
+                                ssim_per_channel = [0.0] * 5
+                            
+                            # Compute SAM (Spectral Angle Mapper)
+                            if SAM_AVAILABLE:
+                                try:
+                                    # metric needs to be on the same device as the input tensors (default is CPU)
+                                    sam = SpectralAngleMapper().to(decoded_pixels.device)
+                                    
+                                    # Clip outliers using 95th percentile for SAM compatibility (monitoring only)
+                                    decoded_pixels_clipped = decoded_pixels.clone()
+                                    for i in range(decoded_pixels_clipped.shape[1]):  # For each channel
+                                        channel_data = decoded_pixels_clipped[0, i]  # Shape: (H, W)
+                                        q_05 = torch.quantile(channel_data, 0.05)  # 5th percentile
+                                        q_95 = torch.quantile(channel_data, 0.95)  # 95th percentile
+                                        decoded_pixels_clipped[0, i] = torch.clamp(channel_data, q_05, q_95)
+                                    
+                                    # Debug: Check tensor shapes and values
+                                    logger.info(f"SAM input shapes: decoded_pixels[0:1]={decoded_pixels_clipped[0:1].shape}, pixel_values[0:1]={pixel_values[0:1].shape}")
+                                    logger.info(f"SAM input ranges: decoded_pixels=[{decoded_pixels_clipped[0:1].min():.4f}, {decoded_pixels_clipped[0:1].max():.4f}], pixel_values=[{pixel_values[0:1].min():.4f}, {pixel_values[0:1].max():.4f}]")
+                                    logger.info(f"SAM device: decoded_pixels={decoded_pixels_clipped[0:1].device}, pixel_values={pixel_values[0:1].device}, sam_metric={sam.device}")
+                                    
+                                    sam_score = sam(decoded_pixels_clipped[0:1], pixel_values[0:1]).item()
+                                    
+                                    # Debug: Check output
+                                    logger.info(f"SAM raw output: {sam_score}")
+                                    
+                                    # Check for invalid values
+                                    if math.isnan(sam_score) or math.isinf(sam_score):
+                                        logger.warning(f"SAM computation failed: VAE output range [{decoded_pixels[0:1].min():.4f}, {decoded_pixels[0:1].max():.4f}] incompatible with SpectralAngleMapper expectations")
+                                        sam_score = None  # Use None to indicate "not computable"
+                                        
+                                except Exception as e:
+                                    logger.error(f"SAM computation failed with error: {e}")
+                                    logger.error(f"SAM input details: decoded_pixels dtype={decoded_pixels[0:1].dtype}, pixel_values dtype={pixel_values[0:1].dtype}")
+                                    sam_score = None  # Use None to indicate "not computable"
+                            else:
+                                sam_score = None  # Use None to indicate "not available"
+                            
+                            # Compute range statistics for monitoring
+                            try:
+                                range_stats = {}
+                                total_out_of_bounds = 0
+                                total_pixels = 0
+                                
+                                for i in range(5):  # 5 channels
+                                    # Get decoded pixel values for this channel
+                                    channel_data = decoded_pixels[0, i]  # Shape: (H, W)
+                                    
+                                    # Count out-of-bounds pixels
+                                    out_of_bounds = torch.sum((channel_data < -1.0) | (channel_data > 1.0)).item()
+                                    total_pixels_channel = channel_data.numel()
+                                    
+                                    range_stats[f"band_{i}"] = {
+                                        "out_of_bounds": out_of_bounds,
+                                        "total_pixels": total_pixels_channel,
+                                        "min_val": channel_data.min().item(),
+                                        "max_val": channel_data.max().item(),
+                                        "mean_val": channel_data.mean().item(),
+                                        "std_val": channel_data.std().item(),
+                                        "out_of_bounds_pct": (out_of_bounds / total_pixels_channel * 100) if total_pixels_channel > 0 else 0
+                                    }
+                                    
+                                    total_out_of_bounds += out_of_bounds
+                                    total_pixels += total_pixels_channel
+                                
+                                # Add overall statistics
+                                range_stats["overall"] = {
+                                    "total_out_of_bounds": total_out_of_bounds,
+                                    "total_pixels": total_pixels,
+                                    "out_of_bounds_percentage": (total_out_of_bounds / total_pixels * 100) if total_pixels > 0 else 0
+                                }
+                            except Exception as e:
+                                logger.warning(f"Failed to compute range statistics: {e}")
+                                range_stats = {}
+                            
+                            # Log all metrics with band information
+                            try:
+                                band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
+                                             "Band 42 (731nm)", "Band 55 (851nm)"]
+                                logger.info(f"Step {global_step} - Spectral Fidelity Metrics:")
+                                if sam_score is not None:
+                                    logger.info(f"  SAM Score: {sam_score:.6f} (95th percentile clipped)")
+                                else:
+                                    logger.info(f"  SAM Score: Not computable (VAE output range incompatible)")
+                                for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
+                                    logger.info(f"  {band_name}: MSE={mse.item():.6f}, SSIM={ssim_val:.6f}")
+                                
+                                # Log range statistics
+                                if range_stats:
+                                    overall_pct = range_stats["overall"]["out_of_bounds_percentage"]
+                                    logger.info(f"  Range monitoring: {overall_pct:.2f}% out-of-bounds pixels")
+                            except Exception as e:
+                                logger.warning(f"Failed to log spectral metrics: {e}")
+                            
+                            # Log to wandb if available
+                            try:
+                                if is_wandb_available() and wandb.run:
+                                    wandb_log = {}
+                                    if sam_score is not None:
+                                        wandb_log["spectral/sam_score"] = sam_score
+                                    else:
+                                        wandb_log["spectral/sam_score"] = -1.0  # Use -1 to indicate "not computable"
+                                    for i, (mse, ssim_val, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
+                                        band_id = band_name.split()[1]  # Extract wavelength
+                                        wandb_log[f"spectral/mse_channel_{i}_{band_id}"] = mse.item()
+                                        wandb_log[f"spectral/ssim_channel_{i}_{band_id}"] = ssim_val
+                                    
+                                    # Add range statistics to wandb
+                                    if range_stats:
+                                        wandb_log["spectral/out_of_bounds_percentage"] = range_stats["overall"]["out_of_bounds_percentage"]
+                                        for i in range(5):
+                                            band_stats = range_stats.get(f"band_{i}", {})
+                                            wandb_log[f"spectral/band_{i}_out_of_bounds_pct"] = (band_stats.get("out_of_bounds", 0) / band_stats.get("total_pixels", 1) * 100)
+                                            wandb_log[f"spectral/band_{i}_min_val"] = band_stats.get("min_val", 0)
+                                            wandb_log[f"spectral/band_{i}_max_val"] = band_stats.get("max_val", 0)
+                                    
+                                    wandb.log(wandb_log, step=global_step)
+                            except Exception as e:
+                                logger.warning(f"Failed to log spectral metrics to wandb: {e}")
+                    except Exception as e:
+                        logger.warning(f"Failed to compute spectral metrics at step {global_step}: {e}")
+                        # Continue training even if spectral metrics computation fails
 
+                # Backward pass: compute gradients
                 accelerator.backward(loss)
+                
+                # Gradient accumulation: only update weights after accumulating gradients
                 if accelerator.sync_gradients:
+                    # Select parameters to clip (all trainable models)
                     params_to_clip = (
                         itertools.chain(
                             transformer.parameters(),
@@ -1931,8 +2007,10 @@ def main(args):
                         if args.train_text_encoder
                         else transformer.parameters()
                     )
+                    # Clip gradients to prevent explosion (max norm = 1.0)
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                    # Compute gradient norm for logging
+                    
+                    # Compute gradient norm for logging (L2 norm of all gradients)
                     total_norm = 0.0
                     for p in transformer.parameters():
                         if p.grad is not None:
@@ -1940,34 +2018,46 @@ def main(args):
                             total_norm += param_norm.item() ** 2
                     grad_norm = total_norm ** 0.5
 
+                # Update model weights using computed gradients
                 optimizer.step()
+                # Update learning rate schedule
                 lr_scheduler.step()
+                # Clear gradients for next iteration
                 optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
+            # Gradient accumulation: only increment step counter when gradients are actually applied
+            # With gradient_accumulation_steps=1, this happens every iteration
+            # With gradient_accumulation_steps>1, this happens every N iterations
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
 
                 # Log to DreamBooth logger every 100 steps
-                if global_step % 100 == 0:
-                    # Prepare spectral metrics for logging
-                    spectral_metrics = None
-                    if 'mse_per_channel' in locals() and 'ssim_per_channel' in locals() and 'sam_score' in locals():
-                        spectral_metrics = {
-                            "sam_score": sam_score,
-                            "mse_per_channel": [mse.item() for mse in mse_per_channel],
-                            "ssim_per_channel": ssim_per_channel
-                        }
-                    
-                    dreambooth_logger.log_step(
-                        step=global_step, 
-                        epoch=epoch,
-                        loss=loss.detach().item(),
-                        learning_rate=lr_scheduler.get_last_lr()[0],
-                        grad_norm=grad_norm,
-                        spectral_metrics=spectral_metrics
-                    )
+                if global_step % 100 == 0 and dreambooth_logger is not None:
+                    try:
+                        # Prepare spectral metrics for logging
+                        spectral_metrics = None
+                        if 'mse_per_channel' in locals() and 'ssim_per_channel' in locals() and 'sam_score' in locals():
+                            spectral_metrics = {
+                                "sam_score": sam_score,
+                                "mse_per_channel": [mse.item() for mse in mse_per_channel],
+                                "ssim_per_channel": ssim_per_channel
+                            }
+                            # Add range statistics if available
+                            if 'range_stats' in locals():
+                                spectral_metrics["range_stats"] = range_stats
+                        
+                        dreambooth_logger.log_step(
+                            step=global_step, 
+                            epoch=epoch,
+                            loss=loss.detach().item(),
+                            learning_rate=lr_scheduler.get_last_lr()[0],
+                            grad_norm=grad_norm,
+                            spectral_metrics=spectral_metrics
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to log step {global_step}: {e}")
+                        # Continue training even if logging fails
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
@@ -2035,14 +2125,17 @@ def main(args):
                                     validation_images.append(pil_image)
                                 
                             # Log validation images and metrics using logger
-                            val_metrics = {"val_loss": loss.detach().item()}
-                            dreambooth_logger.log_validation(
-                                epoch=global_step,
-                                images=validation_images,
-                                prompt=args.validation_prompt,
-                                validation_metrics=val_metrics
-                            )
-                            logger.info(f"Validation logging succeeded at step {global_step}")
+                            if dreambooth_logger is not None:
+                                val_metrics = {"val_loss": loss.detach().item()}
+                                dreambooth_logger.log_validation(
+                                    epoch=global_step,
+                                    images=validation_images,
+                                    prompt=args.validation_prompt,
+                                    validation_metrics=val_metrics
+                                )
+                                logger.info(f"Validation logging succeeded at step {global_step}")
+                            else:
+                                logger.info(f"Validation completed at step {global_step} (no logger)")
                         except Exception as e:
                             logger.error(f"Could not log validation at step {global_step}: {e}")
 
@@ -2054,14 +2147,18 @@ def main(args):
                 })
             # Log step metrics using logger (basic metrics only, no spectral metrics here)
             # Only log if not already logged with spectral metrics (every 100 steps)
-            if global_step % 100 != 0:
-                dreambooth_logger.log_step(
-                    step=global_step,
-                    epoch=epoch,
-                    loss=loss.detach().item(),
-                    learning_rate=lr_scheduler.get_last_lr()[0],
-                    grad_norm=grad_norm
-                )
+            if global_step % 100 != 0 and dreambooth_logger is not None:
+                try:
+                    dreambooth_logger.log_step(
+                        step=global_step,
+                        epoch=epoch,
+                        loss=loss.detach().item(),
+                        learning_rate=lr_scheduler.get_last_lr()[0],
+                        grad_norm=grad_norm
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log basic step {global_step}: {e}")
+                    # Continue training even if logging fails
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
@@ -2098,13 +2195,16 @@ def main(args):
                             validation_images.append(pil_image)
                         
                         # Log with DreamBooth logger
-                        dreambooth_logger.log_validation(
-                            epoch=global_step,
-                            images=validation_images,
-                            prompt=args.validation_prompt,
-                            validation_metrics={"val_loss": loss.detach().item()}
-                        )
-                    logger.info(f"Validation logging succeeded at epoch {epoch}")
+                        if dreambooth_logger is not None:
+                            dreambooth_logger.log_validation(
+                                epoch=global_step,
+                                images=validation_images,
+                                prompt=args.validation_prompt,
+                                validation_metrics={"val_loss": loss.detach().item()}
+                            )
+                            logger.info(f"Validation logging succeeded at epoch {epoch}")
+                        else:
+                            logger.info(f"Validation completed at epoch {epoch} (no logger)")
                 except Exception as e:
                     logger.error(f"Could not log validation data at epoch {epoch}: {e}")
 

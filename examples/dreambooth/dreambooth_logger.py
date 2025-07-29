@@ -117,97 +117,146 @@ Note: This file is overwritten for each training run to reduce clutter
     def log_step(self, step: int, epoch: int, loss: float, learning_rate: float, grad_norm: Optional[float] = None, 
                  spectral_metrics: Optional[Dict[str, Any]] = None):
         """Log step-level metrics."""
-        step_data = {
-            "step": step,
-            "epoch": epoch,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "loss": loss,
-            "learning_rate": learning_rate,
-            "grad_norm": grad_norm,
-        }
-        
-        # Add spectral metrics if provided (every 100 steps from training script)
-        if spectral_metrics:
-            step_data["spectral_metrics"] = spectral_metrics
+        try:
+            step_data = {
+                "step": step,
+                "epoch": epoch,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "loss": loss,
+                "learning_rate": learning_rate,
+                "grad_norm": grad_norm,
+            }
             
-        # Don't accumulate step data in memory for speed
-        # self.log_data["steps"].append(step_data)  # Removed for memory efficiency
-        self._check_alert_thresholds(step_data, step, mode="step")
-        
-        # Write to text file every 100 steps
-        if step % 100 == 0:
-            self._write_step_summary(step_data)
-            # Also write detailed spectral summary if available
+            # Add spectral metrics if provided (every 100 steps from training script)
             if spectral_metrics:
-                self.log_spectral_summary(step, spectral_metrics)
+                step_data["spectral_metrics"] = spectral_metrics
+                
+            # Don't accumulate step data in memory for speed
+            # self.log_data["steps"].append(step_data)  # Removed for memory efficiency
             
-        # Log to wandb every 50 steps (reduced frequency for speed)
-        if step % 50 == 0 and WANDB_AVAILABLE and wandb.run:
-            wandb_log = {k: v for k, v in step_data.items() if v is not None and k != "spectral_metrics"}
-            wandb.log(wandb_log, step=step)
+            # Check alert thresholds with exception handling
+            try:
+                self._check_alert_thresholds(step_data, step, mode="step")
+            except Exception as e:
+                print(f"Warning: Failed to check alert thresholds: {e}")
             
-        # Log spectral metrics to wandb every 100 steps
-        if step % 100 == 0 and spectral_metrics and WANDB_AVAILABLE and wandb.run:
-            wandb_spectral_log = {}
-            for key, value in spectral_metrics.items():
-                wandb_spectral_log[f"spectral/{key}"] = value
-            wandb.log(wandb_spectral_log, step=step)
-            
-        # JSON logging removed for training speed optimization
+            # Write to text file every 100 steps with exception handling
+            if step % 100 == 0:
+                try:
+                    self._write_step_summary(step_data)
+                except Exception as e:
+                    print(f"Warning: Failed to write step summary: {e}")
+                
+                # Also write detailed spectral summary if available
+                if spectral_metrics:
+                    try:
+                        self.log_spectral_summary(step, spectral_metrics)
+                    except Exception as e:
+                        print(f"Warning: Failed to write spectral summary: {e}")
+                
+            # Log range monitoring every 500 steps
+            if step % 500 == 0 and spectral_metrics:
+                try:
+                    self._log_range_monitoring(step, spectral_metrics)
+                except Exception as e:
+                    print(f"Warning: Failed to log range monitoring: {e}")
+                
+            # Log to wandb every 50 steps (reduced frequency for speed)
+            try:
+                if step % 50 == 0 and WANDB_AVAILABLE and wandb.run:
+                    wandb_log = {k: v for k, v in step_data.items() if v is not None and k != "spectral_metrics"}
+                    wandb.log(wandb_log, step=step)
+                    
+                # Log spectral metrics to wandb every 100 steps
+                if step % 100 == 0 and spectral_metrics and WANDB_AVAILABLE and wandb.run:
+                    wandb_spectral_log = {}
+                    for key, value in spectral_metrics.items():
+                        if value is not None:
+                            wandb_spectral_log[f"spectral/{key}"] = value
+                        else:
+                            # Use -1 as sentinel value for None values in wandb
+                            wandb_spectral_log[f"spectral/{key}"] = -1.0
+                    wandb.log(wandb_spectral_log, step=step)
+            except Exception as e:
+                print(f"Warning: Failed to log to wandb: {e}")
+                
+        except Exception as e:
+            print(f"Warning: Failed to log step data: {e}")
+            # Continue training even if logging fails
 
     def _write_step_summary(self, step_data: Dict[str, Any]):
-        step = step_data["step"]
-        epoch = step_data["epoch"]
-        loss = step_data["loss"]
-        lr = step_data["learning_rate"]
-        grad_norm = step_data.get("grad_norm", None)
-        
-        # Handle None grad_norm gracefully
-        if grad_norm is not None:
-            grad_norm_str = f" | GradNorm: {grad_norm:.4f}"
-        else:
-            grad_norm_str = " | GradNorm: N/A"
+        try:
+            step = step_data["step"]
+            epoch = step_data["epoch"]
+            loss = step_data["loss"]
+            lr = step_data["learning_rate"]
+            grad_norm = step_data.get("grad_norm", None)
             
-        line = f"Step {step} | Epoch {epoch} | Loss: {loss:.4f} | LR: {lr:.2e}{grad_norm_str}"
-        
-        # Add spectral metrics if present (every 100 steps)
-        spectral_metrics = step_data.get("spectral_metrics")
-        if spectral_metrics:
-            sam_score = spectral_metrics.get("sam_score", 0.0)
-            line += f" | SAM: {sam_score:.4f}"
-            
-            # Add per-channel MSE and SSIM
-            mse_per_channel = spectral_metrics.get("mse_per_channel", [])
-            ssim_per_channel = spectral_metrics.get("ssim_per_channel", [])
-            band_names = ["B9", "B18", "B32", "B42", "B55"]
-            
-            if mse_per_channel and ssim_per_channel:
-                # Use list comprehension for faster string building
-                spectral_parts = [f"{band}:MSE={mse:.4f},SSIM={ssim:.4f}" 
-                                for mse, ssim, band in zip(mse_per_channel, ssim_per_channel, band_names)]
-                line += " | " + ";".join(spectral_parts)
+            # Handle None grad_norm gracefully
+            if grad_norm is not None:
+                grad_norm_str = f" | GradNorm: {grad_norm:.4f}"
+            else:
+                grad_norm_str = " | GradNorm: N/A"
                 
-        with open(self.log_file, 'a') as f:
-            f.write(line + "\n")
+            line = f"Step {step} | Epoch {epoch} | Loss: {loss:.4f} | LR: {lr:.2e}{grad_norm_str}"
+            
+            # Add spectral metrics if present (every 100 steps)
+            spectral_metrics = step_data.get("spectral_metrics")
+            if spectral_metrics:
+                try:
+                    sam_score = spectral_metrics.get("sam_score")
+                    if sam_score is not None:
+                        line += f" | SAM: {sam_score:.4f}"
+                    else:
+                        line += " | SAM: N/A"
+                    
+                    # Add per-channel MSE and SSIM
+                    mse_per_channel = spectral_metrics.get("mse_per_channel", [])
+                    ssim_per_channel = spectral_metrics.get("ssim_per_channel", [])
+                    band_names = ["B9", "B18", "B32", "B42", "B55"]
+                    
+                    if mse_per_channel and ssim_per_channel:
+                        # Use list comprehension for faster string building
+                        spectral_parts = [f"{band}:MSE={mse:.4f},SSIM={ssim:.4f}" 
+                                        for mse, ssim, band in zip(mse_per_channel, ssim_per_channel, band_names)]
+                        line += " | " + ";".join(spectral_parts)
+                except Exception as e:
+                    line += f" | Spectral metrics error: {str(e)[:50]}"
+                    
+            with open(self.log_file, 'a') as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print(f"Warning: Failed to write step summary: {e}")
 
     def log_epoch(self, epoch: int, avg_loss: float, avg_learning_rate: float, total_steps: int, epoch_time: float, validation_metrics: Optional[Dict] = None):
         """Log epoch-level metrics."""
-        epoch_data = {
-            "epoch": epoch,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "avg_loss": avg_loss,
-            "avg_learning_rate": avg_learning_rate,
-            "total_steps": total_steps,
-            "epoch_time": epoch_time,
-        }
-        if validation_metrics is not None:
-            epoch_data["validation_metrics"] = validation_metrics
-        self.log_data["epochs"].append(epoch_data)
-        self._write_epoch_summary(epoch_data)
-        # JSON logging removed for training speed optimization
-        if WANDB_AVAILABLE and wandb.run:
-            wandb_log = {k: v for k, v in epoch_data.items() if v is not None}
-            wandb.log(wandb_log, step=epoch)
+        try:
+            epoch_data = {
+                "epoch": epoch,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "avg_loss": avg_loss,
+                "avg_learning_rate": avg_learning_rate,
+                "total_steps": total_steps,
+                "epoch_time": epoch_time,
+            }
+            if validation_metrics is not None:
+                epoch_data["validation_metrics"] = validation_metrics
+            self.log_data["epochs"].append(epoch_data)
+            
+            try:
+                self._write_epoch_summary(epoch_data)
+            except Exception as e:
+                print(f"Warning: Failed to write epoch summary: {e}")
+                
+            # JSON logging removed for training speed optimization
+            try:
+                if WANDB_AVAILABLE and wandb.run:
+                    wandb_log = {k: v for k, v in epoch_data.items() if v is not None}
+                    wandb.log(wandb_log, step=epoch)
+            except Exception as e:
+                print(f"Warning: Failed to log epoch to wandb: {e}")
+        except Exception as e:
+            print(f"Warning: Failed to log epoch data: {e}")
 
     def _write_epoch_summary(self, epoch_data: Dict[str, Any]):
         epoch = epoch_data["epoch"]
@@ -223,33 +272,53 @@ Note: This file is overwritten for each training run to reduce clutter
 
     def log_validation(self, epoch: int, images: List[Any], prompt: str, validation_metrics: Dict[str, Any]):
         """Log validation results."""
-        validation_data = {
-            "epoch": epoch,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "prompt": prompt,
-            "num_images": len(images),
-            "validation_metrics": validation_metrics,
-        }
-        self.log_data["validations"].append(validation_data)
-        
-        # Save validation images locally (every 500 steps)
-        validation_dir = self.log_dir / "validation_images"
-        validation_dir.mkdir(exist_ok=True)
-        for i, image in enumerate(images):
-            image_path = validation_dir / f"step_{epoch:06d}_image_{i:02d}.png"
-            image.save(image_path)
+        try:
+            validation_data = {
+                "epoch": epoch,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "prompt": prompt,
+                "num_images": len(images),
+                "validation_metrics": validation_metrics,
+            }
+            self.log_data["validations"].append(validation_data)
+            
+            # Save validation images locally (every 500 steps)
+            try:
+                validation_dir = self.log_dir / "validation_images"
+                validation_dir.mkdir(exist_ok=True)
+                for i, image in enumerate(images):
+                    try:
+                        image_path = validation_dir / f"step_{epoch:06d}_image_{i:02d}.png"
+                        image.save(image_path)
+                    except Exception as e:
+                        print(f"Warning: Failed to save validation image {i}: {e}")
+            except Exception as e:
+                print(f"Warning: Failed to save validation images: {e}")
 
-        # Write validation summary
-        self._write_validation_summary(validation_data)
-        self._check_alert_thresholds(validation_data["validation_metrics"], epoch, mode="val")
-        # JSON logging removed for training speed optimization
-        # Log validation metrics to wandb (no images)
-        if WANDB_AVAILABLE and wandb.run:
-            wandb_log = {}
-            # Add validation metrics only
-            for k, v in validation_data["validation_metrics"].items():
-                wandb_log[f"val/{k}"] = v
-            wandb.log(wandb_log, step=epoch)
+            # Write validation summary
+            try:
+                self._write_validation_summary(validation_data)
+            except Exception as e:
+                print(f"Warning: Failed to write validation summary: {e}")
+                
+            try:
+                self._check_alert_thresholds(validation_data["validation_metrics"], epoch, mode="val")
+            except Exception as e:
+                print(f"Warning: Failed to check validation alert thresholds: {e}")
+                
+            # JSON logging removed for training speed optimization
+            # Log validation metrics to wandb (no images)
+            try:
+                if WANDB_AVAILABLE and wandb.run:
+                    wandb_log = {}
+                    # Add validation metrics only
+                    for k, v in validation_data["validation_metrics"].items():
+                        wandb_log[f"val/{k}"] = v
+                    wandb.log(wandb_log, step=epoch)
+            except Exception as e:
+                print(f"Warning: Failed to log validation to wandb: {e}")
+        except Exception as e:
+            print(f"Warning: Failed to log validation data: {e}")
 
     def _check_alert_thresholds(self, metrics: Dict[str, float], step_or_epoch: int, mode: str = "step"):
         """Checks key metrics for warning thresholds."""
@@ -289,38 +358,119 @@ Note: This file is overwritten for each training run to reduce clutter
 
     def log_spectral_summary(self, step: int, spectral_metrics: Dict[str, Any]):
         """Log a detailed spectral fidelity summary to a single file."""
-        if not spectral_metrics:
-            return
+        try:
+            if not spectral_metrics:
+                return
+                
+            spectral_log_file = self.log_dir / f"{self.model_name}_spectral_log.txt"
             
-        spectral_log_file = self.log_dir / f"{self.model_name}_spectral_log.txt"
-        
-        sam_score = spectral_metrics.get("sam_score", 0.0)
-        mse_per_channel = spectral_metrics.get("mse_per_channel", [])
-        ssim_per_channel = spectral_metrics.get("ssim_per_channel", [])
-        
-        band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
-                     "Band 42 (731nm)", "Band 55 (851nm)"]
-        
-        summary = f"\n{'='*60}\n"
-        summary += f"SPECTRAL FIDELITY SUMMARY - Step {step}\n"
-        summary += f"{'='*60}\n"
-        summary += f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        summary += f"SAM Score: {sam_score:.6f}\n"
-        summary += f"\nPer-Channel Metrics:\n"
-        summary += f"{'-'*40}\n"
-        
-        for i, (mse, ssim, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
-            summary += f"{band_name}:\n"
-            summary += f"  MSE: {mse:.6f}\n"
-            summary += f"  SSIM: {ssim:.6f}\n"
+            sam_score = spectral_metrics.get("sam_score")
+            mse_per_channel = spectral_metrics.get("mse_per_channel", [])
+            ssim_per_channel = spectral_metrics.get("ssim_per_channel", [])
             
-        summary += f"\nOverall Assessment:\n"
-        summary += f"  Spectral Preservation: {'Good' if sam_score > 0.8 else 'Fair' if sam_score > 0.6 else 'Poor'}\n"
-        summary += f"  Spatial Quality: {'Good' if np.mean(ssim_per_channel) > 0.8 else 'Fair' if np.mean(ssim_per_channel) > 0.6 else 'Poor'}\n"
-        summary += f"{'='*60}\n"
-        
-        with open(spectral_log_file, 'a') as f:
-            f.write(summary)
+            band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
+                         "Band 42 (731nm)", "Band 55 (851nm)"]
+            
+            summary = f"\n{'='*60}\n"
+            summary += f"SPECTRAL FIDELITY SUMMARY - Step {step}\n"
+            summary += f"{'='*60}\n"
+            summary += f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            if sam_score is not None:
+                summary += f"SAM Score: {sam_score:.6f}\n"
+            else:
+                summary += f"SAM Score: Not computable\n"
+            summary += f"\nPer-Channel Metrics:\n"
+            summary += f"{'-'*40}\n"
+            
+            for i, (mse, ssim, band_name) in enumerate(zip(mse_per_channel, ssim_per_channel, band_names)):
+                summary += f"{band_name}:\n"
+                summary += f"  MSE: {mse:.6f}\n"
+                summary += f"  SSIM: {ssim:.6f}\n"
+                
+            summary += f"\nOverall Assessment:\n"
+            if sam_score is not None:
+                summary += f"  Spectral Preservation: {'Good' if sam_score > 0.8 else 'Fair' if sam_score > 0.6 else 'Poor'}\n"
+            else:
+                summary += f"  Spectral Preservation: Not computable\n"
+            summary += f"  Spatial Quality: {'Good' if np.mean(ssim_per_channel) > 0.8 else 'Fair' if np.mean(ssim_per_channel) > 0.6 else 'Poor'}\n"
+            summary += f"{'='*60}\n"
+            
+            with open(spectral_log_file, 'a') as f:
+                f.write(summary)
+        except Exception as e:
+            print(f"Warning: Failed to write spectral summary: {e}")
+
+    def _log_range_monitoring(self, step: int, spectral_metrics: Dict[str, Any]):
+        """Log range monitoring statistics every 500 steps."""
+        try:
+            if not spectral_metrics:
+                return
+                
+            range_log_file = self.log_dir / f"{self.model_name}_range_monitoring.txt"
+            
+            # Extract range statistics if available
+            range_stats = spectral_metrics.get("range_stats", {})
+            if not range_stats:
+                return
+                
+            band_names = ["Band 9 (474nm)", "Band 18 (539nm)", "Band 32 (651nm)", 
+                         "Band 42 (731nm)", "Band 55 (851nm)"]
+            
+            summary = f"\n{'='*50}\n"
+            summary += f"RANGE MONITORING - Step {step}\n"
+            summary += f"{'='*50}\n"
+            summary += f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            summary += f"\nOut-of-Bounds Analysis ([-1, 1] range):\n"
+            summary += f"{'-'*40}\n"
+            
+            total_out_of_bounds = 0
+            total_pixels = 0
+            
+            for i, band_name in enumerate(band_names):
+                band_stats = range_stats.get(f"band_{i}", {})
+                out_of_bounds = band_stats.get("out_of_bounds", 0)
+                total_pixels_band = band_stats.get("total_pixels", 0)
+                out_of_bounds_pct = (out_of_bounds / total_pixels_band * 100) if total_pixels_band > 0 else 0
+                
+                total_out_of_bounds += out_of_bounds
+                total_pixels += total_pixels_band
+                
+                summary += f"{band_name}:\n"
+                summary += f"  Out-of-bounds pixels: {out_of_bounds:,} ({out_of_bounds_pct:.2f}%)\n"
+                summary += f"  Min value: {band_stats.get('min_val', 'N/A'):.4f}\n"
+                summary += f"  Max value: {band_stats.get('max_val', 'N/A'):.4f}\n"
+                summary += f"  Mean: {band_stats.get('mean_val', 'N/A'):.4f}\n"
+                summary += f"  Std: {band_stats.get('std_val', 'N/A'):.4f}\n"
+                
+            # Overall statistics
+            overall_out_of_bounds_pct = (total_out_of_bounds / total_pixels * 100) if total_pixels > 0 else 0
+            summary += f"\nOverall Statistics:\n"
+            summary += f"  Total out-of-bounds pixels: {total_out_of_bounds:,} ({overall_out_of_bounds_pct:.2f}%)\n"
+            summary += f"  Total pixels analyzed: {total_pixels:,}\n"
+            
+            # VAE behavior analysis (known to produce out-of-bounds values)
+            if overall_out_of_bounds_pct > 10.0:
+                summary += f"  CRITICAL: Very high out-of-bounds rate - VAE may be unstable\n"
+            elif overall_out_of_bounds_pct > 5.0:
+                summary += f"  HIGH: Significant out-of-bounds rate - Monitor for divergence\n"
+            elif overall_out_of_bounds_pct > 2.0:
+                summary += f"  MODERATE: Expected out-of-bounds rate - VAE behavior normal\n"
+            else:
+                summary += f"  LOW: Minimal out-of-bounds rate - VAE performing well\n"
+                
+            # Trend analysis recommendation
+            summary += f"  📊 Monitor trend: Check if rate increases over time\n"
+                
+            summary += f"{'='*50}\n"
+            
+            with open(range_log_file, 'a') as f:
+                f.write(summary)
+                
+            # Also log to console for immediate visibility
+            print(f"Range monitoring at step {step}: {overall_out_of_bounds_pct:.2f}% out-of-bounds pixels")
+            
+        except Exception as e:
+            print(f"Warning: Failed to write range monitoring: {e}")
 
 
 def create_dreambooth_logger(output_dir: str, model_name: str = "dreambooth_multispectral") -> DreamBoothLogger:
@@ -454,28 +604,3 @@ def log_to_wandb_dreambooth(step: int,
             
     except Exception as e:
         print(f"Warning: Failed to log to wandb: {e}")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
- 

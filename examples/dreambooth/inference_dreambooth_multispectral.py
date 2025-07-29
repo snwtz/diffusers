@@ -24,6 +24,9 @@ import argparse
 import os
 import torch
 from diffusers import StableDiffusion3Pipeline
+from diffusers.models import SD3Transformer2DModel
+from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+from transformers import CLIPTextModel, T5EncoderModel
 # Add import for custom VAE
 import sys
 import os
@@ -62,6 +65,34 @@ def create_pseudo_rgb(bands):
     rgb = np.clip(rgb, 0, 1)
     return rgb
 
+def create_pseudo_rgb_training_style(bands):
+    """
+    Create pseudo-RGB visualization from 5-channel multispectral data (training validation style).
+    
+    Maps specific spectral bands to RGB channels for human visualization:
+    - Red channel: Band 2 (650.665nm - Red) 
+    - Green channel: Band 1 (538.71nm - Green)
+    - Blue channel: Band 0 (474.73nm - Blue)
+    
+    Args:
+        bands: numpy array of shape (5, H, W) in [-1, 1] range
+        
+    Returns:
+        numpy array of shape (3, H, W) in [0, 1] range
+    """
+    # Normalize from [-1, 1] to [0, 1] for RGB visualization
+    bands_norm = (bands + 1) / 2
+    
+    # Create RGB channels using specific band mappings (same as training validation)
+    r = bands_norm[2]  # Red channel (650.665nm)
+    g = bands_norm[1]  # Green channel (538.71nm) 
+    b = bands_norm[0]  # Blue channel (474.73nm)
+    
+    # Stack channels and ensure proper range
+    rgb = np.stack([r, g, b], axis=0)
+    rgb = np.clip(rgb, 0, 1)
+    return rgb
+
 def plot_individual_bands(bands, output_dir, image_idx):
     """
     Create individual plots for each of the 5 spectral bands.
@@ -89,17 +120,8 @@ def plot_individual_bands(bands, output_dir, image_idx):
         # Normalize from [-1, 1] to [0, 1] for visualization
         band_norm = (bands[i] + 1) / 2
         
-        # Display with appropriate colormap
-        if i == 0:  # Blue band
-            axes[i].imshow(band_norm, cmap='Blues', vmin=0, vmax=1)
-        elif i == 1:  # Green band
-            axes[i].imshow(band_norm, cmap='Greens', vmin=0, vmax=1)
-        elif i == 2:  # Red band
-            axes[i].imshow(band_norm, cmap='Reds', vmin=0, vmax=1)
-        elif i == 3:  # Red-edge band
-            axes[i].imshow(band_norm, cmap='RdYlBu_r', vmin=0, vmax=1)
-        else:  # NIR band
-            axes[i].imshow(band_norm, cmap='viridis', vmin=0, vmax=1)
+        # Display with greyscale colormap for all bands
+        axes[i].imshow(band_norm, cmap='gray', vmin=0, vmax=1)
         
         axes[i].set_title(band_info[i], fontsize=10)
         axes[i].axis('off')
@@ -110,6 +132,85 @@ def plot_individual_bands(bands, output_dir, image_idx):
     plt.close(fig)
     
     print(f"Saved individual band plots: individual_bands_{image_idx+1}.png")
+
+def load_model_components(model_path, vae_path=None, device="cuda", dtype=torch.float16, base_model_path="stabilityai/stable-diffusion-3-medium-diffusers"):
+    """
+    Load individual model components from the trained model directory.
+    
+    Args:
+        model_path: Path to the trained model directory
+        vae_path: Path to the multispectral VAE (optional)
+        device: Device to load models on
+        dtype: Data type for models
+        base_model_path: Path to base model for text encoders and tokenizers
+    
+    Returns:
+        tuple: (transformer, vae, text_encoder, text_encoder_2, text_encoder_3, tokenizer, tokenizer_2, tokenizer_3, scheduler)
+    """
+    print(f"Loading model components from: {model_path}")
+    
+    # Load transformer
+    transformer_path = os.path.join(model_path, "transformer")
+    if os.path.exists(transformer_path):
+        print(f"Loading transformer from: {transformer_path}")
+        transformer = SD3Transformer2DModel.from_pretrained(
+            transformer_path,
+            torch_dtype=dtype,
+            use_safetensors=True
+        ).to(device)
+    else:
+        raise ValueError(f"Transformer not found at {transformer_path}")
+    
+    # Load VAE
+    if vae_path is not None:
+        print(f"Loading custom multispectral VAE from: {vae_path}")
+        vae = AutoencoderKLMultispectralAdapter.from_pretrained(vae_path).float()
+        vae = vae.to(device, dtype=torch.float32)
+        print("MS adapter loaded")
+        if hasattr(vae, 'input_adapter'):
+            print(f"   - Input adapter: {vae.input_adapter.in_channels} → {vae.input_adapter.out_channels} channels")
+        if hasattr(vae, 'output_adapter'):
+            print(f"   - Output adapter: {vae.output_adapter.in_channels} → {vae.output_adapter.out_channels} channels")
+    else:
+        # Load default VAE from model path
+        vae_path = os.path.join(model_path, "vae")
+        if os.path.exists(vae_path):
+            print(f"Loading VAE from: {vae_path}")
+            vae = AutoencoderKLMultispectralAdapter.from_pretrained(vae_path).to(device, dtype=torch.float32)
+        else:
+            raise ValueError(f"VAE not found at {vae_path}")
+    
+    # Load text encoders and tokenizers from base model (they're typically not saved in DreamBooth)
+    print(f"Loading text encoders and tokenizers from base model: {base_model_path}")
+    
+    # Load text encoders
+    from transformers import CLIPTextModelWithProjection, T5EncoderModel
+    text_encoder = CLIPTextModelWithProjection.from_pretrained(
+        base_model_path, subfolder="text_encoder", torch_dtype=dtype
+    ).to(device)
+    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+        base_model_path, subfolder="text_encoder_2", torch_dtype=dtype
+    ).to(device)
+    text_encoder_3 = T5EncoderModel.from_pretrained(
+        base_model_path, subfolder="text_encoder_3", torch_dtype=dtype
+    ).to(device)
+    
+    # Load tokenizers
+    from transformers import CLIPTokenizer, T5TokenizerFast
+    tokenizer = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer")
+    tokenizer_2 = CLIPTokenizer.from_pretrained(base_model_path, subfolder="tokenizer_2")
+    tokenizer_3 = T5TokenizerFast.from_pretrained(base_model_path, subfolder="tokenizer_3")
+    
+    # Load scheduler
+    scheduler_path = os.path.join(model_path, "scheduler")
+    if os.path.exists(scheduler_path):
+        print(f"Loading scheduler from: {scheduler_path}")
+        scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(scheduler_path)
+    else:
+        print("Scheduler not found, using default FlowMatchEulerDiscreteScheduler")
+        scheduler = FlowMatchEulerDiscreteScheduler()
+    
+    return transformer, vae, text_encoder, text_encoder_2, text_encoder_3, tokenizer, tokenizer_2, tokenizer_3, scheduler
 
 def main():
     parser = argparse.ArgumentParser(description="Inference for DreamBooth Multispectral Model")
@@ -201,34 +302,34 @@ def main():
     print(f"Loading model from: {model_path}")
     print(f"Output directory: {output_dir}")
     
-    # Load MS VAE if provided
-    vae = None
-    if args.vae is not None:
-        print(f"Loading custom multispectral VAE from: {args.vae}")
-        # Always load VAE in float32 for stability
-        vae = AutoencoderKLMultispectralAdapter.from_pretrained(args.vae).float()
-        vae = vae.to("cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float32)
-
-        # Log successful adapter loading
-        print("MS adapter loaded")
-        if hasattr(vae, 'input_adapter'):
-            print(f"   - Input adapter: {vae.input_adapter.in_channels} → {vae.input_adapter.out_channels} channels")
-        if hasattr(vae, 'output_adapter'):
-            print(f"   - Output adapter: {vae.output_adapter.in_channels} → {vae.output_adapter.out_channels} channels")
-
-    # Set pipeline dtype: float16 for speed (except VAE)
+    # Set device and dtype
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     pipeline_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    
+    # Load model components
+    try:
+        transformer, vae, text_encoder, text_encoder_2, text_encoder_3, tokenizer, tokenizer_2, tokenizer_3, scheduler = load_model_components(
+            model_path, args.vae, device, pipeline_dtype
+        )
+    except Exception as e:
+        print(f"Error loading model components: {e}")
+        return
 
-    # Load pipeline, injecting VAE if provided
-    pipeline = StableDiffusion3Pipeline.from_pretrained(
-        model_path,
-        vae=vae if vae is not None else None,
-        torch_dtype=pipeline_dtype,
-        use_safetensors=True
+    # Create pipeline manually
+    pipeline = StableDiffusion3Pipeline(
+        transformer=transformer,
+        vae=vae,
+        text_encoder=text_encoder,
+        text_encoder_2=text_encoder_2,
+        text_encoder_3=text_encoder_3,
+        tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
+        tokenizer_3=tokenizer_3,
+        scheduler=scheduler,
     )
 
     # Patch the pipeline's image processor to handle multispectral output
-    if vae is not None:
+    if hasattr(vae, 'input_adapter'):  # Check if it's multispectral VAE
         original_postprocess = pipeline.image_processor.postprocess
         def patched_postprocess(image, output_type="pil", **kwargs):
             # Convert 5-channel multispectral to RGB for display
@@ -239,7 +340,7 @@ def main():
                     pipeline._multispectral_outputs = []
                 pipeline._multispectral_outputs.append(image.clone())
                 
-                # Convert to pseudo-RGB using proper spectral mapping
+                # Convert to pseudo-RGB using training validation style mapping
                 batch_size = image.shape[0]
                 rgb_images = []
                 for i in range(batch_size):
@@ -247,8 +348,8 @@ def main():
                     bands = image[i]  # Shape: (5, H, W)
                     # Move to CPU and convert to numpy for pseudo-RGB creation
                     bands_cpu = bands.cpu().numpy()
-                    # Create pseudo-RGB: (3, H, W)
-                    rgb = create_pseudo_rgb(bands_cpu)
+                    # Create pseudo-RGB: (3, H, W) - using training validation style
+                    rgb = create_pseudo_rgb_training_style(bands_cpu)
                     rgb_images.append(torch.from_numpy(rgb).to(image.device))
                 
                 # Stack back to batch: (B, 3, H, W)
@@ -258,8 +359,7 @@ def main():
                 return original_postprocess(image, output_type=output_type, **kwargs)
         pipeline.image_processor.postprocess = patched_postprocess
 
-    # Move pipeline to device (float16 if possible)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Move pipeline to device
     pipeline = pipeline.to(device)
 
     # Set pipeline components to eval mode for inference
@@ -331,7 +431,6 @@ def main():
         filename = f"pipeline_rgb_output_{i+1}.png"
         filepath = os.path.join(output_dir, filename)
         image.save(filepath)
-        print(f"Saved pipeline RGB output: {filepath}")
     
     # Save multispectral images if available
     if hasattr(pipeline, '_multispectral_outputs') and pipeline._multispectral_outputs:
@@ -340,33 +439,12 @@ def main():
             # Convert to numpy: Shape: (1, 5, H, W)
             ms_numpy = ms_image.cpu().numpy()[0]  # Remove batch dimension: (5, H, W)
             
-            # # Save as TIFF file
-            # ms_filename = f"multispectral_{i+1}.tiff"
-            # ms_filepath = os.path.join(args.output_dir, ms_filename)
-            # 
-            # # Save as TIFF with proper metadata
-            # with rasterio.open(
-            #     ms_filepath,
-            #     'w',
-            #     driver='GTiff',
-            #     height=ms_numpy.shape[1],
-            #     width=ms_numpy.shape[2],
-            #     count=5,
-            #     dtype=ms_numpy.dtype,
-            #     crs=None,  # No georeference for now
-            #     transform=Affine.identity(),
-            # ) as dst:
-            #     for band_idx in range(5):
-            #         dst.write(ms_numpy[band_idx], band_idx + 1)
-            # 
-            # print(f"Saved multispectral TIFF: {ms_filepath} (shape: {ms_numpy.shape})")
-            
             # Create individual band plots
             plot_individual_bands(ms_numpy, output_dir, i)
             
-            # Also save pseudo-RGB visualization (our custom spectral mapping)
-            rgb = create_pseudo_rgb(ms_numpy)  # Shape: (3, H, W)
-            rgb_filename = f"custom_pseudo_rgb_{i+1}.png"
+            # Also save pseudo-RGB visualization (training validation style)
+            rgb = create_pseudo_rgb_training_style(ms_numpy)  # Shape: (3, H, W)
+            rgb_filename = f"training_style_pseudo_rgb_{i+1}.png"
             rgb_filepath = os.path.join(output_dir, rgb_filename)
             
             # Save pseudo-RGB as PNG
@@ -376,12 +454,12 @@ def main():
             rgb_image = Image.fromarray(rgb_display)
             rgb_image.save(rgb_filepath)
             
-            print(f"Saved custom pseudo-RGB: {rgb_filepath} (shape: {rgb.shape})")
+            print(f"Saved training-style pseudo-RGB: {rgb_filepath} (shape: {rgb.shape})")
     
     print(f"Generated {len(images)} images in {output_dir}")
     print("\nFile descriptions:")
-    print("- pipeline_rgb_output_*.png: Pipeline's default RGB output (pseudo-RGB conversion)")
-    print("- custom_pseudo_rgb_*.png: Our custom spectral mapping (B1→B, B2→G, B3→R, B4→R+, B5→G+)")
+    print("- pipeline_rgb_output_*.png: Pipeline's default RGB output (training-style pseudo-RGB conversion)")
+    print("- training_style_pseudo_rgb_*.png: Training validation style mapping (B0→B, B1→G, B2→R)")
     print("- individual_bands_*.png: Individual plots of each of the 5 spectral bands")
 
 if __name__ == "__main__":
