@@ -1,16 +1,35 @@
 """
-NOTE: replace NaNs with per-band mean before masking
-
 Multispectral Image Dataloader for VAE Training
+===============================================
 
 This module implements a specialized dataloader for multispectral TIFF images,
-optimized for training a VAE on hyperspectral plant data. It extends the base
+optimized for training a VAE on multispectral plant data. It extends the base
 multispectral dataloader to support train/val splits via file lists.
+
+USAGE:
+------
+# Create dataloaders for training
+train_loader, val_loader = create_vae_dataloaders(
+    train_list_path="path/to/train_files.txt",
+    val_list_path="path/to/val_files.txt",
+    batch_size=8,
+    resolution=512,
+    num_workers=4,
+    use_cache=True,
+    return_mask=True
+)
+
+CONFIGURATION:
+--------------
+- Input: Hyperspectral TIFF files with at least 55 bands
+- Output: 5-channel tensors (bands 9, 18, 32, 42, 55) normalized to [-1, 1]
+- Background: NaN values represent background regions, excluded from training
+- Mask: Binary mask (1=leaf, 0=background) for loss computation
 
 Key Features:
 - Support for train/val splits via file lists
 - Optimized for VAE training
-- Memory-efficient loading
+- Memory-efficient loading with optional caching
 - Spectral fidelity preservation
 - Robust validation
 - Background masking using NaN values
@@ -22,7 +41,6 @@ Implementation Notes:
    - NaN values in TIFF files represent background (cut-out regions)
    - These regions are masked out during training
    - Model focuses on leaf features
-   - No background inpainting or interpolation
 
    The loss function:
     • Applies full loss (100%) on leaf regions (mask == 1).
@@ -84,11 +102,6 @@ class VAEMultispectralDataset(Dataset):
        - Only normalizes valid (non-NaN) regions
        - Preserves spectral relationships
        - Required for VAE training stability
-
-    4. Memory Management:
-       - Optional caching for repeated access
-       - Efficient worker process utilization
-       - GPU memory considerations
     5. Reproducibility:
        - File list is expected to be pre-generated and deterministic for scientific reproducibility
     """

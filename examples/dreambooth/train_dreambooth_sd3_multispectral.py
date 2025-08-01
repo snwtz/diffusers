@@ -143,6 +143,17 @@ Logging and Evaluation:
    - Spectral visualization tools
    - Loss term tracking
 
+LOGGING AND MONITORING:
+-----------------------
+
+- Training loss and learning rate
+- Gradient norm and training stability
+- Per-band MSE and SSIM (5 spectral bands)
+- Global SAM scores
+- VAE reconstruction quality
+- Output range statistics
+
+
 Open Research Questions:
 ----------------------
 1. Text Encoder Adaptation:

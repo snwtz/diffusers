@@ -1,14 +1,55 @@
 """
 Multispectral VAE Adapter for Stable Diffusion 3: Core Methodological Contribution
-
-https://huggingface.co/docs/diffusers/v0.6.0/en/api/models
-https://huggingface.co/docs/diffusers/en/api/models/autoencoderkl
-
+================================================================================
 
 This module implements the central methodological contribution of the thesis: a lightweight
 adapter-based multispectral autoencoder architecture built on a pretrained SD3 backbone.
 The design enables efficient processing of 5-channel spectral plant imagery while maintaining
 compatibility with SD3's latent space requirements.
+
+USAGE:
+------
+# Initialize with pretrained SD3 VAE
+vae = AutoencoderKLMultispectralAdapter.from_pretrained(
+    "stabilityai/stable-diffusion-3-medium-diffusers",
+    adapter_placement="both",  # or "input" or "output"
+    use_spectral_attention=True,
+    use_sam_loss=True
+)
+
+# Freeze backbone (only adapters will be trained)
+vae.freeze_backbone()
+
+# Train only adapter layers
+optimizer = torch.optim.AdamW(vae.get_trainable_params(), lr=1e-4)
+
+# Forward pass with masking
+reconstruction, losses = vae.forward(sample=batch, mask=mask)
+
+CONFIGURATION:
+--------------
+- Input: 5-channel multispectral images (bands 9, 18, 32, 42, 55)
+- Output: Reconstructed 5-channel images with spectral fidelity
+- Adapters: Lightweight layers bridging 5→3→5 channels
+- Backbone: Frozen SD3 VAE for parameter efficiency
+- Loss: Multi-objective (MSE + SAM) with masked computation
+
+Key Features:
+- Spectral attention mechanism for band importance
+- Parameter-efficient fine-tuning (frozen backbone)
+- Masked loss computation for leaf-focused training
+- SD3 pipeline compatibility
+- Scale convergence monitoring
+- Reference signature guidance
+
+LOGGING AND MONITORING:
+-----------------------
+- Scale convergence monitoring (global scale parameter)
+- Per-band importance weights (spectral attention)
+- Masked loss statistics (coverage, valid pixels)
+- Per-channel MSE and global SAM loss
+- Numerical stability (NaN/Inf detection)
+- Parameter count
 
 Data Flow Summary:
 ------------------
@@ -456,7 +497,6 @@ class SpectralAdapter(nn.Module):
 
         # Log adapter input stats for NaN debugging
         logger.debug(f"[NaN DEBUG] SpectralAdapter input stats - min: {x.min().item():.6f}, max: {x.max().item():.6f}, mean: {x.mean().item():.6f}")
-
         # Apply spectral attention: learns per-band importance weights and scales input accordingly
         # Weights are computed via 1x1 conv + sigmoid, then applied via element-wise multiplication
         if self.use_attention and hasattr(self, 'attention'):
@@ -670,9 +710,10 @@ def safe_normalize(tensor, dim=1, eps=1e-8):
     # Numerically stable normalization for SAM loss
     # Ensures that spectral angle calculations are robust to small values and avoid NaNs.
     norm = torch.norm(tensor, p=2, dim=dim, keepdim=True)
-    norm = norm.clamp(min=eps)
+    norm = norm.clamp(min=eps) # CLAMP
     return tensor / norm
 
+# Custom SAM loss function for spectral signature preservation
 def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> torch.Tensor:
     """
     Numerically stable Spectral Angle Mapper (SAM) loss between two multispectral images.
@@ -683,8 +724,8 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
     Returns:
         Mean spectral angle in radians
     
-    - SAM loss is critical for preserving spectral signatures, which is a key scientific goal in plant imaging.
-    - Invariant to scaling, so it focuses on spectral shape rather than intensity.
+    - SAM loss is for preserving spectral signatures
+    - Invariant to scaling, so it focuses on spectral shape rather than intensity
     """
     # Use safe normalization to avoid NaNs
     normalized_original = safe_normalize(original, dim=1)
@@ -692,7 +733,7 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
 
     # Compute cosine similarity and clamp for stability
     cos_sim = F.cosine_similarity(normalized_original, normalized_reconstructed, dim=1)
-    cos_sim = cos_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    cos_sim = cos_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7) # CLAMP
 
     angle = torch.acos(cos_sim)
     angle = torch.nan_to_num(angle, nan=0.0, posinf=0.0, neginf=0.0)

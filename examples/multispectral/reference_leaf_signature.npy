@@ -1,2 +1,0 @@
-# This is a binary file, but for the assistant, the content is:
-# np.save('examples/multispectral/reference_leaf_signature.npy', np.array([0.055, 0.12, 0.05, 0.31, 0.325], dtype=np.float32)) 

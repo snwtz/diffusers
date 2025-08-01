@@ -23,7 +23,7 @@ from .import_utils import is_accelerate_available
 if is_accelerate_available():
     import accelerate
 
-
+# for profiling and debugging
 def apply_forward_hook(method):
     """
     Decorator that applies a registered CpuOffload hook to an arbitrary function rather than `forward`. This is useful

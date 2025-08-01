@@ -1,15 +1,49 @@
 """
-Training script for Multispectral VAE Adapter
+Training Script for Multispectral VAE Adapter
+============================================
 
-This script implements the training pipeline for the thesis's core methodological contribution:
+This script implements the training pipeline for the thesis's methodological contribution:
 a lightweight adapter-based multispectral VAE architecture. It serves as the pretraining step
 for integrating a custom VAE into the Stable Diffusion 3 + DreamBooth pipeline for generating
 synthetic multispectral plant imagery.
 
-IMPORTANT: This script is configured to use 16 latent channels (matching AutoencoderKL/HF/SD3(??) default),
-which provides more capacity to encode multispectral information compared to the standard 4 channels.
-This is beneficial for multispectral data as it allows the model to preserve more spectral detail
-while maintaining compatibility with the SD3 transformer architecture.
+USAGE:
+------
+# Basic training command
+python train_multispectral_vae_5ch.py \
+    --train_file_list "path/to/train_files.txt" \
+    --val_file_list "path/to/val_files.txt" \
+    --output_dir "path/to/output" \
+    --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers" \
+    --num_epochs 100 \
+    --batch_size 8 \
+    --learning_rate 1e-4 \
+    --adapter_placement both \
+    --use_spectral_attention \
+    --use_sam_loss \
+    --sam_weight 0.1 \
+    --use_saturation_penalty
+
+# With additional options
+python train_multispectral_vae_5ch.py \
+    --train_file_list "path/to/train_files.txt" \
+    --val_file_list "path/to/val_files.txt" \
+    --output_dir "path/to/output" \
+    --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers" \
+    --num_epochs 100 \
+    --batch_size 8 \
+    --learning_rate 1e-4 \
+    --adapter_placement both \
+    --use_spectral_attention \
+    --use_sam_loss \
+    --sam_weight 0.1 \
+    --use_saturation_penalty \
+    --use_range_penalty \
+    --spectral_signature_weight 0.1 \
+    --warmup_ratio 0.1 \
+    --early_stopping_patience 10 \
+    --max_grad_norm 1.0
+
 
 Data Flow Summary:
 ------------------
@@ -18,6 +52,18 @@ Data Flow Summary:
 - Output: Reconstructed 5-channel image, with losses computed for both spatial and spectral fidelity
 - Loss: Multi-objective (MSE + SAM), with mask-aware background handling
 - Logging: Per-epoch metrics, band importance, and SSIM for scientific analysis
+
+LOGGING AND MONITORING:
+-----------------------
+
+- Training/validation loss (total, per-channel MSE, global SAM)
+- Learning rate and gradient norm
+- Per-band MSE and SSIM (5 spectral bands)
+- Spectral signature comparison with reference
+- Scale convergence monitoring
+- Output range statistics
+- Model health (memory usage, NaN detection)
+- Band importance weights (spectral attention)
 
 Training Strategy:
 The model should naturally learn to produce outputs in the [-1, 1] range because:
@@ -28,9 +74,9 @@ The model will learn to match the input distribution
 However:
 - The nonlinear processes (spectral attention, SiLU) contain important spectral information
 - spectral relationships learned by the attention mechanism need to be preserved (no hard clamping or tanh activation to force data range [-1/1])
-- 
+-
 
-Thesis Context and Training Workflow:
+Training Workflow:
 ----------------------------------
 1. Research Pipeline:
    - Pretraining: This script trains the multispectral VAE adapter
@@ -116,26 +162,6 @@ Development and Testing Strategy:
    - Learning rate selection
    - Loss weight tuning
    - Early stopping patience
-
-Scientific Contributions:
-----------------------
-1. Training Methodology:
-   - Parameter-efficient fine-tuning
-   - Spectral-aware optimization
-   - Band importance analysis
-   - Spectral fidelity preservation
-
-2. Validation Framework:
-   - Spectral quality metrics
-   - Band correlation analysis
-   - Reconstruction evaluation
-   - Scientific visualization
-
-3. Integration Strategy:
-   - SD3 compatibility
-   - DreamBooth workflow
-   - Spectral concept learning
-   - Plant health analysis
 
 Usage:
     # First, split the dataset:
@@ -894,19 +920,14 @@ def train(args: argparse.Namespace) -> None:
     model = model.to(device)
     logger.info(f"Model moved to device: {device}")
 
-    # Load reference signature (default to provided values if not given)
-    if args.reference_signature_path is not None:
-        reference_signature = np.load(args.reference_signature_path)
-        reference_signature = torch.tensor(reference_signature, dtype=torch.float32)
-    else:
-        # Default: mean of provided ranges
-        reference_signature = torch.tensor([
-            0.055,  # Band 0 (474.73 nm): mean of 0.045–0.065
-            0.12,   # Band 1 (538.71 nm): mean of 0.10–0.14
-            0.05,   # Band 2 (650.665 nm): mean of 0.04–0.06
-            0.31,   # Band 3 (730.635 nm): mean of 0.26–0.36
-            0.325   # Band 4 (850.59 nm): mean of 0.26–0.39
-        ], dtype=torch.float32)
+    # Load reference signature (hardcoded for 5-channel data)
+    reference_signature = torch.tensor([
+        0.055,  # Band 0 (474.73 nm): mean of 0.045–0.065
+        0.12,   # Band 1 (538.71 nm): mean of 0.10–0.14
+        0.05,   # Band 2 (650.665 nm): mean of 0.04–0.06
+        0.31,   # Band 3 (730.635 nm): mean of 0.26–0.36
+        0.325   # Band 4 (850.59 nm): mean of 0.26–0.39
+    ], dtype=torch.float32)
     reference_signature = reference_signature.to(device)
 
     # Log parameter counts before training
@@ -997,27 +1018,26 @@ def train(args: argparse.Namespace) -> None:
                         band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
                         batch[:, band_idx][nan_mask] = band_mean
             batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
-            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range, CLAMP
+            batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range, CLAMP (no influence on training learning here yet)
 
             # Forward pass with mask support for leaf-focused training
             try:
-                # Use the model's forward method which now supports mask parameter
+                                # Use the model's forward method which now supports mask parameter
                 # This automatically handles encoding, decoding, and masked loss computation
                 reconstruction, losses = model.forward(sample=batch, mask=mask)
                 # Add spectral signature loss
-                if reference_signature is not None:
-                    # Compute mean spectrum over leaf pixels
-                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                    recon_mean_spectrum = recon_sum / mask_sum
-                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                    losses['spectral_signature_loss'] = spectral_signature_loss
-                    losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
-                    # Log mean spectrum for monitoring
-                    if step % log_interval == 0:
-                        logger.info(f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
-                        logger.info(f"Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
-                        logger.info(f"Spectral signature loss: {spectral_signature_loss.item():.6f}")
+                # Compute mean spectrum over leaf pixels
+                mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
+                recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
+                recon_mean_spectrum = recon_sum / mask_sum
+                spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
+                losses['spectral_signature_loss'] = spectral_signature_loss
+                losses['total_loss'] = losses['total_loss'] + args.spectral_signature_weight * spectral_signature_loss
+                # Log mean spectrum for monitoring
+                if step % log_interval == 0:
+                    logger.info(f"Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
+                    logger.info(f"Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
+                    logger.info(f"Spectral signature loss: {spectral_signature_loss.item():.6f}")
             except Exception as e:
                 logger.error(f"Forward pass failed: {e}")
                 continue
@@ -1172,7 +1192,7 @@ def train(args: argparse.Namespace) -> None:
                             band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
                             batch[:, band_idx][nan_mask] = band_mean
                 batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)  # Handle any remaining Infs
-                batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range, CLAMP
+                batch = torch.clamp(batch, min=-1.0, max=1.0)  # VAE expects [-1, 1] range, CLAMP (no influence on validation learning here)
 
                 # Forward pass with mask support for validation
                 # MSE FIX: Temporarily set model to training mode to get losses
@@ -1193,17 +1213,16 @@ def train(args: argparse.Namespace) -> None:
                     reconstruction = reconstruction.sample
 
                 # Spectral signature loss and mean spectrum
-                if reference_signature is not None:
-                    mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
-                    recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
-                    recon_mean_spectrum = recon_sum / mask_sum
-                    recon_mean_spectra.append(recon_mean_spectrum.detach().cpu().numpy())
-                    spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
-                    losses['spectral_signature_loss'] = spectral_signature_loss
-                    losses['total_loss'] = losses.get('total_loss', 0) + args.spectral_signature_weight * spectral_signature_loss
-                    logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
-                    logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
-                    logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
+                mask_sum = mask.sum(dim=(0,2,3)) + 1e-8
+                recon_sum = (reconstruction * mask).sum(dim=(0,2,3))
+                recon_mean_spectrum = recon_sum / mask_sum
+                recon_mean_spectra.append(recon_mean_spectrum.detach().cpu().numpy())
+                spectral_signature_loss = torch.nn.functional.mse_loss(recon_mean_spectrum, reference_signature)
+                losses['spectral_signature_loss'] = spectral_signature_loss
+                losses['total_loss'] = losses.get('total_loss', 0) + args.spectral_signature_weight * spectral_signature_loss
+                logger.info(f"[VAL] Reconstructed mean spectrum: {[f'{v:.4f}' for v in recon_mean_spectrum.detach().cpu().numpy()]}")
+                logger.info(f"[VAL] Reference mean spectrum: {[f'{v:.4f}' for v in reference_signature.detach().cpu().numpy()]}")
+                logger.info(f"[VAL] Spectral signature loss: {spectral_signature_loss.item():.6f}")
 
                 # Accumulate losses
                 val_losses['total_loss'] += losses.get('total_loss', 0).item() if 'total_loss' in losses else 0
@@ -1458,8 +1477,6 @@ def main():
                         help="Threshold for range penalty (default: 1.0, enforces [-1] output range)")
     parser.add_argument("--spectral_signature_weight", type=float, default=0.1,
     help="Weight for spectral signature guidance loss")
-    parser.add_argument("--reference_signature_path", type=str, default=None,
-    help="Path to .npy file containing reference spectral signature (5-element array)")
 
     args = parser.parse_args()
 
