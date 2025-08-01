@@ -21,390 +21,267 @@ Features:
 - Leaf-focused evaluation using background masks
 - Statistical analysis of SAM differences
 - Implementation difference analysis and error reporting
-
 """
 
-import os
-import argparse
 import torch
 import numpy as np
-from pathlib import Path
-from tqdm import tqdm
-import json
-import logging
-from torchmetrics.image import SpectralAngleMapper
+import matplotlib.pyplot as plt
+import os
 
+from pytorch_msssim import ssim as torch_ssim
 
-from diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter
-from vae_multispectral_dataloader import create_vae_dataloaders
-from torch.utils.data import DataLoader
-
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def load_model(model_dir: str, device: torch.device):
+def custom_sam(original, reconstructed, eps=1e-8):
     """
-    Load the trained multispectral VAE model.
-    
-    Args:
-        model_dir: Path to the saved model directory
-        device: Device to load the model on
-        
-    Returns:
-        Loaded model in evaluation mode
+    Custom SAM implementation from eval_multispectral_vae.py
     """
-    logger.info(f"Loading model from: {model_dir}")
-    
-    try:
-        model = AutoencoderKLMultispectralAdapter.from_pretrained(
-            model_dir,
-            adapter_in_channels=5,
-            adapter_out_channels=5,
-            backbone_in_channels=3,
-            backbone_out_channels=3,
-            adapter_placement="both",
-            use_spectral_attention=True,
-            use_sam_loss=True,
-            use_saturation_penalty=True,
-            ignore_mismatched_sizes=True,
-            low_cpu_mem_usage=False,
-        )
-        model = model.to(device)
-        model.eval()
-        logger.info("Model loaded successfully")
-        return model
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}")
-        raise
+    # Ensure inputs are numpy arrays
+    if torch.is_tensor(original):
+        original = original.cpu().numpy()
+    if torch.is_tensor(reconstructed):
+        reconstructed = reconstructed.cpu().numpy()
 
-def evaluate_sam_metrics(model, dataloader, device, num_samples=None):
-    """
-    Evaluate SAM metrics using torchmetrics implementation.
-    
-    Args:
-        model: Trained VAE model
-        dataloader: DataLoader for evaluation data
-        device: Device for computation
-        num_samples: Maximum number of samples to evaluate (None = all)
-        
-    Returns:
-        Dictionary containing SAM evaluation results
-    """
-    if not TORCHMETRICS_AVAILABLE:
-        raise ImportError("torchmetrics is required but not available")
-    
-    # Initialize torchmetrics SAM
-    sam_metric = SpectralAngleMapper().to(device)
-    
-    # Storage for per-sample results
-    sam_scores = []
-    per_band_sam_scores = []  # For comparison with your per-band implementation
-    
-    logger.info("Starting SAM evaluation with torchmetrics...")
-    
-    with torch.no_grad():
-        for batch_idx, (batch, mask) in enumerate(tqdm(dataloader, desc="Evaluating SAM")):
-            if num_samples and batch_idx * dataloader.batch_size >= num_samples:
-                break
-                
-            batch = batch.to(device)
-            mask = mask.to(device)
-            
-            # Sanitize input (same as in training)
-            if torch.isnan(batch).any():
-                for band_idx in range(batch.shape[1]):
-                    band = batch[:, band_idx]
-                    nan_mask = torch.isnan(band)
-                    if nan_mask.any():
-                        band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
-                        batch[:, band_idx][nan_mask] = band_mean
-            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
-            batch = torch.clamp(batch, min=-1.0, max=1.0)
-            
-            # Forward pass
-            try:
-                # Use the model's decode method directly for evaluation
-                encoded = model.encode(batch)
-                if hasattr(encoded, 'latent_dist'):
-                    latent = encoded.latent_dist.mode()  # Use mode for deterministic evaluation
-                else:
-                    latent = encoded
-                
-                reconstruction = model.decode(latent, return_dict=False)
-                if isinstance(reconstruction, tuple):
-                    reconstruction = reconstruction[0]
-                elif hasattr(reconstruction, 'sample'):
-                    reconstruction = reconstruction.sample
-                    
-            except Exception as e:
-                logger.warning(f"Forward pass failed for batch {batch_idx}: {e}")
-                continue
-            
-            # Compute overall SAM using torchmetrics
-            try:
-                # Torchmetrics expects data in range [0, 1], so we need to convert from [-1, 1]
-                batch_01 = (batch + 1.0) / 2.0
-                reconstruction_01 = (reconstruction + 1.0) / 2.0
-                
-                # Apply mask to focus on leaf regions only
-                if mask is not None:
-                    mask_expanded = mask.expand_as(batch_01)
-                    
-                    # Only compute SAM on pixels with significant leaf coverage
-                    leaf_pixels = mask_expanded.sum(dim=1) > 0.1  # At least 10% leaf coverage
-                    
-                    if leaf_pixels.any():
-                        masked_batch = batch_01[leaf_pixels.unsqueeze(1).expand_as(batch_01)]
-                        masked_recon = reconstruction_01[leaf_pixels.unsqueeze(1).expand_as(reconstruction_01)]
-                        
-                        # Reshape for torchmetrics: (N, C, H, W) where N is number of valid pixels
-                        # torchmetrics expects each "image" to be a single pixel's spectrum
-                        n_valid = leaf_pixels.sum().item()
-                        if n_valid > 0:
-                            # Reshape to treat each valid pixel as a separate "image"
-                            pixel_batch = masked_batch.view(n_valid, batch.shape[1], 1, 1)
-                            pixel_recon = masked_recon.view(n_valid, batch.shape[1], 1, 1)
-                            
-                            sam_score = sam_metric(pixel_recon, pixel_batch)
-                            sam_scores.append(sam_score.item())
-                else:
-                    # No mask provided, compute on entire image
-                    sam_score = sam_metric(reconstruction_01, batch_01)
-                    sam_scores.append(sam_score.item())
-                
-                # Compute per-band analysis for comparison
-                per_band_scores = []
-                for band_idx in range(batch.shape[1]):
-                    try:
-                        # Extract single band and treat as grayscale "image"
-                        band_orig = batch_01[:, band_idx:band_idx+1]  # Keep channel dim
-                        band_recon = reconstruction_01[:, band_idx:band_idx+1]
-                        
-                        if mask is not None:
-                            band_mask = mask
-                            # Apply mask
-                            masked_orig = band_orig * band_mask
-                            masked_recon = band_recon * band_mask
-                            
-                            # Only compute if there are valid pixels
-                            if (band_mask > 0.1).any():
-                                band_sam = sam_metric(masked_recon, masked_orig)
-                                per_band_scores.append(band_sam.item())
-                            else:
-                                per_band_scores.append(float('nan'))
-                        else:
-                            band_sam = sam_metric(band_recon, band_orig)
-                            per_band_scores.append(band_sam.item())
-                    except Exception as e:
-                        logger.warning(f"Per-band SAM failed for band {band_idx}: {e}")
-                        per_band_scores.append(float('nan'))
-                
-                per_band_sam_scores.append(per_band_scores)
-                
-            except Exception as e:
-                logger.warning(f"SAM computation failed for batch {batch_idx}: {e}")
-                continue
-    
-    # Compute statistics
-    if sam_scores:
-        results = {
-            'overall_sam': {
-                'mean': np.mean(sam_scores),
-                'std': np.std(sam_scores),
-                'min': np.min(sam_scores),
-                'max': np.max(sam_scores),
-                'median': np.median(sam_scores),
-                'n_samples': len(sam_scores)
-            }
-        }
-        
-        # Per-band statistics
-        if per_band_sam_scores:
-            per_band_array = np.array(per_band_sam_scores)
-            per_band_means = np.nanmean(per_band_array, axis=0)
-            per_band_stds = np.nanstd(per_band_array, axis=0)
-            
-            results['per_band_sam'] = {
-                'means': per_band_means.tolist(),
-                'stds': per_band_stds.tolist(),
-                'band_names': ['Blue (474.73nm)', 'Green (538.71nm)', 'Red (650.665nm)', 
-                              'Red-edge (730.635nm)', 'NIR (850.59nm)']
-            }
-        
-        logger.info(f"SAM Evaluation Results:")
-        logger.info(f"  Overall SAM: {results['overall_sam']['mean']:.4f} ± {results['overall_sam']['std']:.4f} rad")
-        logger.info(f"  Overall SAM (degrees): {results['overall_sam']['mean'] * 180/np.pi:.2f} ± {results['overall_sam']['std'] * 180/np.pi:.2f}°")
-        
-        if 'per_band_sam' in results:
-            logger.info("  Per-band SAM (radians):")
-            for i, (name, mean_val, std_val) in enumerate(zip(
-                results['per_band_sam']['band_names'],
-                results['per_band_sam']['means'],
-                results['per_band_sam']['stds']
-            )):
-                logger.info(f"    {name}: {mean_val:.4f} ± {std_val:.4f}")
-        
-        return results
+    # Handle different input shapes
+    if original.ndim == 4:  # (B, C, H, W)
+        B, C, H, W = original.shape
+        # Flatten spatial dimensions
+        orig_flat = original.reshape(B, C, -1)  # (B, 5, H*W)
+        recon_flat = reconstructed.reshape(B, C, -1)
+
+        # Compute dot product and norms per pixel
+        dot = (orig_flat * recon_flat).sum(axis=1)  # (B, H*W)
+        norm_orig = np.linalg.norm(orig_flat, axis=1)  # (B, H*W)
+        norm_recon = np.linalg.norm(recon_flat, axis=1)  # (B, H*W)
+
+        cos = dot / (norm_orig * norm_recon + eps)
+        cos = np.clip(cos, -1, 1)
+        angles = np.arccos(cos)  # (B, H*W)
+
+        return np.nanmean(angles)
+
+    elif original.ndim == 3:  # (C, H, W) - single image
+        # Compute per-pixel SAM
+        dot = (original * reconstructed).sum(axis=0)  # (H, W)
+        norm_orig = np.linalg.norm(original, axis=0)  # (H, W)
+        norm_recon = np.linalg.norm(reconstructed, axis=0)  # (H, W)
+
+        cos_theta = dot / (norm_orig * norm_recon + eps)
+        cos_theta = np.clip(cos_theta, -1, 1)
+        sam_map = np.arccos(cos_theta)  # (H, W)
+
+        return np.nanmean(sam_map)
+
     else:
-        logger.error("No valid SAM scores computed")
-        return {}
+        raise ValueError(f"Unsupported input shape: {original.shape}")
 
-def compare_with_custom_sam(original, reconstructed, mask=None):
+def torch_sam(original, reconstructed, eps=1e-8):
     """
-    Compare torchmetrics SAM with a custom implementation for validation.
-    
-    Args:
-        original: Original tensor in [-1, 1] range
-        reconstructed: Reconstructed tensor in [-1, 1] range
-        mask: Optional mask tensor
-        
-    Returns:
-        Dictionary with comparison results
+    SAM implementation using torch operations
     """
-    if not TORCHMETRICS_AVAILABLE:
-        return {}
-    
-    device = original.device
-    sam_metric = SpectralAngleMapper().to(device)
-    
-    # Convert to [0, 1] for torchmetrics
-    orig_01 = (original + 1.0) / 2.0
-    recon_01 = (reconstructed + 1.0) / 2.0
-    
-    # Torchmetrics SAM
-    torchmetrics_sam = sam_metric(recon_01, orig_01).item()
-    
-    # Custom SAM implementation (matching your training code)
-    def custom_sam_loss(orig, recon):
-        # Normalize to unit vectors
-        orig_norm = torch.nn.functional.normalize(orig, p=2, dim=1)
-        recon_norm = torch.nn.functional.normalize(recon, p=2, dim=1)
-        
-        # Compute cosine similarity
-        cos_sim = torch.nn.functional.cosine_similarity(orig_norm, recon_norm, dim=1)
-        cos_sim = torch.clamp(cos_sim, -1.0 + 1e-7, 1.0 - 1e-7)
-        
-        # Convert to angle
-        angle = torch.acos(cos_sim)
-        return angle.mean().item()
-    
-    custom_sam = custom_sam_loss(original, reconstructed)
-    
-    return {
-        'torchmetrics_sam': torchmetrics_sam,
-        'custom_sam': custom_sam,
-        'difference': abs(torchmetrics_sam - custom_sam),
-        'relative_error': abs(torchmetrics_sam - custom_sam) / max(torchmetrics_sam, 1e-8)
-    }
+    # Ensure inputs are torch tensors
+    if not torch.is_tensor(original):
+        original = torch.from_numpy(original).float()
+    if not torch.is_tensor(reconstructed):
+        reconstructed = torch.from_numpy(reconstructed).float()
 
-def main():
-    parser = argparse.ArgumentParser(description="Evaluate VAE with torchmetrics SpectralAngleMapper")
-    parser.add_argument('--model_dir', type=str, required=True, 
-                       help='Path to trained model directory')
-    parser.add_argument('--val_file_list', type=str, required=True,
-                       help='Path to validation file list')
-    parser.add_argument('--batch_size', type=int, default=4,
-                       help='Batch size for evaluation')
-    parser.add_argument('--num_samples', type=int, default=None,
-                       help='Number of samples to evaluate (None = all)')
-    parser.add_argument('--output_dir', type=str, default=None,
-                       help='Directory to save results')
-    parser.add_argument('--compare_implementations', action='store_true',
-                       help='Compare torchmetrics with custom SAM implementation')
-    
-    args = parser.parse_args()
-    
-    # Set output directory
-    if args.output_dir is None:
-        args.output_dir = str(Path(args.model_dir).parent / "torchmetrics_sam_evaluation")
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Check torchmetrics availability
-    if not TORCHMETRICS_AVAILABLE:
-        logger.error("torchmetrics is not available. Install with: pip install torchmetrics")
-        return
-    
-    # Setup device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-    
-    # Load model
-    model = load_model(args.model_dir, device)
-    
-    # Create dataloader
-    try:
-        _, val_loader = create_vae_dataloaders(
-            train_list_path=args.val_file_list,  # Use val list for both (we only need val)
-            val_list_path=args.val_file_list,
-            batch_size=args.batch_size,
-            resolution=512,
-            num_workers=0,  # Avoid multiprocessing issues
-            use_cache=False,
-            return_mask=True
-        )
-        logger.info(f"Created dataloader with {len(val_loader.dataset)} validation samples")
-    except Exception as e:
-        logger.error(f"Failed to create dataloader: {e}")
-        return
-    
-    # Evaluate SAM metrics
-    try:
-        results = evaluate_sam_metrics(model, val_loader, device, args.num_samples)
-        
-        # Save results
-        results_file = os.path.join(args.output_dir, 'torchmetrics_sam_results.json')
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Results saved to: {results_file}")
-        
-        # Compare implementations if requested
-        if args.compare_implementations and results:
-            logger.info("\nComparing torchmetrics with custom SAM implementation...")
-            
-            # Test on a single batch
-            for batch, mask in val_loader:
-                batch = batch.to(device)
-                mask = mask.to(device)
-                
-                # Sanitize input
-                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
-                batch = torch.clamp(batch, min=-1.0, max=1.0)
-                
-                # Get reconstruction
-                with torch.no_grad():
-                    encoded = model.encode(batch)
-                    if hasattr(encoded, 'latent_dist'):
-                        latent = encoded.latent_dist.mode()
-                    else:
-                        latent = encoded
-                    reconstruction = model.decode(latent, return_dict=False)
-                    if isinstance(reconstruction, tuple):
-                        reconstruction = reconstruction[0]
-                    elif hasattr(reconstruction, 'sample'):
-                        reconstruction = reconstruction.sample
-                
-                # Compare implementations
-                comparison = compare_with_custom_sam(batch, reconstruction, mask)
-                
-                logger.info("Implementation Comparison:")
-                logger.info(f"  Torchmetrics SAM: {comparison['torchmetrics_sam']:.6f} rad")
-                logger.info(f"  Custom SAM: {comparison['custom_sam']:.6f} rad")
-                logger.info(f"  Absolute difference: {comparison['difference']:.6f} rad")
-                logger.info(f"  Relative error: {comparison['relative_error']:.2%}")
-                
-                # Save comparison
-                comparison_file = os.path.join(args.output_dir, 'sam_implementation_comparison.json')
-                with open(comparison_file, 'w') as f:
-                    json.dump(comparison, f, indent=2)
-                
-                break  # Only test on first batch
-                
-    except Exception as e:
-        logger.error(f"Evaluation failed: {e}")
-        raise
-    
-    logger.info("Evaluation completed successfully!")
+    # Handle different input shapes
+    if original.ndim == 4:  # (B, C, H, W)
+        B, C, H, W = original.shape
+        # Flatten spatial dimensions
+        orig_flat = original.reshape(B, C, -1)  # (B, 5, H*W)
+        recon_flat = reconstructed.reshape(B, C, -1)
+
+        # Compute dot product and norms per pixel
+        dot = (orig_flat * recon_flat).sum(dim=1)  # (B, H*W)
+        norm_orig = torch.norm(orig_flat, dim=1)  # (B, H*W)
+        norm_recon = torch.norm(recon_flat, dim=1)  # (B, H*W)
+
+        cos = dot / (norm_orig * norm_recon + eps)
+        cos = torch.clamp(cos, -1, 1)
+        angles = torch.arccos(cos)  # (B, H*W)
+
+        return torch.nanmean(angles).item()
+
+    elif original.ndim == 3:  # (C, H, W) - single image
+        # Compute per-pixel SAM
+        dot = (original * reconstructed).sum(dim=0)  # (H, W)
+        norm_orig = torch.norm(original, dim=0)  # (H, W)
+        norm_recon = torch.norm(reconstructed, dim=0)  # (H, W)
+
+        cos_theta = dot / (norm_orig * norm_recon + eps)
+        cos_theta = torch.clamp(cos_theta, -1, 1)
+        sam_map = torch.arccos(cos_theta)  # (H, W)
+
+        return torch.nanmean(sam_map).item()
+
+    else:
+        raise ValueError(f"Unsupported input shape: {original.shape}")
+
+def create_synthetic_multispectral_data(num_samples=5, height=64, width=64):
+    """
+    Create synthetic multispectral data for testing
+    """
+    # Create realistic multispectral patterns
+    # 5 bands: Blue, Green, Red, Red-edge, NIR
+    np.random.seed(42)
+
+    data = []
+    for i in range(num_samples):
+        # Create base patterns
+        x, y = np.meshgrid(np.linspace(0, 1, width), np.linspace(0, 1, height))
+
+        # Different patterns for each band
+        band1 = 0.3 + 0.4 * np.sin(2 * np.pi * x) * np.cos(2 * np.pi * y)  # Blue
+        band2 = 0.4 + 0.3 * np.cos(3 * np.pi * x) * np.sin(3 * np.pi * y)  # Green
+        band3 = 0.5 + 0.2 * np.sin(4 * np.pi * x) * np.cos(4 * np.pi * y)  # Red
+        band4 = 0.6 + 0.1 * np.cos(5 * np.pi * x) * np.sin(5 * np.pi * y)  # Red-edge
+        band5 = 0.7 + 0.05 * np.sin(6 * np.pi * x) * np.cos(6 * np.pi * y)  # NIR
+
+        # Stack bands and add noise
+        sample = np.stack([band1, band2, band3, band4, band5], axis=0)
+        noise = np.random.normal(0, 0.05, sample.shape)
+        sample = sample + noise
+
+        # Normalize to [-1, 1] range
+        sample = 2 * (sample - sample.min()) / (sample.max() - sample.min()) - 1
+
+        data.append(sample)
+
+    return np.array(data)  # (num_samples, 5, height, width)
+
+def create_reconstructed_data(original_data, noise_level=0.1, spectral_shift=0.05):
+    """
+    Create reconstructed data with controlled degradation
+    """
+    np.random.seed(42)
+
+    reconstructed = original_data.copy()
+
+    # Add noise
+    noise = np.random.normal(0, noise_level, reconstructed.shape)
+    reconstructed = reconstructed + noise
+
+    # Add spectral shift (simulate reconstruction errors)
+    spectral_shift_matrix = np.random.normal(0, spectral_shift, (5,))
+    for i in range(5):
+        reconstructed[:, i] = reconstructed[:, i] + spectral_shift_matrix[i]
+
+    # Clip to valid range
+    reconstructed = np.clip(reconstructed, -1, 1)
+
+    return reconstructed
+
+def test_sam_implementations():
+    """
+    Test both SAM implementations with synthetic data
+    """
+    print("Creating synthetic multispectral data...")
+    original_data = create_synthetic_multispectral_data(num_samples=10, height=32, width=32)
+    reconstructed_data = create_reconstructed_data(original_data, noise_level=0.1, spectral_shift=0.05)
+
+    print(f"Original data shape: {original_data.shape}")
+    print(f"Reconstructed data shape: {reconstructed_data.shape}")
+
+    # Test both implementations
+    custom_sam_results = []
+    torch_sam_results = []
+
+    print("\nTesting SAM implementations...")
+    for i in range(original_data.shape[0]):
+        orig = original_data[i]  # (5, H, W)
+        recon = reconstructed_data[i]  # (5, H, W)
+
+        custom_sam_val = custom_sam(orig, recon)
+        torch_sam_val = torch_sam(orig, recon)
+
+        custom_sam_results.append(custom_sam_val)
+        torch_sam_results.append(torch_sam_val)
+
+        print(f"Sample {i}: Custom SAM = {custom_sam_val:.6f}, Torch SAM = {torch_sam_val:.6f}")
+
+    # Compare results
+    custom_sam_array = np.array(custom_sam_results)
+    torch_sam_array = np.array(torch_sam_results)
+
+    print(f"\n=== SAM Comparison Results ===")
+    print(f"Custom SAM mean: {np.mean(custom_sam_array):.6f} ± {np.std(custom_sam_array):.6f}")
+    print(f"Torch SAM mean: {np.mean(torch_sam_array):.6f} ± {np.std(torch_sam_array):.6f}")
+    print(f"Mean difference: {np.mean(custom_sam_array - torch_sam_array):.6f}")
+    print(f"Max difference: {np.max(np.abs(custom_sam_array - torch_sam_array)):.6f}")
+    print(f"Correlation: {np.corrcoef(custom_sam_array, torch_sam_array)[0,1]:.6f}")
+
+    # Create comparison plot
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+
+    # Scatter plot
+    ax1.scatter(custom_sam_array, torch_sam_array, alpha=0.7)
+    ax1.plot([0, max(custom_sam_array)], [0, max(custom_sam_array)], 'r--', label='Perfect agreement')
+    ax1.set_xlabel('Custom SAM (radians)')
+    ax1.set_ylabel('Torch SAM (radians)')
+    ax1.set_title('Custom vs Torch SAM Comparison')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Difference histogram
+    differences = custom_sam_array - torch_sam_array
+    ax2.hist(differences, bins=10, alpha=0.7, edgecolor='black')
+    ax2.set_xlabel('Difference (Custom - Torch)')
+    ax2.set_ylabel('Frequency')
+    ax2.set_title('SAM Implementation Differences')
+    ax2.axvline(0, color='red', linestyle='--', label='No difference')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig('sam_comparison_test.png', dpi=150, bbox_inches='tight')
+    plt.show()
+
+    return custom_sam_array, torch_sam_array
+
+def test_edge_cases():
+    """
+    Test edge cases for SAM implementations
+    """
+    print("\n=== Testing Edge Cases ===")
+
+    # Test 1: Perfect reconstruction (should give SAM = 0)
+    print("Test 1: Perfect reconstruction")
+    perfect_orig = np.random.randn(5, 16, 16)
+    perfect_recon = perfect_orig.copy()
+
+    custom_sam_val = custom_sam(perfect_orig, perfect_recon)
+    torch_sam_val = torch_sam(perfect_orig, perfect_recon)
+    print(f"Perfect reconstruction - Custom SAM: {custom_sam_val:.6f}, Torch SAM: {torch_sam_val:.6f}")
+
+    # Test 2: Orthogonal vectors (should give SAM ≈ π/2)
+    print("Test 2: Orthogonal vectors")
+    orth_orig = np.random.randn(5, 16, 16)
+    orth_recon = np.random.randn(5, 16, 16)
+    # Make them orthogonal
+    orth_orig = orth_orig / np.linalg.norm(orth_orig, axis=0, keepdims=True)
+    orth_recon = orth_recon / np.linalg.norm(orth_recon, axis=0, keepdims=True)
+
+    custom_sam_val = custom_sam(orth_orig, orth_recon)
+    torch_sam_val = torch_sam(orth_orig, orth_recon)
+    print(f"Orthogonal vectors - Custom SAM: {custom_sam_val:.6f}, Torch SAM: {torch_sam_val:.6f}")
+    print(f"Expected: ~{np.pi/2:.6f}")
+
+    # Test 3: Opposite vectors (should give SAM ≈ π)
+    print("Test 3: Opposite vectors")
+    opp_orig = np.random.randn(5, 16, 16)
+    opp_recon = -opp_orig  # Opposite direction
+
+    custom_sam_val = custom_sam(opp_orig, opp_recon)
+    torch_sam_val = torch_sam(opp_orig, opp_recon)
+    print(f"Opposite vectors - Custom SAM: {custom_sam_val:.6f}, Torch SAM: {torch_sam_val:.6f}")
+    print(f"Expected: ~{np.pi:.6f}")
 
 if __name__ == '__main__':
-    main() 
+    print("=== SAM Implementation Test ===")
+
+    # Test with synthetic data
+    custom_results, torch_results = test_sam_implementations()
+
+    # Test edge cases
+    test_edge_cases()
+
+    print("\nTest completed! Check 'sam_comparison_test.png' for visualization.")
