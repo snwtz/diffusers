@@ -1,17 +1,8 @@
 MULTISPECTRAL VAE TRAINING PIPELINE - DIGITAL ARCHIVE
 ====================================================
 
-This digital archive contains the complete implementation of a multispectral VAE (MSAE) training pipeline
-for adapting Stable Diffusion 3 (SD3) to generate synthetic 5-channel multispectral plant imagery.
-The pipeline enables parameter-efficient fine-tuning of pretrained SD3 VAE for hyperspectral data
-while maintaining spectral fidelity and SD3 compatibility.
-
-RESEARCH CONTEXT
----------------
-This work addresses the challenge of adapting pretrained diffusion models for multispectral
-plant imaging applications. The core innovation is a lightweight adapter architecture that
-bridges 5-channel hyperspectral data to the 3-channel RGB format expected by SD3, enabling
-synthetic multispectral image generation through DreamBooth fine-tuning.
+This digital archive contains the implementation of a multispectral VAE (MSAE) training pipeline
+for adapting Stable Diffusion 3 (SD3) to generate synthetic 5-channel multispectral plant imagery via DreamBooth fine-tuning.
 
 ARCHIVE STRUCTURE
 ================
@@ -50,9 +41,6 @@ examples/multispectral/
 
 The pipeline requires:
 - Python 3.8+ with PyTorch, diffusers, rasterio
-- CUDA-compatible GPU for training
-- Hyperspectral TIFF files with at least 55 bands
-- Weights & Biases account for experiment tracking (optional)
 
 5. LOGGING AND MONITORING
 -------------------------
@@ -86,7 +74,6 @@ The pipeline requires:
    - Evaluate spectral fidelity and plant health analysis
 
 
-
 10. FILE DESCRIPTIONS
 --------------------
 
@@ -107,12 +94,3 @@ autoencoder_kl_multispectral_adapter.py:
 - Spectral attention mechanism for band weighting
 - Masked loss computation for leaf-focused training
 - SD3 pipeline compatibility with DecoderOutput format
-
-11. CITATION AND ACKNOWLEDGMENTS
---------------------------------
-
-This work builds upon:
-- Stable Diffusion 3 (Stability AI)
-- Diffusers library (Hugging Face)
-- DreamBooth fine-tuning methodology
-- Spectral Angle Mapper for multispectral analysis

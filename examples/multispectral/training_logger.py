@@ -1,51 +1,24 @@
 """
 Training Logger for Multispectral VAE
 
-This module provides comprehensive logging functionality for the multispectral VAE training process.
+This module provides logging functionality for the multispectral VAE training process.
 It captures key metrics, model health indicators, and training behavior in a compressed format
 for quick analysis and debugging.
 
+USAGE:
+------
+in train_dreambooth_sd3_multispectral.py: training_logger = create_training_logger(args.output_dir, "multispectral_vae_adapter")
+training_logger.log_final_summary(...)
+
 Features:
-- Epoch-by-epoch training metrics
-- Model health monitoring
-- Spectral-specific indicators
-- System information
-- Compressed log format for easy parsing
+- Epoch-by-epoch training metrics (loss, validation, learning rate, gradient norm)
+- Spectral band importance tracking and analysis
+- Output range statistics and compliance monitoring
+- Model health indicators (memory usage, gradient clipping)
+- Best model tracking and final training summary
+- Reconstructed mean spectrum monitoring with reference deviation
+- SSIM per-band performance metrics
 
-SCIENTIFIC UTILITY:
-------------------
-This logger addresses critical needs in multispectral VAE training:
-
-1. SPECTRAL FIDELITY MONITORING:
-   - Band importance analysis reveals which spectral bands the model prioritizes
-   - Enables detection of problematic bands that may be underweighted by attention mechanisms
-   - Provides interpretable insights into spectral signature preservation
-
-2. OUTPUT RANGE COMPLIANCE:
-   - Post-adapter range statistics verify adherence to expected [-1, 1] output ranges
-   - Quantifies range violations that can affect downstream pipeline compatibility
-   - Enables systematic debugging of spectral transformation issues
-
-3. TRAINING STABILITY ASSESSMENT:
-   - Gradient clipping detection identifies optimization instability
-   - Global scale monitoring tracks convergence of spectral scaling parameters
-   - Comprehensive loss tracking enables multi-objective optimization analysis
-
-4. REPRODUCIBILITY AND ANALYSIS:
-   - Structured JSON logging enables automated post-training analysis
-   - Compressed text format provides human-readable quick reference
-   - Complete metric history supports scientific validation and comparison
-
-DESIGN RATIONALE:
------------------
-The logger employs a dual-format approach (text + JSON) to balance human readability
-with machine-processable data. This design supports both real-time monitoring during
-training and comprehensive post-hoc analysis for scientific publication.
-
-The spectral-specific metrics address unique challenges in multispectral imaging:
-- Non-uniform band importance due to varying signal quality and biological relevance
-- Complex spectral transformations that may violate expected output ranges
-- Multi-objective loss functions requiring careful balance between spatial and spectral fidelity
 """
 
 import os
@@ -59,49 +32,6 @@ from pathlib import Path
 
 
 class TrainingLogger:
-    """
-    Comprehensive training logger for multispectral VAE training.
-    
-    Captures and logs:
-    - Training progress metrics
-    - Model health indicators
-    - Validation performance
-    - Spectral-specific metrics
-    - System information
-    
-    SCIENTIFIC CONTRIBUTION:
-    ------------------------
-    This logger addresses the unique challenges of multispectral VAE training by providing:
-    
-    1. SPECTRAL ATTENTION ANALYSIS:
-       - Monitors band importance weights from spectral attention mechanisms
-       - Detects problematic bands that may be underweighted during training
-       - Provides interpretable patterns of spectral focus (uniform/focused/balanced)
-       - Enables validation of spectral signature preservation strategies
-    
-    2. OUTPUT RANGE VERIFICATION:
-       - Quantifies compliance with expected [-1, 1] output ranges
-       - Identifies systematic range violations that affect downstream compatibility
-       - Provides detailed violation statistics for debugging spectral transformations
-       - Supports assessment of spectral fidelity preservation
-    
-    3. TRAINING STABILITY MONITORING:
-       - Tracks gradient clipping events that indicate optimization instability
-       - Monitors global scale parameters for convergence analysis
-       - Provides comprehensive loss decomposition for multi-objective optimization
-       - Enables early detection of training divergence or collapse
-    
-    IMPLEMENTATION DESIGN:
-    ----------------------
-    The logger employs a hierarchical data structure that separates:
-    - Epoch-level metrics (training progress, validation performance)
-    - Model health indicators (numerical stability, parameter behavior)
-    - Spectral-specific analysis (band importance, range compliance)
-    - System-level information (timing, resource usage)
-    
-    This design enables both real-time monitoring and comprehensive post-training analysis.
-    """
-    
     def __init__(self, output_dir: str, model_name: str = "multispectral_vae"):
         """
         Initialize the training logger.
@@ -189,35 +119,6 @@ TRAINING CONFIGURATION:
                   recon_mean_spectrum: Optional[list] = None):
         """
         Log epoch-level metrics.
-        
-        This method captures comprehensive training metrics including spectral-specific
-        indicators that are critical for multispectral VAE training analysis.
-        
-        SPECTRAL-SPECIFIC METRICS:
-        --------------------------
-        
-        1. BAND IMPORTANCE ANALYSIS:
-           - band_importance: Raw attention weights from spectral attention mechanisms
-           - band_importance_analysis: Processed analysis including problematic band detection
-           - This enables assessment of whether the model is appropriately weighting
-             different spectral bands based on their biological relevance and signal quality
-        
-        2. OUTPUT RANGE VERIFICATION:
-           - post_adapter_range_stats: Detailed analysis of output range compliance
-           - Quantifies violations of expected [-1, 1] ranges that affect downstream compatibility
-           - Provides violation statistics for debugging spectral transformation issues
-        
-        3. SPECTRAL FIDELITY INDICATORS:
-           - ssim_per_band: Structural similarity per spectral band
-           - global_min_max_per_band: Range statistics per band
-           - These metrics enable assessment of spectral signature preservation
-           reconstructed mean spectrum
-        
-        TRAINING STABILITY METRICS:
-        ---------------------------
-        - gradient_clipping: Indicates optimization instability
-        - global_scale: Convergence of spectral scaling parameters
-        - grad_norm: Gradient magnitude for stability assessment
         
         Args:
             epoch: Current epoch number
@@ -344,10 +245,10 @@ TRAINING CONFIGURATION:
             
             # Color-code based on violations and 95% compliance
             if violations > 0:
-                compliance_indicator = "✓95%" if compliance_95 else "✗95%"
+                compliance_indicator = "95%" if compliance_95 else "95%"
                 post_range_str = f" | Post-Adapter: [{min_val:.3f},{max_val:.3f}] | VIOLATIONS: {violations} ({violation_pct:.1f}%) | {compliance_indicator} ({compliance_95_val:.1f}%)"
             else:
-                post_range_str = f" | Post-Adapter: [{min_val:.3f},{max_val:.3f}] ✓ | 95%: ✓ ({compliance_95_val:.1f}%)"
+                post_range_str = f" | Post-Adapter: [{min_val:.3f},{max_val:.3f}]  | 95%: ({compliance_95_val:.1f}%)"
         
         # Format gradient clipping indicator
         clip_str = " [CLIP]" if gradient_clipping else ""
@@ -464,39 +365,6 @@ def analyze_band_importance(model, problematic_bands=None):
     """
     Analyze band importance and detect problematic bands.
     
-    This function provides comprehensive analysis of spectral attention mechanisms
-    in multispectral VAE training. It addresses the critical need to understand
-    how the model weights different spectral bands and whether problematic bands
-    are being appropriately handled.
-    
-    SCIENTIFIC UTILITY:
-    -------------------
-    
-    1. PROBLEMATIC BAND DETECTION:
-       - Identifies bands that may be underweighted by attention mechanisms
-       - Enables validation of spectral signature preservation strategies
-       - Provides early warning of potential spectral fidelity issues
-    
-    2. ATTENTION PATTERN ANALYSIS:
-       - Classifies attention patterns as uniform, focused, or balanced
-       - Enables assessment of spectral focus strategies
-       - Supports optimization of spectral attention mechanisms
-    
-    3. SPECTRAL INTERPRETABILITY:
-       - Maps attention weights to biological wavelengths
-       - Enables scientific validation of band importance
-       - Supports plant health analysis through spectral signature interpretation
-    
-    IMPLEMENTATION DETAILS:
-    -----------------------
-    The function analyzes attention weights from spectral attention mechanisms
-    and applies statistical analysis to detect patterns and anomalies:
-    
-    - Mean and standard deviation analysis for pattern classification
-    - Threshold-based detection of underweighted bands
-    - Wavelength mapping for biological interpretability
-    - Statistical significance assessment for attention patterns
-    
     Args:
         model: The multispectral VAE model
         problematic_bands: List of band indices known to be problematic (e.g., [2, 4] for bands 3 and 5)
@@ -555,41 +423,6 @@ def analyze_band_importance(model, problematic_bands=None):
 def compute_post_adapter_range_stats(model_output):
     """
     Compute range statistics after the output adapter to verify [-1, 1] compliance.
-    
-    This function addresses the critical issue of output range compliance in multispectral
-    VAE training. It provides comprehensive analysis of whether model outputs adhere to
-    expected [-1, 1] ranges that are required for downstream pipeline compatibility.
-    
-    SCIENTIFIC UTILITY:
-    -------------------
-    
-    1. RANGE COMPLIANCE VERIFICATION:
-       - Quantifies violations of expected [-1, 1] output ranges
-       - Enables systematic debugging of spectral transformation issues
-       - Provides violation statistics for downstream pipeline assessment
-    
-    2. SPECTRAL FIDELITY ASSESSMENT:
-       - Analyzes whether spectral transformations preserve expected ranges
-       - Identifies systematic range violations that affect spectral fidelity
-       - Supports optimization of spectral transformation mechanisms
-    
-    3. DOWNSTREAM COMPATIBILITY:
-       - Ensures compatibility with standard image processing pipelines
-       - Identifies range violations that may affect model integration
-       - Provides metrics for post-processing optimization
-    
-    IMPLEMENTATION DETAILS:
-    -----------------------
-    The function performs comprehensive statistical analysis of output ranges:
-    
-    - Basic statistics (min, max, mean, std) for range assessment
-    - Violation counting and percentage calculation
-    - Severity analysis (below minimum vs above maximum violations)
-    - Maximum violation magnitude for severity assessment
-    - 95% range compliance check for practical pipeline compatibility
-    
-    This analysis enables both real-time monitoring during training and
-    comprehensive post-training assessment of spectral transformation quality.
     
     Args:
         model_output: Output tensor from the model (after output adapter)

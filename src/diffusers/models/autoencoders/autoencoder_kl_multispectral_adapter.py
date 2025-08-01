@@ -2,29 +2,25 @@
 Multispectral VAE Adapter for Stable Diffusion 3: Core Methodological Contribution
 ================================================================================
 
-This module implements the central methodological contribution of the thesis: a lightweight
-adapter-based multispectral autoencoder architecture built on a pretrained SD3 backbone.
+This module implements a lightweight adapter-based multispectral autoencoder architecture 
+built on a pretrained SD3 backbone.
 The design enables efficient processing of 5-channel spectral plant imagery while maintaining
 compatibility with SD3's latent space requirements.
 
+It handles the neural network architecture and forward pass
+
 USAGE:
 ------
-# Initialize with pretrained SD3 VAE
-vae = AutoencoderKLMultispectralAdapter.from_pretrained(
-    "stabilityai/stable-diffusion-3-medium-diffusers",
-    adapter_placement="both",  # or "input" or "output"
-    use_spectral_attention=True,
-    use_sam_loss=True
-)
-
-# Freeze backbone (only adapters will be trained)
-vae.freeze_backbone()
-
-# Train only adapter layers
-optimizer = torch.optim.AdamW(vae.get_trainable_params(), lr=1e-4)
-
-# Forward pass with masking
-reconstruction, losses = vae.forward(sample=batch, mask=mask)
+in train_dreambooth_sd3_multispectral.py:
+1. Import 
+from src.diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter
+2. Load 
+vae = AutoencoderKLMultispectralAdapter.from_pretrained(args.vae_path)
+3. Freeze for MSDB training
+vae.requires_grad_(False)
+4. Use during training
+model_input = vae.encode(pixel_values).latent_dist.sample() 
+decoded_pixels = vae.decode(decoded_latents).sample  
 
 CONFIGURATION:
 --------------
@@ -34,7 +30,7 @@ CONFIGURATION:
 - Backbone: Frozen SD3 VAE for parameter efficiency
 - Loss: Multi-objective (MSE + SAM) with masked computation
 
-Key Features:
+Features:
 - Spectral attention mechanism for band importance
 - Parameter-efficient fine-tuning (frozen backbone)
 - Masked loss computation for leaf-focused training
@@ -58,231 +54,26 @@ Data Flow Summary:
 - Output: Reconstructed 5-channel image with nonlinear transformations applied (unconstrained range)
 - Loss: Multi-objective (MSE + SAM), with pure leaf-focused masked loss computation
 - Output Format: Compatible with both training (raw tensor) and downstream pipelines (DecoderOutput)
-
-NOTE ON INPUT FORMAT:
----------------------
-This training script currently expects raw tensor input of shape (B, 5, H, W) during training. In contrast,
-standard SD3 inference pipelines typically expect `dict`-style conditioning input format, e.g. {"sample": x, "mask": y}.
-This discrepancy can impact integration with SD pipelines if later applying this model in generation tasks.
-Adjustments may be required for compatibility with diffusers pipelines or script-based inference.
-
-NOTE: This version includes defensive coding for numerical stability.
-- Applies nan/inf detection after transforming inputs.
-- Replaces NaNs/Infs with default clamped values to prevent decoder failures.
-- This is necessary due to observed NaNs early in the model pipeline, traced to potential data anomalies or instability.
-- IMPORTANT: The decoder output contains significant nonlinear transformations that may 
-produce values outside typical image ranges (range not constrained to [-1,1]).
-
-Thesis Context and Scientific Innovation:
----------------------------------------
-1. Research Objective:
-   - Enable multispectral image generation using SD3
-   - Maintain spectral fidelity while leveraging pretrained knowledge
-   - Support scientific analysis of plant health through spectral signatures
-   - Enable parameter-efficient adaptation for limited data scenarios
-
-2. Core Innovation:
-   - Lightweight adapter architecture for 5-channel spectral data
-   - Parameter-efficient fine-tuning strategy
-   - Spectral attention mechanism for interpretable band selection (nonlinear)
-   - Dual loss function preserving both spatial and spectral fidelity
-   - Nonlinear transformations enabling complex spectral relationship learning
-
-3. Biological Relevance:
-   The architecture processes 5 carefully selected bands from hyperspectral data:
-   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
-   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
-   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
-   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
-
-Architectural Design Decisions:
-----------------------------
-1. Adapter Architecture:
-   a) SpectralAdapter:
-      - 3×3 convolutions: Balance spatial feature modeling with efficiency
-      - GroupNorm: Stable training with small batch sizes typical in hyperspectral data (nonlinear normalization)
-      - SiLU activation: Gradient-friendly nonlinearity better suited than ReLU (nonlinear activation)
-      - Three-layer design: Progressive feature extraction and channel adaptation with nonlinear transformations
-
-   b) SpectralAttention:
-      - 1×1 convolution: Learn band importance weights (linear transformation)
-      - Sigmoid activation: Ensure interpretable [0,1] importance scores (nonlinear activation)
-      - Element-wise multiplication: Apply learned weights to input (nonlinear due to sigmoid weights)
-      - Wavelength mapping: Enable scientific visualization of band contributions
-
-2. Loss Function Design:
-   a) Per-channel MSE Loss:
-      - Preserves spatial structure and pixel-wise accuracy
-      - Enables band-specific optimization
-      - Helps identify problematic spectral bands
-
-   b) Spectral Angle Mapper (SAM) Loss:
-      - Measures spectral similarity through vector angles
-      - Invariant to scaling, preserves spectral signatures
-      - Weighted combination: loss = α * MSE + β * SAM
-      - Configurable weights for balancing spatial vs. spectral fidelity
-
-3. Training Strategy:
-   a) Parameter Efficiency:
-      - freeze_backbone(): Preserve SD3's latent space properties
-      - get_trainable_params(): Enable adapter-only training
-      - Minimal trainable parameters (only adapter layers)
-
-   b) Pure Leaf-Focused Training:
-      - compute_losses(): Implements masked loss computation
-      - Excludes background regions from loss calculation
-      - Focuses training purely on biologically relevant leaf regions
-      - Provides mask coverage statistics for monitoring
-
-   c) Flexible Configuration:
-      - adapter_placement: "input", "output", or "both"
-      - Enables experimentation with different adaptation strategies
-      - Supports ablation studies for thesis analysis
-
-Integration and Downstream Use:
-----------------------------
-1. DreamBooth Integration:
-   - Seamless compatibility with SD3's latent space
-   - Supports multispectral image generation
-   - Enables spectral concept learning
-
-2. Scientific Analysis:
-   - get_band_importance(): Generate interpretable visualizations
-   - Per-band loss tracking for spectral fidelity analysis
-   - Support for spectral signature preservation studies
-
-Implementation Details:
----------------------
-1. Model Components:
-   - Pretrained SD3 VAE backbone
-   - Input/output adapter layers
-   - Spectral attention mechanism
-   - Loss computation pipeline
-
-2. Training Integration:
-   - Parameter isolation for efficient fine-tuning
-   - Loss term balancing
-   - Spectral fidelity preservation
-   - Band importance tracking
-
-Known Limitations:
-----------------
-1. Latent Space Compatibility:
-   - Must maintain SD3's 4-channel latent space
-   - Potential information bottleneck
-   - Trade-off between compression and fidelity
-
-2. Training Stability:
-   - Loss term balancing needed
-   - Potential spectral distortion
-   - Channel interaction complexity
-
-Scientific Contributions and Future Work:
--------------------------------------
-1. Spectral Representation Learning:
-   - Develop novel spectral attention mechanisms
-   - Investigate band correlation patterns
-   - Study spectral signature preservation
-   - Explore adaptive normalization strategies
-   - Design spectral-aware loss functions
-
-2. Model Architecture:
-   - Propose new adapter architectures
-   - Develop spectral correlation models
-   - Create band importance metrics
-   - Design spectral normalization layers
-   - Investigate residual spectral connections
-
-3. Training Methodology:
-   - Develop spectral-aware optimization
-   - Design spectral validation protocols
-   - Create spectral benchmarking
-   - Study gradient flow in spectral space
-   - Investigate spectral regularization
-
-4. Theoretical Foundations:
-   - Analyze spectral information flow
-   - Study latent space properties
-   - Develop spectral fidelity metrics
-   - Create spectral interpretability tools
-   - Design spectral validation frameworks
-
-TODOs:
-------
-1. For convergence stability:
-   - Consider scaling/weighting loss terms
-   - Implement loss = mse_weight * mse + sam_weight * sam
-   - Allow tuning of loss contributions
-
-2. For overfitting prevention:
-   - Add dropout layer to each input/output adapter
-   - Implement if overfitting to spectral patterns becomes an issue
-
-3. For implementation:
-   - Add get_trainable_params() method
-   - Implement compute_losses() in model
-   - Add per-band loss tracking
-
-
-   CLI command needs --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers"
-   NOTE: enable Tanh output bounding via --force_output_tanh on the CLI.
-    -> disable during training and apply only during inference
-
-Usage:
-    # Initialize with pretrained SD3 VAE
-    vae = AutoencoderKLMultispectralAdapter.from_pretrained(
-        "stabilityai/stable-diffusion-3-medium-diffusers",
-        adapter_placement="both",  # or "input" or "output"
-        use_spectral_attention=True,
-        use_sam_loss=True
-    )
-
-    # Freeze backbone (only adapters will be trained)
-    vae.freeze_backbone()
-
-    # Train only adapter layers
-    optimizer = torch.optim.AdamW(vae.get_trainable_params(), lr=1e-4)
-    
-    # Note: Output range is unconstrained due to nonlinear transformations
-    # TODO nonlinearities introduce range warping, making it likely that even properly normalized 
-    # [–1, 1] input will produce non-symmetric output.
-    Fix Options:
-	•	(Recommended) Clamp output of output adapter to [–1, 1].
-	•	(Optional) Add Tanh() at the very end of SpectralAdapter.forward() (only for output adapter).
-    -> Add final Tanh activation to force [–1, 1] output
-    self.output_norm = nn.Tanh()
-
-    Then in forward()
-    x = self.output_norm(x)
-    
-    # For downstream usage requiring [-1, 1] range, apply post-processing normalization
-
-    
 """
 
 # ------------------------------------------------------------
 # VAE Loading Fix Summary:
-# After encountering multiple initialization and argument errors,
-# we determined that Hugging Face's `from_pretrained()` logic uses
-# keyword arguments via a config object. The original constructor
-# was not compatible with this pattern. To fix this:
+# Hugging Face's `from_pretrained()` logic uses
+# keyword arguments via a config object. To fix this:
 #
-# - We added `*` to enforce keyword-only arguments in __init__.
-# - We unpacked the base config using `**config` when calling
+# - Added `*` to enforce keyword-only arguments in __init__.
+# - Unpacked the base config using `**config` when calling
 #   the parent AutoencoderKL constructor (which expects kwargs).
-# - We implemented a custom `from_pretrained()` classmethod that
+# - Custom `from_pretrained()` classmethod that
 #   combines Hugging Face-compatible config loading with custom
 #   adapter arguments for spectral training.
 #
-# These changes now allow seamless loading of RGB VAE weights into
-# the multispectral adapter class while preserving pretrained features.
+# These changes allow seamless loading of RGB VAE weights into
+# the adapter class while preserving pretrained features.
 
 # The decode() method has been patched to return a DecoderOutput object
 # instead of AutoencoderKLOutput, resolving the error related to unexpected
-# keyword arguments like latent_sample. This approach was chosen to preserve
-# compatibility with Hugging Face's decoding expectations while still applying
-# the custom multispectral output adapter.
+# keyword arguments like latent_sample.
 # ------------------------------------------------------------
 
 from typing import Dict, Optional, Tuple, Union
@@ -301,17 +92,6 @@ from ..modeling_outputs import AutoencoderKLOutput
 from .autoencoder_kl import AutoencoderKL
 from .vae import DecoderOutput
 
-
-
-
-
-#
-# Design Rationale: Spectral Attention
-# ------------------------------------
-# Applies learnable per-band weights via 1×1 conv + sigmoid to modulate the importance of each band.
-# This aids interpretability and allows the model to emphasize diagnostically relevant wavelengths.
-# The weights can later be visualized and mapped to biological wavelengths for scientific insight.
-#
 class SpectralAttention(nn.Module):
     """Attention mechanism for spectral band selection.
 
@@ -320,12 +100,10 @@ class SpectralAttention(nn.Module):
     relevant bands for the task while maintaining spectral relationships.
     
     IMPORTANT: This module applies nonlinear transformations:
-    - 1×1 convolution (linear)
+    - 1x1 convolution (linear)
     - Sigmoid activation (nonlinear: maps to [0,1] range)
     - Element-wise multiplication with input (nonlinear due to sigmoid weights)
     
-    - Enables explainable AI attention weights can be visualized and mapped to wavelengths for scientific interpretability.
-    - Supports plant science by highlighting diagnostically relevant bands.
     - Nonlinear attention mechanism allows for complex band interaction modeling.
     """
 
@@ -338,14 +116,12 @@ class SpectralAttention(nn.Module):
             nn.Sigmoid()  # Nonlinear activation: ensures weights are between 0 and 1
         )
 
-        # Store wavelength information for interpretability
-        # These wavelengths correspond to specific bands in the hyperspectral data
         self.wavelengths = {
-            0: 474.73,  # Band 9: Blue - chlorophyll absorption
-            1: 538.71,  # Band 18: Green - healthy vegetation
-            2: 650.665, # Band 32: Red - chlorophyll content
-            3: 730.635, # Band 42: Red-edge - stress detection
-            4: 850.59   # Band 55: NIR - leaf health
+            0: 474.73,  # Band 9
+            1: 538.71,  # Band 18
+            2: 650.665, # Band 32
+            3: 730.635, # Band 42
+            4: 850.59   # Band 55
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -370,55 +146,10 @@ class SpectralAttention(nn.Module):
             return {self.wavelengths[i]: float(weight)
                    for i, weight in enumerate(attention_weights)}
 
-#
-# Design Rationale: SpectralAdapter
-# ---------------------------------
-# These adapter layers transform between 5-channel multispectral inputs and the 3-channel
-# format expected by the SD3 VAE. The input adapter maps 5→3 and output adapter maps 3→5.
-# We use:
-# - 3×3 convs for efficient spatial-spectral processing
-# - GroupNorm for stability with small batch sizes (nonlinear normalization)
-# - SiLU (Swish) activation for smoother gradients compared to ReLU (nonlinear activation)
-# - Spectral attention with sigmoid for band weighting (nonlinear attention)
-# The adapters can be placed at input/output/both to allow ablation studies and flexibility.
-# 
-# IMPORTANT: The nonlinear transformations (SiLU, GroupNorm, sigmoid attention) mean that
-# the output range is not constrained to [-1, 1] and may require post-processing normalization.
-#
-# Output Scale and Bias Parameters:
-# ---------------------------------
-# The output_scale and output_bias parameters are learnable linear transformation coefficients
-# applied to the SpectralAdapter output (via the formula: )output = input * output_scale + output_bias.
-# These parameters enable trainable calibration of the spectral output dynamic range to align
-# with SD3 pipeline expectations (ideally [-1, 1]) while preserving spectral fidelity. Optimal
-# values are output_scale ≈ 1.0 and output_bias ≈ 0.0, indicating minimal transformation is
-# required and the adapter naturally produces appropriately scaled outputs. Values significantly
-# deviating from these targets (output_scale < 0.1 or > 3.0, |output_bias| > 0.5) may indicate
-# training instability, data normalization issues, or inappropriate hyperparameter settings.
-# Scale collapse (output_scale < 0.001) represents a critical failure mode where the model
-# produces near-zero outputs, while scale explosion (output_scale > 5.0) indicates potential
-# gradient instability. Convergence to near-identity values demonstrates successful preservation
-# of biological spectral signatures with minimal range distortion.
-#
 class SpectralAdapter(nn.Module):
     """
     Adapter module for converting between 3 and 5 spectral channels.
-
-    This module handles the conversion between the 5-channel multispectral
-    input and the 3-channel RGB-like format expected by the SD3 VAE.
-    It includes spectral attention and a series of convolutions to learn
-    the optimal transformation while preserving spectral information.
-
-    Key design changes for spectral fidelity:
-    -----------------------------------------
-    - Tanh and adaptive normalization were removed. These nonlinearities, while useful for bounding outputs, can distort the spectral signature in ways that are difficult to interpret and may compromise scientific analysis.
-    - Instead, a single global learnable scale parameter is introduced. This provides linear, interpretable range control and preserves the relative relationships between spectral bands.
-    - torch.clamp(x, -1.0, 1.0) is applied during both training and inference for safety, ensuring no extreme values propagate, but the transformation remains linear.
-    - This approach aligns with the scientific goal of preserving spectral signature fidelity, allowing post-hoc calibration and interpretation.
-    - Global scaling is biologically plausible, as real plant reflectance spectra can vary in magnitude due to illumination, but the *shape* (ratios) is most important for analysis.
     """
-    # NOTE: We assume that background pixels in padded multispectral input are encoded as NaN.
-    # This adapter explicitly masks (zeroes out) these background pixels to avoid propagating NaNs.
 
     def __init__(
         self,
@@ -432,7 +163,6 @@ class SpectralAdapter(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.use_attention = use_attention
-        # Tanh and adaptive normalization are removed
 
         # Initialize spectral attention if needed
         if use_attention and in_channels == num_bands:
@@ -444,17 +174,6 @@ class SpectralAdapter(nn.Module):
         self.conv2 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
         # Final layer uses 1x1 convolution for channel reduction/expansion (no activation)
         self.conv3 = nn.Conv2d(32, out_channels, kernel_size=1)
-
-        # Learnable linear output scaling: aligns the dynamic range of adapter output to the desired range (ideally [-1, 1]).
-        # more adaptive and flexible than clamping or fixed postprocessing.
-        # These parameters are learned via gradient descent during training:
-        #   - output_scale (default: 1.0): scales the output amplitude.
-        #   - output_bias  (default: 0.0): shifts the output baseline.
-        # Together, they form an affine transformation: x' = output_scale * x + output_bias.
-        # This enables smooth, trainable calibration of spectral output without hard clipping or nonlinear warping.
-        # Motivation:
-        #   - Avoids saturating Tanh or clamping artifacts which can distort spectral shapes.
-        #   - Adapts output to match SD3 pipeline expectations (range ~[-1, 1]).
    
         self.output_scale = nn.Parameter(torch.tensor(1.0))  # Global scaling factor
         self.output_bias = nn.Parameter(torch.tensor(0.0))   # Global shift
@@ -474,18 +193,15 @@ class SpectralAdapter(nn.Module):
         self.scale_history = []  # Track scale values during training
         self.scale_convergence_threshold = 0.001  # Consider converged if std < threshold
         self.scale_warning_threshold = 0.01  # Warn if scale < 0.01
-        self.scale_collapse_threshold = 0.001  # Consider collapsed if scale < 0.001
         self.scale_explosion_threshold = 5.0  # Warn if scale > 5.0
         self.convergence_window = 100  # Number of steps to consider for convergence
         self.step_counter = 0  # Track training steps for logging
         self.log_interval = 50  # Log scale info every N steps
         self.convergence_warning_issued = False  # Track if convergence warning was issued
-        self.collapse_warning_issued = False  # Track if collapse warning was issued
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply background mask: Replace NaNs with per-band means to maintain spectral realism
-        # This prevents downstream convolutional layers from propagating invalid values
-        # while preserving realistic spectral signatures in background regions
+        # Apply background mask: Replace NaNs with per-band means
         if torch.isnan(x).any():
             logger.debug("[NaN DEBUG] NaNs found in adapter input, replacing with per-band means.")
             for band_idx in range(x.shape[1]):
@@ -519,7 +235,6 @@ class SpectralAdapter(nn.Module):
         # Helps align the dynamic range of output to [-1, 1] in a trainable and smooth way
         # Facilitates downstream consistency and spectral fidelity by allowing the model
         # to learn appropriate output magnitudes (instead of forcing via hard bounds)
-        x = x * self.output_scale + self.output_bias
 
         # Log adapter output stats for NaN debugging
         if torch.isnan(x).any():
@@ -647,7 +362,7 @@ class SpectralAdapter(nn.Module):
 
     def get_scale_monitoring_info(self) -> Dict[str, any]:
         """
-        Get comprehensive scale monitoring information for logging and analysis.
+        Scale monitoring information for logging and analysis.
         
         Returns:
             Dictionary containing all scale monitoring data
@@ -668,44 +383,8 @@ class SpectralAdapter(nn.Module):
             'step_counter': convergence_info['step_counter']
         }
 
-# ------------------------------------------------------------
-# InputAdapter: Defensive coding for numerical stability
-# ------------------------------------------------------------
-class InputAdapter(nn.Module):
-    """
-    Adapter module for input normalization and defensive nan/inf handling.
-    This module is inserted at the input side of the multispectral VAE pipeline.
-    
-    - Prevents propagation of NaNs/Infs into the model, supporting stable training and inference.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # If you want, you can add normalization or transformation layers here
-        # For now, acts as identity unless extended
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Optionally perform normalization or transformation here
-        # For example: x = (x - x.mean(dim=[2,3], keepdim=True)) / (x.std(dim=[2,3], keepdim=True) + 1e-6)
-
-        # NaN check: early debug to track if input adapter introduces invalid values
-        if torch.isnan(x).any():
-            logger.debug("[NaN DEBUG] NaNs detected in InputAdapter output.")
-        if torch.isinf(x).any():
-            logger.debug("[NaN DEBUG] Infs detected in InputAdapter output.")
-
-        # Handle NaN/Inf values: use per-band means for NaNs, clamp infinities
-        if torch.isnan(x).any():
-            for band_idx in range(x.shape[1]):
-                band = x[:, band_idx]
-                nan_mask = torch.isnan(band)
-                if nan_mask.any():
-                    band_mean = band[~nan_mask].mean() if (~nan_mask).any() else 0.0
-                    x[:, band_idx][nan_mask] = band_mean
-        x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)  # Only handles remaining Infs
-        return x
 
 
-# Numerically stable normalization for SAM loss
 def safe_normalize(tensor, dim=1, eps=1e-8):
     # Numerically stable normalization for SAM loss
     # Ensures that spectral angle calculations are robust to small values and avoid NaNs.
@@ -724,7 +403,6 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
     Returns:
         Mean spectral angle in radians
     
-    - SAM loss is for preserving spectral signatures
     - Invariant to scaling, so it focuses on spectral shape rather than intensity
     """
     # Use safe normalization to avoid NaNs
@@ -743,29 +421,14 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
 
     return angle.mean()
 
-#
-# Adapter Configuration and Training Design:
+
+# Adapter Configuration:
 # ------------------------------------------
 # This constructor registers all adapter-relevant settings for reproducibility.
-# These include:
-# - adapter_placement: Determines whether input/output or both sides of the VAE use adapters.
-# - use_spectral_attention: Enables band-wise weighting for interpretable spectral relevance.
-# - use_sam_loss: Includes a spectral fidelity loss term (Spectral Angle Mapper).
-#
-# These are currently passed via config but not stored in the output config.json.
-# If we later want to reload saved models reliably, these fields should be added explicitly
-# to the HuggingFace-compatible config serialization pipeline.
+# These settings are saved to config.json via save_pretrained() for model reloading.
 #
 class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     """Efficient multispectral VAE implementation using adapter layers.
-
-    This implementation adapts the SD3 VAE for multispectral data by:
-    1. Using pretrained SD3 VAE as backbone
-    2. Adding lightweight adapter layers for 5-channel input/output
-    3. Keeping backbone frozen during training (parameter-efficient fine-tuning)
-    4. Only training the adapter layers (supports rapid adaptation)
-    5. Including spectral attention and specialized losses
-    6. **Supports spectral signature guidance**: The training script can now include a reference-based spectral signature loss, encouraging the reconstructed mean spectrum (over leaf pixels) to match a provided healthy leaf signature. This is important for scientific realism and spectral fidelity in generated images.
 
     Parameters:
         pretrained_model_name_or_path (str): Path to pretrained SD3 VAE
@@ -978,16 +641,10 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         
         return monitoring_info
 
-    # Design Rationale: Multi-objective Loss
-    # --------------------------------------
-    # Combines per-channel MSE (spatial fidelity) with optional SAM (spectral similarity).
-    # - MSE ensures accurate reconstruction pixel-wise.
-    # - SAM focuses on preserving spectral signatures, regardless of scale.
-    # The combination allows the model to prioritize spectral realism, important in plant health analysis.
     def compute_losses(self, original: torch.Tensor, reconstructed: torch.Tensor, mask: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """Compute masked loss terms for multispectral autoencoder training.
 
-        Computes per-channel MSE loss and optional Spectral Angle Mapper (SAM) loss
+        Computes per-channel MSE loss and optional SAM loss
         using binary masking to focus training purely on leaf regions, excluding background. 
         This ensures both pixel-wise accuracy and spectral fidelity.
 
@@ -1027,12 +684,8 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 'total_pixels': mask.numel()
             }
             
-            if mask_coverage < 0.01:
-                logger.warning(f"Very low mask coverage ({mask_coverage:.4f}), training may be unstable")
-            elif mask_coverage > 0.99:
-                logger.warning(f"Very high mask coverage ({mask_coverage:.4f}), consider if masking is necessary")
         else:
-            # No mask provided - use full image (not recommended for plant data)
+            # No mask provided 
             mask = torch.ones_like(original)
             losses['mask_stats'] = {
                 'coverage': 1.0,
@@ -1059,12 +712,12 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         losses['mse_per_channel'] = mse_per_channel
         losses['mse'] = mse_per_channel.mean()
 
-        # Spectral Angle Mapper loss for spectral fidelity (masked)
+        # SAM loss for spectral fidelity (masked)
         if self.use_sam_loss:
             # Apply mask before computing SAM loss
             if mask is not None:
-                # For SAM, we need to handle the case where some pixels have zero spectral magnitude
-                # after masking. We'll compute SAM only on pixels with sufficient spectral content.
+                # handle cases where some pixels have zero spectral magnitude
+                # after masking compute SAM only on pixels with sufficient spectral content.
                 spectral_magnitude = torch.norm(masked_original, dim=1, keepdim=True)  # (B, 1, H, W)
                 valid_spectral_mask = (spectral_magnitude > 1e-6) & (mask[:, :1, :, :] > 0.5)
                 
@@ -1094,32 +747,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         losses['total_loss'] = losses['mse']
 
         # Saturation penalty: softly discourages outputs from nearing ±1 extremes,
-        # which can compress spectral details important in plant stress analysis.
-        # Applies penalty only if use_saturation_penalty=True was set during model init.
-        # v12: saturation_penalty immediately reduced output range from
-        # Decoder output range: min=-9.5801, max=9.3622 to
-        # Decoder output range: min=-3.4364, max=5.2877
-        #
-        # ARCHITECTURAL DESIGN RATIONALE: Why Saturation Penalty is in Model Code
-        # ----------------------------------------------------------------------
-        # The saturation penalty is placed in the model/adapter code (not training loop) because:
-        #1. SCIENTIFIC FIDELITY: It is a core part of the model's scientific objective - preserving
-        #    spectral interpretability by preventing hard saturation that destroys subtle spectral
-        #    differences crucial for plant health analysis. This is always relevant, regardless of
-        #    how the model is used (training, inference, or integration).
-        # 2. MODEL CONSISTENCY: By being in the model code, it ensures consistent application across
-        #    all use cases - the model will always preserve spectral fidelity, even when used in
-        #    different pipelines or by other researchers.
-        # 3. REPRODUCIBILITY: The saturation penalty is part of the model's scientific design and
-        #    should be preserved when sharing or reusing the model, ensuring consistent spectral
-        #    behavior across different implementations.
-        # 4. SEPARATION OF CONCERNS: The model handles scientific fidelity (saturation penalty),
-        #    while the training loop handles engineering constraints (range penalty for SD3tibility).
-        #
-        # COMPLEMENTARY APPROACH: The range penalty (in training loop) handles the practical
-        # engineering constraint of ensuring outputs stay within [-1,1ownstream pipeline
-        # compatibility, while this saturation penalty handles the scientific constraint of
-        # preserving spectral detail and avoiding hard nonlinearities.
+   
         if self.use_saturation_penalty:
             saturation_penalty = torch.mean(F.relu(torch.abs(reconstructed) - 0.95))
             losses["saturation_penalty"] = saturation_penalty
@@ -1202,8 +830,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
     def encode(self, x: torch.Tensor, return_dict: bool = True) -> Union[AutoencoderKLOutput, Tuple]:
         """Encode multispectral image to latent space.
         
-        - Input adapter ensures compatibility with 5-channel plant data and robust handling of NaNs/Infs.
-        - Supports end-to-end scientific validity by aligning with the dataloader's mask/NaN handling.
         """
         if hasattr(self, 'input_adapter'):
             # Convert 5 channels to 3 using input adapter
@@ -1240,19 +866,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
              * Loss computation: losses = model.compute_losses(batch, reconstruction)
              * Legacy pipelines: image = vae.decode(latents, return_dict=False)[0]
         
-        This dual interface ensures:
-        - Backward compatibility with existing training code
-        - Forward compatibility with HuggingFace pipeline ecosystem
-        - No breaking changes to downstream SD3 integration
-        - Consistent behavior with base AutoencoderKL.decode() method
-
-        IMPORTANT: The output adapter applies significant nonlinear transformations including:
-        - Spectral attention with sigmoid activation and element-wise multiplication
-        - Two convolutional blocks with SiLU activations and GroupNorm
-        - Final linear convolution
-        
-        These nonlinearities mean the output range is NOT constrained to [-1, 1] and may require
-        post-processing normalization depending on downstream usage.
 
         Args:
             z (torch.Tensor): Latent vector.
@@ -1301,7 +914,7 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
         """
         Forward pass through the entire network with optional masking for leaf-focused training.
 
-        NOTE: This forward method avoids using AutoencoderKLOutput for decoding output, in compliance with Hugging Face's class definition.
+        NOTE: This forward method avoids using AutoencoderKLOutput for decoding output
         The previously encountered error ("AutoencoderKLOutput.__init__() got an unexpected keyword argument") has been resolved
         by ensuring decode() returns only raw tensors, not structured outputs.
 
@@ -1356,9 +969,6 @@ class AutoencoderKLMultispectralAdapter(AutoencoderKL):
                 logger.debug(f"[DEBUG] Mask stats — coverage: {stats['coverage']:.4f}, valid_pixels: {stats['valid_pixels']}/{stats['total_pixels']}")
 
             # Global scale monitoring: logs the learned scalar after each forward pass during training.
-            # This is critical for ensuring the output magnitude remains biologically meaningful.
-            # A scale too small (<0.1) or too large (>3.0) can indicate loss of spectral fidelity.
-            # Log and check global scale if output_adapter exists
             if hasattr(self, "output_adapter"):
                 global_scale_val = self.output_adapter.global_scale.item()
                 logger.info(f"[Monitor] Global scale: {global_scale_val:.4f}")

@@ -7,6 +7,8 @@ a lightweight adapter-based multispectral VAE architecture. It serves as the pre
 for integrating a custom VAE into the Stable Diffusion 3 + DreamBooth pipeline for generating
 synthetic multispectral plant imagery.
 
+It handles data loading, preprocessing, and training.
+
 USAGE:
 ------
 # Basic training command
@@ -15,35 +17,22 @@ python train_multispectral_vae_5ch.py \
     --val_file_list "path/to/val_files.txt" \
     --output_dir "path/to/output" \
     --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers" \
-    --num_epochs 100 \
-    --batch_size 8 \
-    --learning_rate 1e-4 \
-    --adapter_placement both \
-    --use_spectral_attention \
-    --use_sam_loss \
-    --sam_weight 0.1 \
-    --use_saturation_penalty
-
-# With additional options
-python train_multispectral_vae_5ch.py \
-    --train_file_list "path/to/train_files.txt" \
-    --val_file_list "path/to/val_files.txt" \
-    --output_dir "path/to/output" \
-    --base_model_path "stabilityai/stable-diffusion-3-medium-diffusers" \
-    --num_epochs 100 \
-    --batch_size 8 \
-    --learning_rate 1e-4 \
-    --adapter_placement both \
-    --use_spectral_attention \
-    --use_sam_loss \
-    --sam_weight 0.1 \
-    --use_saturation_penalty \
-    --use_range_penalty \
-    --spectral_signature_weight 0.1 \
+    --num_epochs  \
+    --batch_size \
+    --learning_rate \
     --warmup_ratio 0.1 \
     --early_stopping_patience 10 \
     --max_grad_norm 1.0
+    --adapter_placement both \
+    --use_spectral_attention \
+    --use_sam_loss \
+    --sam_weight 0.05 \
+    --use_saturation_penalty
 
+# With additional options
+    --use_range_penalty \
+    --spectral_signature_weight 0.1 \
+    
 
 Data Flow Summary:
 ------------------
@@ -55,8 +44,7 @@ Data Flow Summary:
 
 LOGGING AND MONITORING:
 -----------------------
-
-- Training/validation loss (total, per-channel MSE, global SAM)
+- Training/validation loss (total, per-channel MSE, SAM)
 - Learning rate and gradient norm
 - Per-band MSE and SSIM (5 spectral bands)
 - Spectral signature comparison with reference
@@ -69,122 +57,11 @@ Training Strategy:
 The model should naturally learn to produce outputs in the [-1, 1] range because:
 Input data is normalized to [-1, 1]
 Loss function penalizes reconstruction error
-The model will learn to match the input distribution
+Ergo the model will learn to match the input distribution
 
 However:
 - The nonlinear processes (spectral attention, SiLU) contain important spectral information
 - spectral relationships learned by the attention mechanism need to be preserved (no hard clamping or tanh activation to force data range [-1/1])
--
-
-Training Workflow:
-----------------------------------
-1. Research Pipeline:
-   - Pretraining: This script trains the multispectral VAE adapter
-   - Fine-tuning: DreamBooth adapts SD3 for multispectral generation
-   - Evaluation: Spectral fidelity
-
-2. Data Processing:
-   The training pipeline handles 5 biologically relevant spectral bands:
-   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
-   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
-   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
-   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
-
-3. Background Handling:
-   - NaN values in TIFF files represent background (cut-out regions)
-   - Binary masks (1 for leaf, 0 for background) are generated
-   - Loss computation primarily considers leaf regions
-   - Background contributes softly (10%) to the total loss
-   - Model focuses solely on leaf features
-   - No background inpainting or interpolation
-
-4. Training Features:
-   a) Data Management:
-      - Custom 5-channel MultispectralDataset
-      - Deterministic train/val splitting
-      - Spectral normalization pipeline
-      - Memory-efficient loading
-      - Background masking
-
-   b) Loss Computation:
-      - Per-band MSE for spatial fidelity
-      - SAM loss for spectral signature preservation
-      - Masked loss computation: full weight on leaf, soft penalty on background (10%)
-      - Configurable loss weighting
-      - Band-specific loss tracking
-
-   c) Training Optimization:
-      - Parameter isolation via get_trainable_params()
-      - Learning rate scheduling with warmup
-      - Early stopping on validation plateau
-      - EMA model averaging
-      - Gradient clipping
-
-4. Validation and Monitoring:
-   a) Per-epoch Validation:
-      - Per-band MSE tracking
-      - SAM loss computation
-      - Spectral attention weights
-      - Reconstruction quality
-
-   b) Scientific Logging:
-      - Weights & Biases integration
-      - Automatic experiment logging with wandb (setup inside `train()`)
-      - Band importance visualization
-      - Spectral signature plots
-      - Training dynamics analysis
-
-Development and Testing Strategy:
-------------------------------
-1. Dataset Preparation:
-   - split_dataset.py creates deterministic splits
-   - Fixed random seed for reproducibility
-   - Train/val files for traceability
-   - Healthy leaf sample filtering
-
-2. Initial Testing Protocol:
-   a) Small-Scale Overfit Test:
-      - Train on 1-2 samples
-      - Disable dropout
-      - Monitor per-band MSE
-      - Visualize reconstructions
-      Expected: Near-perfect reconstructions in <100 iterations
-
-   b) Validation Metrics:
-      - Per-band MSE tracking
-      - SAM loss components
-      - Spectral attention weights
-      - Reconstruction quality
-
-3. Training Configuration:
-   - Batch size optimization
-   - Learning rate selection
-   - Loss weight tuning
-   - Early stopping patience
-
-Usage:
-    # First, split the dataset:
-    python split_dataset.py \
-        --dataset_dir /path/to/multispectral/tiffs \
-
-
-    # Then, train the VAE:
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0 --use_saturation_penalty
-NOTE: add to your CLI call: --use_saturation_penalty
-
-    # Testing
-    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0 --use_saturation_penalty
-
-VAE Loading Note:
-   RGB VAE weights from SD3 could not be loaded directly via `from_pretrained()` using a config object,
-    because the class `AutoencoderKLMultispectralAdapter` expects unpacked keyword arguments, not a config instance.
-    Successfully loaded the RGB VAE weights from SD3 by explicitly:
-        1. Using `AutoencoderKL.from_config()` to parse the original RGB config.json.
-        2. Loading pretrained SD3 VAE weights with `load_state_dict`.
-        3. Passing the loaded AutoencoderKL instance as a `base_model` argument to our `AutoencoderKLMultispectralAdapter`.
-
-This approach bypasses issues with conflicting `from_pretrained` calls and allows reuse of the SD3 VAE backbone with frozen weights.
 """
 
 import os
@@ -200,11 +77,11 @@ from datetime import datetime
 import wandb
 import shutil
 from typing import Tuple
-import numpy as np  # Ensure numpy is imported
+import numpy as np  
 from skimage.metrics import structural_similarity as ssim
-import time # Added for timing
+import time 
 
-from diffusers import AutoencoderKLMultispectralAdapter  # <-- Commented out sophisticated VAE
+from diffusers import AutoencoderKLMultispectralAdapter  
 # from diffusers.models.autoencoders.autoencoder_ms_benchmark import AutoencoderMSBenchmark as AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
 from diffusers.training_utils import EMAModel
@@ -514,7 +391,6 @@ def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, recons
             logger.warning(f"Failed to log to wandb: {e}")
         except:
             print(f"Warning: Failed to log to wandb: {e}")
-        # You could also use logger.warning here if logger is available
 
 def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args, best_val_loss=None, patience_counter=None):
     """Save model checkpoint.
@@ -585,37 +461,10 @@ def compute_output_range_stats(reconstruction_batch: torch.Tensor) -> dict:
     """
     Compute comprehensive statistics about the output range of the VAE decoder.
     
-    This function helps monitor the actual output range during training to:
+    This function helps monitoring the actual output range during training to:
     1. Detect if outputs are within expected [-1, 1] range
     2. Identify per-band range variations
-    3. Provide guidance for SSIM data_range parameter adjustment
-    4. Monitor for potential numerical instability
-    
-    POTENTIAL RUNTIME ISSUES AND SOLUTIONS:
-    --------------------------------------
-    1. Output Range Mismatch:
-       - Issue: Adapter nonlinearities produce outputs outside [-1, 1] range
-       - Impact: SSIM computation assumes [-1, 1] range (data_range=2.0)
-       - Solution: Monitor actual range and adjust SSIM data_range parameter
-       - Detection: This function provides range statistics and warnings
-    
-    2. Numerical Instability:
-       - Issue: Very large or small values from nonlinear transformations
-       - Impact: Loss computation, gradient explosion, training instability
-       - Solution: Monitor global min/max and add gradient clipping
-       - Detection: range_warning flag when values outside [-2, 2]
-    
-    3. Per-band Range Variations:
-       - Issue: Different spectral bands may have different output ranges
-       - Impact: Inconsistent loss scaling across bands
-       - Solution: Monitor per-band statistics and consider band-specific normalization
-       - Detection: Per-band min/max/mean/std statistics
-    
-    4. SSIM Parameter Adjustment:
-       - Issue: SSIM data_range parameter mismatch with actual output range
-       - Impact: Incorrect SSIM scores, misleading validation metrics
-       - Solution: Use actual output range to compute data_range parameter
-       - Detection: Compare actual range with assumed [-1, 1] range
+    3. Monitor for potential numerical instability
     
     Args:
         reconstruction_batch: Tensor of shape (B, C, H, W) from VAE decoder
@@ -664,24 +513,6 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
 
     Returns:
         Tuple of (train_loader, val_loader)
-
-    Implementation Notes:
-    -------------------
-    1. File List Management:
-       - Uses split files from split_dataset.py for deterministic, reproducible splits.
-       - Ensures data consistency and traceability.
-
-    2. Dataloader Configuration:
-       - Uses VAE-specific dataloader module.
-       - Optimizes for GPU training and efficient data loading.
-
-    3. Data Quality Assurance:
-       - Inspects the first batch for NaNs/Infs to ensure data quality before training.
-       - Logs anomalies for debugging and reproducibility.
-
-    4. Error Handling:
-       - Validates split files exist and provides clear error messages.
-       - Ensures training stability and scientific rigor.
     """
     # Get split files from args
     train_list = Path(args.train_file_list)
@@ -709,24 +540,7 @@ def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     except Exception as e:
         raise RuntimeError(f"Failed to create dataloaders: {e}")
 
-    """
-    # Sample inspection — checking first training batch for NaNs
-    logger = logging.getLogger('multispectral_vae')
-    logger.info(f"Sample inspection — checking first training batch for NaNs")
-    # New debug check: inspect for NaNs before any sanitization or clamping
-    for sample_batch, mask in train_loader:
-        logger.info("Checking for NaNs/Infs in first batch (pre-sanitization)...")
-        raw_nan_check = torch.isnan(sample_batch)
-        if raw_nan_check.any():
-            logger.warning(f"NaNs detected in raw first batch before sanitization. NaN count: {raw_nan_check.sum().item()}")
-            for channel_idx in range(sample_batch.shape[1]):
-                channel_nans = raw_nan_check[:, channel_idx].sum()
-                if channel_nans > 0:
-                    logger.warning(f"  NaNs in channel {channel_idx}: {channel_nans.item()} total")
-        else:
-            logger.info("First training batch is free of NaNs (pre-sanitization).")
-        break
-    """
+
     return train_loader, val_loader
 
     
@@ -795,37 +609,6 @@ def log_training_progress_to_wandb(step, total_loss, current_lr, grad_norm=None,
 def train(args: argparse.Namespace) -> None:
     """
     Main training function.
-
-    Implementation Notes:
-    -------------------
-    1. Model Initialization:
-       - Loads pretrained SD3 model and configures multispectral adapters.
-       - Freezes backbone for parameter-efficient fine-tuning (only adapters are trainable).
-       - Logs parameter counts for scientific reporting.
-
-    2. Training Pipeline:
-       - Uses cosine learning rate schedule with warmup for stable convergence.
-       - Implements EMA model averaging for improved generalization.
-       - Applies gradient clipping to prevent exploding gradients.
-       - Supports early stopping and checkpointing for robust model selection.
-       - Handles background masking throughout the pipeline for leaf-focused learning.
-
-    3. Loss Computation:
-       - Per-band MSE for spatial fidelity.
-       - Optional SAM loss for spectral signature preservation.
-       - Masked loss computation: only leaf regions (mask==1) contribute fully; background (mask==0) is softly penalized.
-       - Combination of MSE and SAM loss is critical for balancing spatial and spectral fidelity in scientific applications.
-
-    4. Validation Strategy:
-       - Per-epoch validation with per-band MSE, SAM loss, and SSIM metrics.
-       - SSIM is computed per-band and only on masked (leaf) regions to ensure validity.
-       - Tracks best model and implements early stopping to prevent overfitting.
-       - Saves checkpoints for reproducibility and analysis.
-
-    5. Monitoring and Logging:
-       - Comprehensive logging of all metrics, band importance, and training dynamics.
-       - Weights & Biases integration for experiment tracking and visualization.
-       - Logs all hyperparameters and results for scientific reproducibility.
     """
 
     # Setup logging first (after output_dir is set)
@@ -1062,48 +845,10 @@ def train(args: argparse.Namespace) -> None:
             if 'saturation_penalty' in losses:
                 total_loss += losses['saturation_penalty']
 
-            # --- Coordinated Output Range Control System ---
-            # This system coordinates two complementary penalties to achieve optimal output range control
-            # while preserving spectral fidelity and enabling SD3 compatibility.
-            #
-            # COORDINATION STRATEGY:
-            # 1. Saturation Penalty (in model): Prevents spectral compression by discouraging values near ±1
-            #    - Threshold: args.saturation_threshold (default: 0.95, avoids hard saturation that destroys spectral details)
-            #    - Weight: args.saturation_penalty_weight (default: 0.05, gentle, preserves spectral relationships)
-            #    - Location: Model level (applied during loss computation)
-            #
-            # 2. Range Penalty (in training): Enforces overall output range for SD3 compatibility
-            #    - Threshold: args.range_threshold (default: 1.0, enforces [-1,1] range for downstream pipelines)
-            #    - Weight: args.range_penalty_weight (default: 0.2, stronger than saturation, provides output control)
-            #    - Location: Training level (applied during optimization)
-            #
-            # RATIONALE FOR COORDINATION:
-            # - Saturation penalty alone: Great for spectral fidelity but insufficient for output range control
-            # - Range penalty alone: Good for output range but can cause spectral compression
-            # - Combined approach: Spectral fidelity + output range control + SD3 compatibility
-            #
-            # TRAINING BENEFITS:
-            # - Early training: Range penalty quickly brings outputs into reasonable range
-            # - Mid training: Saturation penalty prevents spectral compression as outputs approach ±1
-            # - Late training: Both penalties work together for optimal spectral fidelity within [-1,1]
-            #
-            # SPECTRAL SCIENCE BENEFITS:
-            # - Preserves fine spectral distinctions important for plant health analysis
-            # - Maintains interpretable spectral signatures
-            # - Enables downstream SD3 integration without range issues
+
             if reconstruction is not None and args.use_range_penalty:
                 range_penalty = torch.mean(torch.relu(torch.abs(reconstruction) - args.range_threshold))
                 total_loss += args.range_penalty_weight * range_penalty
-
-            # --- Learned Per-Band Weighting ---
-            # Manually increase weight for bands 3 and 5 due to persistent reconstruction errors.
-            # Could be replaced with learned weights or adaptive heuristics later.
-            # Apply learned per-band weights (simple example: weight poor-performing bands more)
-            #if 'mse_per_channel' in losses:
-            #    band_weights = torch.tensor([1.0, 1.0, 1.5, 1.0, 1.5], device=device)  # Bands 3 and 5 upweighted
-            #    weighted_mse = (losses['mse_per_channel'] * band_weights).mean()
-            #    total_loss = weighted_mse + total_loss - losses['mse']  # Replace original MSE
-            # disabled to avoid conflicts with upped sam_loss weight, avoiding optimization conflicts
 
             # Debugging: Check for NaN/Inf in total loss before backward
             if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
@@ -1111,7 +856,6 @@ def train(args: argparse.Namespace) -> None:
                 continue
 
             # Log decoder output range every log_interval steps
-            # NOTE: Tanh() is applied because "if not self.training" in eval mode!!
             if step % log_interval == 0:
                 min_val = reconstruction.min().item()
                 max_val = reconstruction.max().item()
@@ -1157,7 +901,7 @@ def train(args: argparse.Namespace) -> None:
             # Track losses and mask statistics
             # Monitors training progress and mask coverage
             # TODO: dynamic data_range adjustment based on output_range_stats
-            # (assumes [-1, 1] range – might produce incorrect SSIM scores if output range differs)
+            # (assumes [-1, 1] range – might produce incorrect SSIM scores if output range differs?)
             train_losses['total_loss'] += total_loss.item()
             if 'mse_per_channel' in losses:
                 train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
@@ -1203,7 +947,7 @@ def train(args: argparse.Namespace) -> None:
                 if isinstance(result, tuple) and len(result) == 2:
                     reconstruction, losses = result
                 else:
-                    # This should not happen anymore with the fix above
+                    # This should not happen anymore with the fix above!
                     reconstruction = result
                     losses = {}
                     logger.warning("WARNING: Model forward() returned only reconstruction in validation")
@@ -1299,7 +1043,6 @@ def train(args: argparse.Namespace) -> None:
                 val_losses[key] /= len(val_loader)
 
         # Get band importance if using spectral attention
-        # Analyzes model's spectral understanding
         band_importance = {}
         if args.use_spectral_attention and hasattr(model, 'input_adapter') and hasattr(model.input_adapter, 'attention'):
             try:
@@ -1309,8 +1052,7 @@ def train(args: argparse.Namespace) -> None:
 
         # Global scale monitoring:
         # The model applies a learnable scalar multiplier (global_scale) to preserve spectral shape across bands.
-        # Log its value every epoch to monitor for convergence stability.
-        # Biological interpretability and SD3 compatibility are preserved when scale remains in [0.1, 3.0].
+        # Log value every epoch to monitor for convergence stability
         if hasattr(model.output_adapter, 'global_scale'):
             current_scale = model.output_adapter.global_scale.item()
             logger.info(f"[Epoch {epoch+1}] Global output scale: {current_scale:.4f}")
@@ -1325,7 +1067,7 @@ def train(args: argparse.Namespace) -> None:
         epoch_time = time.time() - epoch_start_time
         
         # Log to training logger
-        # Handle tensor conversion properly - multi-element tensors need to be converted to lists
+        # For tensor conversion: multi-element tensors need to be converted to lists
         def convert_tensor_for_logging(v):
             if isinstance(v, torch.Tensor):
                 if v.numel() == 1:
@@ -1366,7 +1108,7 @@ def train(args: argparse.Namespace) -> None:
         if 'spectral_signature_loss' in val_losses:
             logger.info(f"[EPOCH] Spectral signature loss (val): {val_losses['spectral_signature_loss']:.6f}")
         
-        # Save grayscale band 0 of the first sample as PNG for local inspection
+        # Save grayscale band 0 of the first sample as PNG for inspection
         try:
             orig_img = (batch[0][0].detach().cpu().numpy() + 1.0) * 127.5  # from [-1,1] to [0,255]
             recon_img = (reconstruction[0][0].detach().cpu().numpy() + 1.0) * 127.5
@@ -1379,7 +1121,7 @@ def train(args: argparse.Namespace) -> None:
         except Exception as e:
             logger.warning(f"Failed to save local PNG images: {e}")
         
-        # Log to wandb (includes both metrics and images)
+        # Log to wandb (metrics and images)
         if wandb_initialized:
             try:
                 log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction, model, output_range_stats, ssim_per_band, scheduler.get_last_lr()[0], current_grad_norm)

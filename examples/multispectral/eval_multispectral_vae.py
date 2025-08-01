@@ -1,18 +1,25 @@
 """
-TODO: from skimage.metrics import structural_similarity as ssim
+Multispectral VAE Evaluation Script
 
+This script provides comprehensive evaluation of trained multispectral VAE models,
+including multi-metric analysis, visualization, and spectral fidelity assessment.
+
+USAGE:
+------
 python examples/multispectral/eval_multispectral_vae.py \
-  --model_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/test_run/final_model" \
-  --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" \
-  --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/eval_results" \
+  --model_dir "path/to/trained/model" \
+  --val_file_list "path/to/val_files.txt" \
+  --output_dir "path/to/eval_results" \
   --batch_size 1 \
   --num_samples 10
 
-Note: This evaluation script  handles [-1, 1] normalized data throughout the pipeline.
-The dataloader normalizes to [-1, 1], the model expects [-1, 1], and visualization converts to [0, 1] for display.
+Features:
+- Multi-metric evaluation (MSE, SAM, SSIM) with foreground/background separation
+- Pseudo-RGB visualization for human interpretation
+- Spectral signature analysis and error mapping
+- Per-band performance analysis and aggregated metrics
+- Reference signature comparison and deviation tracking
 
-AutoencoderKL is not imported or defined anywhere. All evaluated configs are from adapters only 
--> inference checks MS VAE model.
 """
 
 import os
@@ -470,53 +477,7 @@ def compute_ssim(original, reconstructed, mask=None):
     results['overall'] = ssim_per_mask(None)
     return results
 
-def check_normalization_consistency(original, reconstructed, outdir, idx):
-    """Check for potential light/dark inversions and normalization issues."""
-    os.makedirs(outdir, exist_ok=True)
-    
-    # Check data ranges
-    orig_min, orig_max = original.min(), original.max()
-    recon_min, recon_max = reconstructed.min(), reconstructed.max()
-    
-    # Check for potential inversions by comparing mean values per band
-    orig_means = original.mean(axis=(1, 2))  # (5,)
-    recon_means = reconstructed.mean(axis=(1, 2))  # (5,)
-    
-    # Calculate correlation between original and reconstructed means
-    correlation = np.corrcoef(orig_means, recon_means)[0, 1]
-    
-    # Check if any band has inverted brightness (negative correlation)
-    band_inversions = []
-    for i in range(5):
-        orig_band = original[i]
-        recon_band = reconstructed[i]
-        band_corr = np.corrcoef(orig_band.flatten(), recon_band.flatten())[0, 1]
-        if band_corr < -0.5:  # Strong negative correlation suggests inversion
-            band_inversions.append(i)
-    
-    # Save diagnostic information
-    diagnostic_info = {
-        'sample_idx': idx,
-        'original_range': [float(orig_min), float(orig_max)],
-        'reconstructed_range': [float(recon_min), float(recon_max)],
-        'original_means_per_band': orig_means.tolist(),
-        'reconstructed_means_per_band': recon_means.tolist(),
-        'overall_correlation': float(correlation),
-        'inverted_bands': band_inversions,
-        'potential_inversion': len(band_inversions) > 0
-    }
-    
-    with open(os.path.join(outdir, f'sample_{idx}_normalization_check.json'), 'w') as f:
-        json.dump(diagnostic_info, f, indent=2)
-    
-    # Print warnings if issues detected
-    if len(band_inversions) > 0:
-        print(f"WARNING: Sample {idx} has potential light/dark inversions in bands: {band_inversions}")
-    
-    if correlation < 0.5:
-        print(f"WARNING: Sample {idx} has low correlation ({correlation:.3f}) between original and reconstructed brightness")
-    
-    return diagnostic_info
+
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate pretrained multispectral VAE")
@@ -536,7 +497,7 @@ def main():
         backbone_in_channels=3, # Refactored: backbone input channels
         backbone_out_channels=3, # Refactored: backbone output channels
         latent_channels=16,
-        adapter_placement="both", # match training
+        adapter_placement="both",
         use_spectral_attention=True,
         use_sam_loss=True,
         use_saturation_penalty=True,
@@ -587,29 +548,6 @@ def main():
             else:
                 decoded_tensor = recon
 
-        # --- TEMP DEBUG: Check if model output is inverted relative to input ---
-        # Find one valid pixel within the mask (foreground/leaf)
-        mask_np_batch = mask.cpu().numpy()[0, 0]  # shape: (H, W)
-        yx = np.argwhere(mask_np_batch > 0)
-        if len(yx) > 0:
-            y, x = yx[len(yx) // 2]  # select middle leaf pixel
-        else:
-            y, x = 25, 25  # fallback
-
-        orig_pixel = batch[0, :, y, x].detach().cpu().numpy()
-        recon_pixel = decoded_tensor[0, :, y, x].detach().cpu().numpy()
-
-        print(f"[DEBUG] Spectral curve at pixel ({y},{x}):")
-        print("Original (normalized):", np.round(orig_pixel, 3))
-        print("Reconstructed (normalized):", np.round(recon_pixel, 3))
-
-        corr = np.corrcoef(orig_pixel, recon_pixel)[0, 1]
-        print(f"[DEBUG] Correlation between original and reconstruction: {corr:.3f}")
-
-        if corr < -0.5:
-            print("[WARNING] Strong negative correlation detected — potential spectral inversion.")
-
-        # NOTE: Comment or remove this block once inversion issue is resolved.
 
         orig_np = batch.cpu().numpy()
         recon_np = decoded_tensor.cpu().numpy()
@@ -621,8 +559,6 @@ def main():
             plot_pseudo_rgb(orig_np[0], recon_np[0], args.output_dir, idx)
             points = plot_spectral_signature(orig_np[0], recon_np[0], mask_np, args.output_dir, idx)
             plot_error_maps(orig_np[0], recon_np[0], mask_np[0], args.output_dir, idx, points)
-            # Check for normalization consistency and potential inversions
-            check_normalization_consistency(orig_np[0], recon_np[0], args.output_dir, idx)
             # Compute and collect spectral signature errors for these points
             sig_errors = []
             for y, x in points:

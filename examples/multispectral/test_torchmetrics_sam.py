@@ -1,18 +1,27 @@
 """
-Test script for evaluating VAE reconstruction quality using torchmetrics SpectralAngleMapper.
+SAM Implementation Validation Script
 
-This script provides a proper baseline for spectral reconstruction evaluation using the
-official torchmetrics implementation, which can be compared against custom SAM implementations.
+This script validates the custom SAM implementation used in training
+by comparing it against the torchmetrics implementation. This ensures the custom
+SAM computation yields appropriate results for MSAE evaluation.
 
-Usage:
-    python examples/multispectral/test_torchmetrics_sam.py \
-        --model_dir "path/to/trained/model" \
-        --val_file_list "path/to/val_files.txt" \
-        --batch_size 4 \
-        --num_samples 50
+USAGE:
+------
+python examples/multispectral/test_torchmetrics_sam.py \
+    --model_dir "path/to/trained/model" \
+    --val_file_list "path/to/val_files.txt" \
+    --batch_size 4 \
+    --num_samples 50 \
+    --compare_implementations
 
-Requirements:
-    pip install torchmetrics
+Features:
+- Uses torchmetrics SpectralAngleMapper as ground truth
+- Compares custom SAM implementation with torchmetrics
+- Per-band SAM analysis 
+- Leaf-focused evaluation using background masks
+- Statistical analysis of SAM differences
+- Implementation difference analysis and error reporting
+
 """
 
 import os
@@ -23,13 +32,8 @@ from pathlib import Path
 from tqdm import tqdm
 import json
 import logging
+from torchmetrics.image import SpectralAngleMapper
 
-try:
-    from torchmetrics.image import SpectralAngleMapper
-    TORCHMETRICS_AVAILABLE = True
-except ImportError:
-    print("torchmetrics not available. Install with: pip install torchmetrics")
-    TORCHMETRICS_AVAILABLE = False
 
 from diffusers.models.autoencoders.autoencoder_kl_multispectral_adapter import AutoencoderKLMultispectralAdapter
 from vae_multispectral_dataloader import create_vae_dataloaders
