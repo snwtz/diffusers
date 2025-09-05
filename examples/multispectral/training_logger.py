@@ -14,7 +14,7 @@ Features:
 - Epoch-by-epoch training metrics (loss, validation, learning rate, gradient norm)
 - Spectral band importance tracking and analysis
 - Output range statistics and compliance monitoring
-- Model health indicators (memory usage, gradient clipping)
+- Model health indicators (esp. gradient clipping)
 - Best model tracking and final training summary
 - Reconstructed mean spectrum monitoring with reference deviation
 - SSIM per-band performance metrics

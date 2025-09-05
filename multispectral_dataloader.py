@@ -1,174 +1,28 @@
 """
-Multispectral Image Dataloader for VAE Training
+Multispectral Image Dataloader for VAE/DreamBooth
+=================================================
 
-This module implements a specialized dataloader for multispectral TIFF images,
-optimized for training a VAE on hyperspectral plant data. The implementation
-focuses on efficient data loading, preprocessing, and memory management while
-maintaining spectral fidelity.
+Specialized dataloader for multispectral TIFFs, optimized for VAE pretraining
+and DreamBooth integration on 5-channel plant data.
 
 CHANNEL CONFIGURATION:
-- Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
-- Output: 5-channel tensor of shape (5, 512, 512) normalized to [-1, 1]
-- VAE Processing: 5-channel input → 16-channel latent (SD3's default expectation)
-- This configuration provides optimal capacity for encoding multispectral information
+- Input: 5 channels (bands 9, 18, 32, 42, 55)
+- Output: (5, 512, 512) tensor normalized to [-1, 1]
+- VAE Latents: 5-channel input → 16-channel latent (SD3 default)
 
-Scientific Background:
---------------------
-1. Spectral Band Selection:
-   The dataloader processes 5 carefully selected bands from hyperspectral data:
-   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
-   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
-   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
-   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
-
-2. Data Preprocessing:
-   a) Band Selection:
-      - Fixed band indices for reproducibility
-      - Optimized for vegetation analysis
-      - Maintains spectral relationships
-   
-   b) Normalization:
-      - Per-channel normalization to [-1, 1] range
-      - Scientific rationale:
-        * Preserves relative spectral relationships
-        * Enables meaningful band comparisons
-        * Maintains physical interpretability
-        * Facilitates cross-dataset consistency
-        * Supports spectral signature analysis
-      - Implementation considerations:
-        * Handles outliers through robust statistics
-        * Preserves zero-crossing points
-        * Maintains spectral ratios
-        * Enables meaningful band comparisons
-   
-   c) Spatial Processing:
-      - Square padding for consistent dimensions
-      - Bilinear resizing to 512x512
-      - Maintains aspect ratio
-
-3. Memory Management:
-   - Efficient caching system
-   - Worker process optimization
-   - GPU memory considerations
-   - Batch size management
-
-Implementation Details:
----------------------
-1. Dataset Class:
-   - TIFF file validation
-   - Band selection and extraction
-   - Normalization pipeline
-   - Caching mechanism
-   - Error handling
-
-2. DataLoader Configuration:
-   - Worker process management
-   - Prefetch optimization
-   - Memory pinning
-   - Batch size control
-   - Shuffle behavior:
-     * Deterministic shuffling for reproducibility
-     * Seed-based randomization
-     * Epoch-level shuffling
-     * Batch-level consistency
-     * Cross-worker synchronization
-
-3. Validation and Testing:
-   - File format verification
-   - Band count validation
-   - Data type checking
-   - Memory usage monitoring
-   - Worker behavior testing
-   - Channel independence testing:
-     * Rationale:
-       - Ensures spectral band independence
-       - Validates normalization effectiveness
-       - Verifies preprocessing pipeline
-       - Maintains physical interpretability
-     * Implementation:
-       - Per-band statistical analysis
-       - Cross-band correlation testing
-       - Spectral signature preservation
-       - Normalization consistency checks
-
-Known Limitations:
+USAGE:
 ----------------
-1. Memory Usage:
-   - Caching can increase memory footprint
-   - Large datasets require careful management
-   - Worker processes need monitoring
+python -c "from multispectral_dataloader import create_multispectral_dataloader; \
+    dl=create_multispectral_dataloader(data_root='path/to/tiffs', batch_size=4, num_workers=0)"
 
-2. Performance:
-   - TIFF loading can be slow
-   - Worker overhead for small datasets
-   - Cache invalidation complexity
-
-3. Data Requirements:
-   - Minimum 55 bands required
-   - Specific band indices needed
-   - Healthy leaf samples only
-
-Scientific Contributions and Future Work:
--------------------------------------
-1. Spectral Analysis:
-   - Develop novel spectral normalization methods
-   - Investigate band correlation patterns
-   - Study spectral signature preservation
-   - Explore adaptive normalization strategies
-
-2. Data Quality:
-   - Design spectral quality metrics
-   - Develop band selection algorithms
-   - Create spectral validation protocols
-   - Study preprocessing impact
-
-3. Methodological Advances:
-   - Propose new testing frameworks
-   - Develop spectral benchmarking
-   - Create validation standards
-   - Design evaluation metrics
-
-Usage Notes:
-1. The dataloader takes any TIFF file with at least 55 bands
-2. Uses specific bands (9, 18, 32, 42, 55) for optimal vegetation analysis
-3. Caching is enabled by default for small datasets
-4. For local testing:
-   - Set num_workers=0
-   - Set prefetch_factor=None
-   - Set persistent_workers=False
-5. For GPU training:
-   - Enable prefetch_factor (default=2)
-   - Enable persistent_workers (default=True)
-   - Set appropriate num_workers based on system
-6. Tests use relaxed tolerances (rtol=1e-2, atol=1e-2) for floating-point imprecision
-7. The test_specific_band_selection test uses the exact file as the dataloader for index 0
-
-Example:
-    ```python
-    # For local testing
-    dataloader = create_multispectral_dataloader(
-        data_root="path/to/tiffs",
-        batch_size=4,
-        num_workers=0,
-        prefetch_factor=None,
-        persistent_workers=False
-    )
-
-    # For GPU training
-    dataloader = create_multispectral_dataloader(
-        data_root="path/to/tiffs",
-        batch_size=4,
-        num_workers=4,
-        prefetch_factor=2,
-        persistent_workers=True
-    )
-    
-    # Batch structure:
-    # batch["pixel_values"]: tensor of shape (B, 5, 512, 512) normalized to [-1, 1]
-    # batch["mask"]: tensor of shape (B, 1, 512, 512) if return_mask=True
-    # batch["prompts"]: list of prompt strings for the batch
-    ```
+Features:
+------------------
+- Band selection → NaN/mask handling → per-band normalization → pad → resize
+- Returns dict batches with pixel_values, optional mask, and prompts (DreamBooth)
+- Efficient caching; flexible worker/prefetch settings
+- Deterministic behavior for testing; configurable for GPU training
+- Preserves spectral relationships via per-band normalization
+- Requires ≥55 bands to extract required indices
 """
 
 import os

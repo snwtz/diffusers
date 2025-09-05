@@ -1,23 +1,21 @@
 """
-Simple CLI-based inference for DreamBooth Multispectral Model
+DreamBooth Inference for Multispectral SD3
+==========================================
 
-This script provides a simple command-line interface for generating images
-from a trained DreamBooth multispectral model, similar to the original DreamBooth approach.
+This script provides a CLI for generating images from a trained DreamBooth
+multispectral model by assembling an SD3 pipeline with the multispectral VAE.
 
-Usage:
-    python inference_dreambooth_multispectral.py \
-        --model_path "path/to/trained/model" \
-        --prompt "sks leaf" \
-        --output_dir "output_images"
+USAGE:
+------
+python examples/dreambooth/inference_dreambooth_multispectral.py \
+    --model_path /path/to/trained/model \
+    --prompt "sks leaf" \
+    --num_images 4 --guidance_scale 7.5 --num_inference_steps 50 --seed 42
 
-
---guidance_scale: Controls how strongly the prompt influences the image. Default is 7.5.
-Higher values = more prompt adherence, lower = more creative.
---num_inference_steps: Number of denoising steps. Default is 50.
-Higher = better quality, slower inference.
---seed: For reproducibility. Set a value to get the same images each run.
---prompt: You can change the prompt to test different concepts.
---use_best_model: If you want to use the best model checkpoint (if available) instead of the final model.
+Design Summary:
+---------------
+- Components: transformer, multispectral VAE (float32), text encoders, tokenizers, scheduler
+- Outputs: default RGB (pseudo-RGB from 5-channel), optional raw 5-channel saves and band plots
 """
 
 import argparse
@@ -382,9 +380,9 @@ def main():
 
     # Warn if running on CPU or float32
     if device == "cpu":
-        print("[WARNING] Running on CPU! This will be extremely slow. Check your CUDA setup.")
+        print("[WARNING] Running on CPU! Check CUDA setup.")
     if next(pipeline.transformer.parameters()).dtype == torch.float32 and device == "cuda":
-        print("[WARNING] Running on CUDA but using float32. Consider using float16 for better performance.")
+        print("[WARNING] Running on CUDA but using float32. Use float16 for better performance.")
 
     # Set generator for reproducibility
     generator = None

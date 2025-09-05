@@ -1,42 +1,20 @@
 """
 DreamBooth Multispectral Training Logger
+=======================================
 
-This module provides comprehensive logging functionality for the DreamBooth multispectral training process.
-It captures key metrics and training behavior in both compressed text format and structured JSON for analysis.
+Provides compact, human-readable training logs with optional Weights & Biases logging
+for DreamBooth multispectral training.
+
+USAGE:
+------
+from dreambooth_logger import create_dreambooth_logger in train_dreambooth_sd3_multispectral.py
 
 Features:
-- Epoch-by-epoch training metrics
-- Spectral fidelity monitoring (MSE, SSIM, SAM)
-- Validation image generation
-- System performance tracking
-- Compressed log format for easy parsing
-
-1. TRAINING MONITORING:
-   - Tracks training loss and learning rate
-   - Monitors gradient norms for optimization stability
-   - Provides step-by-step progress tracking
-
-2. SPECTRAL FIDELITY MONITORING:
-   - Per-channel MSE (Mean Squared Error)
-   - Per-channel SSIM (Structural Similarity Index)
-   - SAM (Spectral Angle Mapper) for spectral signature preservation
-   - Detailed spectral summaries every 100 steps
-
-3. VALIDATION AND VISUALIZATION:
-   - Generated image quality assessment
-   - Progress tracking through training epochs
-   - Basic validation metrics logging
-
-4. SYSTEM PERFORMANCE:
-   - Memory usage tracking
-   - Training efficiency monitoring
-   - Error and warning logging
-
-DESIGN RATIONALE:
------------------
-The logger employs a dual-format approach (text + JSON) to balance human readability
-with machine-processable data. This design supports both real-time monitoring during
-training and comprehensive post-hoc analysis.
+---------
+- Step/epoch metrics: loss, learning rate, gradient norm
+- Spectral monitoring: per-band MSE/SSIM, global SAM, periodic summaries
+- Range monitoring: per-band and overall out-of-bounds analysis
+- Validation image saving and brief validation summaries
 """
 
 import os
@@ -459,7 +437,7 @@ Note: This file is overwritten for each training run to reduce clutter
                 summary += f"  LOW: Minimal out-of-bounds rate - VAE performing well\n"
                 
             # Trend analysis recommendation
-            summary += f"  📊 Monitor trend: Check if rate increases over time\n"
+            summary += f"  Monitor trend: Check if rate increases over time\n"
                 
             summary += f"{'='*50}\n"
             

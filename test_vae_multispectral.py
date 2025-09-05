@@ -1,37 +1,26 @@
 """
-Test script for evaluating VAE reconstruction fidelity across spectral bands.
+Tests for Multispectral VAE (Adapter)
+=====================================
 
-This script tests the AutoencoderKLMultispectralAdapter's ability to:
-1. Faithfully reconstruct each spectral band independently
-2. Use spectral attention for band selection
-3. Properly handle adapter layers
-4. Compute and apply SAM loss
+Evaluates `AutoencoderKLMultispectralAdapter` reconstruction fidelity and
+internal invariants: adapters, spectral attention, and SAM loss.
 
-Key Features:
-- Mean Squared Error (MSE) per band
-- Root Mean Squared Error (RMSE) per band
-- Spectral attention weights
-- SAM loss values
-- Visual comparison of original vs reconstructed bands
+USAGE:
+------
+pytest test_vae_multispectral.py \
+    --data-dir "/path/to/tiffs" \
+    --vae-path "/path/to/vae" \
+    --adapter-placement both \
+    --use-spectral-attention \
+    --use-sam-loss -v
 
-Spectral Bands:
-- Band 9 (474.73nm): Blue - captures chlorophyll absorption
-- Band 18 (538.71nm): Green - reflects well in healthy vegetation
-- Band 32 (650.665nm): Red - sensitive to chlorophyll content
-- Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-- Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
-
-The test passes a single multispectral image through the VAE (encode + decode). 
-High errors on non-RGB bands means spectral info is lost in latent representation. 
-
-Usage:
-    pytest test_vae_multispectral.py \
-        --data-dir "/path/to/multispectral/tiffs" \
-        --vae-path "/path/to/vae/model" \
-        --adapter-placement "both" \
-        --use-spectral-attention \
-        --use-sam-loss \
-        -v
+Test Coverage:
+--------------
+- Adapter structure and freezing (5→3 input, 3→5 output)
+- Attention availability and weight ranges [0, 1]
+- Loss components (MSE, per-band MSE, optional SAM)
+- Roundtrip (encode→decode) fidelity with band-wise MSE/RMSE
+- Sanity constraints on MSE thresholds and RGB vs. non‑RGB parity
 """
 
 import os

@@ -1,30 +1,30 @@
 """
 Minimal Multispectral VAE Benchmark
+===================================
 
-This is a bare-bones implementation that adds only the absolutely necessary
-components to process 5-channel multispectral data using the original SD3 VAE.
-No sophisticated features - just basic 5->3->5  basic 1x1 convs for channel conversion.
+Bare‑bones 5→3→5 channel adapters on top of the original SD3 VAE for baseline
+comparison against the full multispectral adapter.
 
-Baseline comparison for the more sophisticated multispectral adapter.
+USAGE:
+------
+from diffusers.models.autoencoders.autoencoder_ms_benchmark import AutoencoderMSBenchmark
+model = AutoencoderMSBenchmark.from_pretrained("stabilityai/stable-diffusion-3-medium", subfolder="vae")
 
-Required Training Interface Methods
-- freeze_backbone() - Freezes backbone, unfreezes adapters
-- get_trainable_params() - Returns only adapter parameters
-- ompute_losses() - Minimal MSE loss with mask support
+Training Interface (compatibility):
+-----------------------------------
+- freeze_backbone(): freeze backbone, unfreeze adapters
+- get_trainable_params(): return adapter parameters only
+- compute_losses(): minimal MSE (with mask support), per‑channel MSE, mask stats
 
-Configuration Attributes
-- All expected config parameters (adapter_placement, use_spectral_attention, etc.)
-- Compatible from_pretrained() accepting same parameters as sophisticated version
-- save_pretrained() method for checkpointing
+Configuration:
+--------------
+- Accepts same key arguments as the full adapter (adapter_placement, use_spectral_attention, use_sam_loss, …)
+- save_pretrained() for checkpointing; from_pretrained() mirrors SD3 VAE
 
-Training Script Integration
-- Updated import to use benchmark model: AutoencoderMSBenchmark as AutoencoderKLMultispectralAdapter
-- forward() method supports mask parameter and returns (reconstruction, losses) in training mode
-
-Fake Features for Compatibility
-- global_scale parameter in adapters (for scale logging)
-- FakeAttention class with get_band_importance() method
-- Placeholder monitoring info to avoid training script errors
+Notes:
+------
+- No attention or SAM by default (can add fake attention for compatibility)
+- Intended as a simple baseline for experiments
 """
 
 from typing import Dict, Optional, Tuple, Union

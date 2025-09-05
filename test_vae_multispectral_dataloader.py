@@ -1,67 +1,23 @@
 """
-Test script for the VAE multispectral dataloader.
+Tests for VAE Multispectral Dataloader
+======================================
 
-This script tests the key functionality of the VAEMultispectralDataset and related classes,
-including data loading, normalization, validation, error handling, and background masking.
+Validates `VAEMultispectralDataset` and loader factory used for VAE pretraining:
+band selection, normalization, mask handling, caching, and SD3 compatibility.
 
-src of test image files: https://github.com/cogsys-tuebingen/deephs_fruit?tab=readme-ov-file
+USAGE:
+------
+pytest test_vae_multispectral_dataloader.py --data-dir "/path/to/tiffs" -v
 
-Test Design Decisions:
-
-1. Data Testing:
-   - Uses multispectral TIFF files with 5 or more bands
-   - Takes first predefined bands for processing
-   - Maintains reproducibility by using fixed seed for random selection
-   - Tests background masking from NaN values
-
-2. Error Handling Tests:
-   - Non-existent file lists are tested
-   - Invalid band counts are tested
-   - Empty file lists are tested
-   - NaN handling is verified
-
-3. Caching Tests:
-   - Performance is measured using time.time()
-   - Data consistency is verified using torch.allclose()
-   - Cache behavior is tested with controlled data access patterns
-   - Mask caching is verified
-
-4. SD3 Compatibility:
-   - Input shape tests verify 5-channel, 512x512 requirements
-   - Pixel range tests ensure [-1, 1] normalization for VAE
-   - Channel independence is verified for normalization
-   - Background masking is preserved
-
-5. Performance Tests:
-   - Worker behavior is tested for consistency
-   - Local testing configuration:
-     * num_workers=0
-     * prefetch_factor=None
-     * persistent_workers=False
-   - Memory usage is monitored
-   - Mask handling performance is verified
-
-6. Tolerance:
-   - Tests use relaxed tolerances (rtol=1e-2, atol=1e-2) for floating-point imprecision
-   - NaN values are preserved in masked regions
-
-7. Band Selection Test:
-   - The test_specific_band_selection test uses the exact file as the dataloader for index 0
-   - Background masking is verified in band selection
-
-8. Background Masking Tests:
-   - NaN values are properly converted to binary masks
-   - Masks are correctly applied during normalization
-   - Background regions are properly handled
-   - Mask shape and type are verified
-
-Usage:
-    pytest test_vae_multispectral_dataloader.py --data-dir "C:\\Users\\NOcsPS-440g\\Desktop\\Beispiel Dateien\\Ausgeschnittene Bilder" -v
-
-Note:
-    For local testing, worker-intensive features are disabled to ensure
-    reliable test execution. These features should be enabled when running
-    on GPU hardware for actual training.
+Test Coverage:
+--------------
+- Dataset init and band count validation
+- Per-band normalization to [-1, 1] with NaN-aware masking
+- Input shape (5, 512, 512), dtype float32, channel independence checks
+- Caching correctness and basic performance
+- DataLoader creation and worker behavior
+- Train/val split handling; background mask properties
+- Deterministic file order when shuffle=False
 """
 
 import os
@@ -102,7 +58,7 @@ def get_test_images(data_dir, num_images=2):
     """Select a subset of images for testing."""
     all_files = sorted(Path(data_dir).glob('*.tiff'))
 
-    # Adjust num_images if we have fewer files
+    # Adjust num_images if fewer files
     num_images = min(num_images, len(all_files))
 
     # Randomly select images
@@ -325,7 +281,7 @@ def test_train_val_separation(data_dir, test_images, file_lists):
     train_batch, train_masks = next(iter(train_loader))
     assert train_batch.shape[0] == 2  # batch_size
 
-    # Verify val loader is empty (since we created an empty val list)
+    # Verify val loader is empty (since empty val list was created)
     assert len(list(val_loader)) == 0
 
 def test_background_masking(data_dir, test_images, file_lists):

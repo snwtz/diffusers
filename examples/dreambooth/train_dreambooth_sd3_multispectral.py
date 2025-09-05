@@ -1,20 +1,10 @@
 """
-DreamBooth Training Script for Stable Diffusion 3 with Multispectral Support
+DreamBooth Training for Multispectral SD3
+=========================================
 
-This script implements the core training workflow for adapting DreamBooth to multispectral
-image generation, a central component of synthetic multispectral plant tissue generation.
-It extends SD3's capabilities to handle 5-channel spectral data while maintaining
-compatibility with the original model's latent space.
-
-IMPORTANT: This script assumes the multispectral VAE has been pretrained and frozen.
-Only the SD3 components are trained during DreamBooth fine-tuning.
-
-CHANNEL CONFIGURATION:
-- Input: 5-channel multispectral data (bands 9, 18, 32, 42, 55)
-- VAE Adapter: 5-in/5-out (adapter_in_channels/adapter_out_channels)
-- VAE Backbone: 3-in/3-out (backbone_in_channels/backbone_out_channels)
-- VAE Output: 16 latent channels (matching SD3 transformer's default expectation)
-- Transformer Input: 16 latent channels (SD3's default in_channels)
+This script fine-tunes Stable Diffusion 3 via DreamBooth using a pretrained, frozen
+multispectral VAE (5→3→5) to preserve 5-channel spectral signatures while learning
+concept-specific generation.
 
 Identical Core Logic with Original DreamBooth:
 Training loop structure: Matches original exactly
@@ -28,124 +18,32 @@ VAE: Multispectral VAE instead of standard AutoencoderKL
 Input processing: 5-channel instead of 3-channel RGB
 Validation: Spectral-aware logging
 
-✅ Missing Elements Check:
-All critical elements from the original script are present:
-Complete argument parsing
-Model loading and setup
-Optimizer and scheduler configuration
-Training loop with all steps
-Checkpointing and resuming
-Validation and logging
-Model saving and final inference
+USAGE:
+------
+python examples/dreambooth/train_dreambooth_sd3_multispectral.py \
+    --pretrained_model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
+    --vae_path /path/to/ms_vae \
+    --instance_data_dir /path/to/multispectral/tiffs \
+    --output_dir /path/to/save/model \
+    --instance_prompt "sks leaf" \
+    --num_train_epochs 50 --train_batch_size 2 --learning_rate 1e-4 --mixed_precision fp16
 
-
-Module Purpose and Scientific Context:
------------------------------------
-1. Research Objective:
-   - Adapt DreamBooth for multispectral concept learning
-   - Enable synthetic generation of plant tissue spectral signatures
-   - Maintain spectral fidelity while leveraging SD3's generative capabilities
-   - Support scientific analysis of plant health through spectral signatures
-
-2. Technical Foundation:
-   - Built on pretrained Stable Diffusion 3
-   - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectralAdapter)
-   - Integrates spectral attention mechanism (TODO: implement)
-   - Implements spectral-aware loss functions (TODO: implement)
-
-3. Scientific/Biological Relevance:
-   The training pipeline processes 5 carefully selected bands:
-   - Band 9 (474.73nm): Blue - captures chlorophyll absorption
-   - Band 18 (538.71nm): Green - reflects well in healthy vegetation
-   - Band 32 (650.665nm): Red - sensitive to chlorophyll content
-   - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
-   - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
-
-   Band Selection Rationale:
-   - Optimized for plant health monitoring
-   - Covers key physiological indicators
-   - Enables stress detection
-   - Supports disease identification
-
-Implementation Decisions:
-----------------------
-1. Parameter-Efficient Design:
-   - Adapter-based approach preferred over full retraining
-   - Frozen VAE preserves SD3 compatibility
-   - Minimal trainable parameters
-   - Enables training with limited data
-
-2. Loss Function Design:
-   - Standard DreamBooth loss (currently implemented)
-   - Prior preservation: Retains concept learning
-
-3. Latent Space Handling:
-   - Expects 16 latent channels (SD3's default, beneficial for multispectral data)
-   - Maintains generative capabilities
-   - Preserves spectral information with increased capacity
-
-Data Handling:
-------------
-1. Multispectral Dataloader:
-   - Uses create_multispectral_dataloader() for 5-channel TIFF input
-   - Implements efficient caching and prefetching
-   - Supports multiprocessing for data loading
-   - Validates channel compatibility via validate_dataloader_output()
-   - Returns dict with "pixel_values" and "mask" (mask available for future masked loss)
-
-2. Data Preprocessing:
-   - Per-channel normalization to [-1, 1] range
-   - Spectral signature preservation
-   - Memory-efficient loading
-   - Band selection and validation
+Data Flow Summary:
+------------------
+- Input: 5-channel TIFFs (normalized to [-1, 1]) via custom dataloader
+- Model: Frozen multispectral VAE encodes/decodes; SD3 transformer trains
+- Output: Concept-preserving image generations with spectral fidelity
+- Loss: FlowMatch objective (no prior preservation)
 
 Training Strategy:
----------------
-1. VAE Integration:
-   - Pretrained and frozen multispectral VAE
-   - Expects 16 latent channels (SD3's default, optimal for multispectral data)
+------------------
+- Mixed precision via Accelerate; gradient accumulation and clipping
+- LR scheduling, EMA, checkpointing, resume
+- Latent channels: 16 (SD3 default) for spectral capacity
 
-
-2. Loss Functions:
-   - Standard DreamBooth loss (currently implemented)
-   - Prior preservation loss
-
-3. Optimization:
-   - Gradient accumulation for memory efficiency
-   - Learning rate scheduling with warmup
-   - Early stopping on validation plateau
-   - Gradient clipping for stability
-
-
-
-Text Encoder Handling:
--------------------
-1. Multi-Encoder Architecture:
-   - CLIP: Visual-semantic alignment
-   - T5: Detailed concept understanding
-   - Concatenated embeddings for rich representation
-
-
-2. Encoding Functions:
-   - _encode_prompt_with_clip(): Visual-semantic features
-   - _encode_prompt_with_t5(): Detailed concept understanding
-   - encode_prompt(): Combined representation
-   - Support for per-image embeddings
-
-Logging and Evaluation:
---------------------
-1. Validation Pipeline:
-   - log_validation() for model assessment
-   - Concept preservation evaluation
-
-2. Integration:
-   - Weights & Biases for experiment tracking
-   - Spectral visualization tools
-   - Loss term tracking
-
-LOGGING AND MONITORING:
+Logging and Monitoring:
 -----------------------
-
+- DreamBooth logger from dreambooth_logger.py
 - Training loss and learning rate
 - Gradient norm and training stability
 - Per-band MSE and SSIM (5 spectral bands)
@@ -153,136 +51,9 @@ LOGGING AND MONITORING:
 - VAE reconstruction quality
 - Output range statistics
 
-
-Open Research Questions:
-----------------------
-1. Text Encoder Adaptation:
-   a) Concept Learning:
-      - How does the text encoder handle multispectral concepts?
-      - Can it learn spectral signatures from text descriptions?
-      - How does it map between spectral and semantic spaces?
-   
-   b) Prior Preservation:
-      - Should prior preservation loss be modified for spectral data?
-      - How to balance spectral fidelity with concept preservation?
-      - What is the optimal prompt engineering for spectral features?
-
-2. Training Dynamics:
-   a) Learning Rate:
-      - Optimal learning rate for 5-channel inputs?
-      - How does spectral data affect gradient flow?
-      - Should learning rates differ for spectral vs. spatial features?
-   
-   b) Latent Space:
-      - How does the latent space distribution change?
-      - What spectral information is preserved/compressed?
-      - How to visualize and interpret spectral latent codes?
-
-3. Architecture Design:
-   a) Channel Processing:
-      - Should we use channel-specific attention?
-      - How does channel ordering affect performance?
-      - What is the optimal adapter architecture?
-   
-   b) Spectral Fidelity:
-      - How to measure spectral reconstruction quality?
-      - What metrics best capture spectral signature preservation?
-      - How to balance spatial vs. spectral accuracy?
-
-Thesis Discussion Points:
------------------------
-1. Methodological Contributions:
-   a) Architecture Design:
-      - Lightweight adapter approach for spectral adaptation
-      - Parameter-efficient fine-tuning strategy
-      
-   
-   b) Training Strategy:
-      - Concept preservation
-
-2. Scientific Implications:
-   a) Plant Health Analysis:
-      - Spectral signature preservation
-      - Stress detection capabilities
-      - Disease identification potential
-   
-   b) Agricultural Applications:
-      - Early stress detection
-      - Disease monitoring
-
-3. Limitations and Future Work:
-   a) Technical Limitations:
-      - Memory constraints
-      - Training stability
-      - Spectral fidelity trade-offs
-      - Computational requirements
-   
-   b) Research Directions:
-      - Novel spectral attention mechanisms
-      - Advanced loss functions
-      - Improved training strategies
-      - Enhanced visualization tools
-
-4. Broader Impact:
-   a) Agricultural Technology:
-      - Precision agriculture
-      - Automated monitoring
-      - Early intervention
-      - Resource optimization
-   
-   b) Scientific Research:
-      - Plant physiology studies
-      - Stress response analysis
-      - Spectral signature research
-
-# Thesis Integration Points:
--------------------------
-1. Methodology Chapter:
-   - Parameter-efficient design rationale
-   - Band selection methodology
-
-
-2. Results Chapter:
-
-   - Concept preservation analysis
-
-
-TODOs and Future Features:
-------------------------
-1. Data Handling:
-   - [ ] Add support for reading train/val splits from .txt files
-   - [ ] Implement spectral data augmentation
-   - [ ] Add data validation pipeline
-   - [ ] Implement spectral quality checks
-
-2. Evaluation:
-   - [ ] Add comprehensive unit tests
-   - [ ] Add visualization tools
-   - [ ] Create evaluation pipeline
-
-
 References:
 - DreamBooth paper: https://arxiv.org/abs/2208.12242
 - SD3 paper: https://arxiv.org/pdf/2403.03206
-
-Usage:
-    # Train the model:
-    python train_dreambooth_sd3_multispectral.py \
-        --pretrained_model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
-        --instance_data_dir /path/to/multispectral/tiffs \
-        --output_dir /path/to/save/model \
-        --instance_prompt "sks leaf" \
-        --num_train_epochs 100 \
-        --train_batch_size 4 \
-        --learning_rate 1e-4 \
-        --mixed_precision fp16
-
-# Research questions for multispectral DreamBooth
-# 1. How does the text encoder handle multispectral concepts?
-# 2. Should we modify the prior preservation loss for multispectral data?
-# 3. Do we need to adjust the learning rate for 5-channel inputs?
-# 4. How does the latent space distribution change with 5-channel input?
-# 5. What is the optimal way to visualize multispectral training progress?
 """
 
 # Unused imports that were removed:
@@ -903,7 +674,7 @@ def parse_args(input_args=None):
         "--precondition_outputs",
         type=int,
         default=1,
-        help="Flag indicating if we are preconditioning the model outputs or not as done in EDM. This affects how "
+        help="Flag indicating if preconditioning the model outputs or not as done in EDM. This affects how "
         "model `target` is calculated.",
     )
     parser.add_argument(
@@ -1538,7 +1309,6 @@ def main(args):
                 pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
             return prompt_embeds, pooled_prompt_embeds
 
-    # For multispectral DreamBooth, we use a single prompt for all images (no custom prompts)
     # Encode the instance prompt once to avoid redundant encoding
     if not args.train_text_encoder:
         instance_prompt_hidden_states, instance_pooled_prompt_embeds = compute_text_embeddings(
@@ -1566,7 +1336,7 @@ def main(args):
         if args.with_prior_preservation:
             prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, class_pooled_prompt_embeds], dim=0)
-    # if we're optimizing the text encoder we need to tokenize and encode the batch prompts on all training steps
+    # when optimizing the text encoder, tokenize and encode the batch prompts on all training steps
     else:
         tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt)
         tokens_two = tokenize_prompt(tokenizer_two, args.instance_prompt)
@@ -1619,14 +1389,14 @@ def main(args):
             transformer, optimizer, train_dataloader, lr_scheduler
         )
 
-    # We need to recalculate our total training steps as the size of the training dataloader may have changed
+    # recalculate total training steps as the size of the training dataloader may have changed
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
+    # recalculate our number of training epochs
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
-    # We need to initialize the trackers we use, and also store our configuration
+    # initialize the used trackers, store configuration
     # The trackers initializes automatically on the main process
     if accelerator.is_main_process:
         tracker_name = "dreambooth-sd3-multispectral"
@@ -1743,7 +1513,7 @@ def main(args):
             with accelerator.accumulate(models_to_accumulate):
                 # Multispectral data: 5-channel input (bands 9, 18, 32, 42, 55) instead of 3-channel RGB
                 # FIXED: Use vae.dtype (fp32) for pixel_values, following original DreamBooth SD3 pattern
-                # This ensures VAE input is in fp32, then we convert model_input to weight_dtype after encoding
+                # This ensures VAE input is in fp32, then convert model_input to weight_dtype after encoding
                 pixel_values = batch["pixel_values"].to(dtype=vae.dtype)  # vae.dtype is fp32
                 prompts = batch["prompts"]
 
@@ -1767,7 +1537,7 @@ def main(args):
                 bsz = model_input.shape[0]
 
                 # Sample a random timestep for each image
-                # for weighting schemes where we sample timesteps non-uniformly
+                # for weighting schemes where timesteps are sampled non-uniformly
                 u = compute_density_for_timestep_sampling(
                     weighting_scheme=args.weighting_scheme,
                     batch_size=bsz,
@@ -2078,7 +1848,7 @@ def main(args):
                             checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                             checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
+                            # before new checkpoint is saved, set _most_ `checkpoints_total_limit - 1`
                             if len(checkpoints) >= args.checkpoints_total_limit:
                                 num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
                                 removing_checkpoints = checkpoints[0:num_to_remove]

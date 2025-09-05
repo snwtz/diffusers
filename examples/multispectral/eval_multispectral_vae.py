@@ -255,16 +255,11 @@ def aggregate_spectral_errors(all_errors, outdir):
 
 def compute_sam(original, reconstructed, mask=None, eps=1e-8):
     """
-    Compute Spectral Angle Mapper (SAM) between original and reconstructed images.
+    Compute SAM between original and reconstructed images.
     Computes three sets of metrics if mask is provided:
     - Foreground (mask==1): focuses on leaf fidelity
     - Background (mask==0): provides context on background reconstruction
     - Overall (no mask): global metric over entire image
-    
-    Additionally, computes per-band SAM by averaging spectral angles per band.
-    NOTE: SAM is angular, so band-wise breakdown is a bit unconventional, 
-    but here it's computed sensibly: angle between original and reconstructed 
-    vector using a one-hot band vector
     
     Args:
         original: Original multispectral image (B, 5, H, W)
@@ -275,7 +270,6 @@ def compute_sam(original, reconstructed, mask=None, eps=1e-8):
     Returns:
         Dictionary with keys 'foreground', 'background', and 'overall', each containing:
             - 'mean_angle': Mean spectral angle in radians
-            - 'per_band_angle': Per-band mean spectral angle in radians (length 5)
     """
     def sam_per_mask(m):
         # m shape: (B,1,H,W) or None
@@ -301,32 +295,6 @@ def compute_sam(original, reconstructed, mask=None, eps=1e-8):
         cos = np.clip(cos, -1, 1)
         angles = np.arccos(cos)  # (B, H*W)
         
-        # Per-band SAM: compute angle per band by considering each band's vector as 1D
-        # Here, we compute SAM per band by comparing original and reconstructed values per band
-        # Since each band is scalar, spectral angle reduces to 0 if values have same sign and magnitude
-        # Instead, we compute mean absolute difference normalized by magnitude for each band
-        per_band_angles = []
-        for band in range(5):
-            orig_band = orig_masked[:, band]  # (B,H,W)
-            recon_band = recon_masked[:, band]  # (B,H,W)
-            # Flatten spatial dims
-            orig_b_flat = orig_band.reshape(B, -1)
-            recon_b_flat = recon_band.reshape(B, -1)
-            dot_b = orig_b_flat * recon_b_flat  # (B,H*W)
-            norm_orig_b = np.abs(orig_b_flat)
-            norm_recon_b = np.abs(recon_b_flat)
-            cos_b = dot_b / (norm_orig_b * norm_recon_b + eps)
-            cos_b = np.clip(cos_b, -1, 1)
-            angles_b = np.arccos(cos_b)  # (B,H*W)
-            # Mask out zero norm pixels to avoid invalid angles
-            valid_mask_b = (norm_orig_b > eps) & (norm_recon_b > eps)
-            if np.any(valid_mask_b):
-                mean_angle_b = np.nanmean(angles_b[valid_mask_b])
-            else:
-                mean_angle_b = 0.0
-            per_band_angles.append(mean_angle_b)
-        per_band_angles = np.array(per_band_angles)
-        
         if m is not None:
             mask_flat = m.reshape(B, -1)  # (B,H*W)
             valid_pixels = mask_flat.sum(axis=1) > 0  # (B,)
@@ -337,7 +305,7 @@ def compute_sam(original, reconstructed, mask=None, eps=1e-8):
         else:
             mean_angle = np.nanmean(angles)
         
-        return {'mean_angle': mean_angle, 'per_band_angle': per_band_angles}
+        return {'mean_angle': mean_angle}
     
     results = {}
     # Foreground metrics (mask==1)
@@ -351,15 +319,11 @@ def compute_sam(original, reconstructed, mask=None, eps=1e-8):
         results['background'] = None
     # Overall metrics (no mask)
     results['overall'] = sam_per_mask(None)
-    # Add per-band angles for each region
-    results['per_band_angle_foreground'] = results['foreground']['per_band_angle'].tolist() if results['foreground'] is not None else None
-    results['per_band_angle_background'] = results['background']['per_band_angle'].tolist() if results['background'] is not None else None
-    results['per_band_angle_overall'] = results['overall']['per_band_angle'].tolist()
     return results
 
 def compute_bandwise_mse(original, reconstructed, mask=None, eps=1e-8):
     """
-    Compute per-band Mean Squared Error (MSE) between original and reconstructed images.
+    Compute per-band MSE between original and reconstructed images.
     Computes three sets of metrics if mask is provided:
     - Foreground (mask==1): focuses on leaf fidelity
     - Background (mask==0): provides context on background reconstruction
@@ -406,7 +370,7 @@ def compute_bandwise_mse(original, reconstructed, mask=None, eps=1e-8):
 
 def compute_ssim(original, reconstructed, mask=None):
     """
-    Compute Structural Similarity Index (SSIM) between original and reconstructed images.
+    Compute SSIM between original and reconstructed images.
     Computes three sets of metrics if mask is provided:
     - Foreground (mask==1): focuses on leaf fidelity
     - Background (mask==0): provides context on background reconstruction

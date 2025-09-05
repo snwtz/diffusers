@@ -1,54 +1,21 @@
 """
-Test script for the multispectral dataloader.
+Tests for Multispectral DreamBooth Dataloader
+============================================
 
-This script tests the key functionality of the MultispectralDataset and related classes,
-including data loading, normalization, validation, and error handling.
+Validates core functionality of `MultispectralDataset` and its DataLoader:
+data loading, normalization, masks, batching, and error handling.
 
-Test Design Decisions:
+USAGE:
+------
+pytest test_multispectral_dataloader.py --data-dir "/path/to/tiffs" -v
 
-1. Data Testing:
-   - Uses multispectral TIFF files with 5 or more bands
-   - Takes first predefined bands for processing
-   - Maintains reproducibility by using fixed seed for random selection
-
-2. Error Handling Tests:
-   - Non-existent directories are tested
-   - Invalid band counts are tested
-   - Empty directories are tested
-
-3. Caching Tests:
-   - Performance is measured using time.time()
-   - Data consistency is verified using torch.allclose()
-   - Cache behavior is tested with controlled data access patterns
-
-4. SD3 Compatibility:
-   - Input shape tests verify 5-channel, 512x512 requirements
-   - Pixel range tests ensure [-1, 1] normalization for VAE
-   - Channel independence is verified for normalization
-
-5. Performance Tests:
-   - Worker behavior is tested for consistency
-   - Local testing configuration:
-     * num_workers=0
-     * prefetch_factor=None
-     * persistent_workers=False
-   - Memory usage is monitored
-   - TODO: GPU-specific features (prefetching, persistent workers) are disabled
-     for local testing but should be enabled for GPU training
-
-6. Tolerance:
-   - Tests use relaxed tolerances (rtol=1e-2, atol=1e-2) for floating-point imprecision
-
-7. Band Selection Test:
-   - The test_specific_band_selection test uses the exact file as the dataloader for index 0
-
-Usage:
-    pytest test_multispectral_dataloader.py --data-dir "/Users/zina/Desktop/LDM4HSI/Project Files/Dataloader test/Output Testset Mango" -v
-
-Note:
-    For local testing, worker-intensive features are disabled to ensure
-    reliable test execution. These features should be enabled when running
-    on GPU hardware for actual training.
+Test Coverage:
+--------------
+- SD3 compatibility: (5, 512, 512) tensors, float32, [-1, 1]
+- Batch structure for DreamBooth (dict with pixel_values, mask, prompts)
+- DataLoader batching/stacking correctness
+- Error handling for invalid inputs
+- Determinism and basic performance (local test config)
 """
 
 import os
@@ -87,7 +54,7 @@ def get_test_images(data_dir, num_images=2):
     """Select a subset of images for testing."""
     all_files = sorted(Path(data_dir).glob('*.tiff'))
     
-    # Adjust num_images if we have fewer files
+    # Adjust num_images if fewer files
     num_images = min(num_images, len(all_files))
     
     # Randomly select images

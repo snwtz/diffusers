@@ -3,8 +3,7 @@ Multispectral VAE Adapter for Stable Diffusion 3: Core Methodological Contributi
 ================================================================================
 
 This module implements a lightweight adapter-based multispectral autoencoder architecture 
-built on a pretrained SD3 backbone.
-The design enables efficient processing of 5-channel spectral plant imagery while maintaining
+built on a pretrained SD3 backbone. The design enables efficient processing of 5-channel spectral plant imagery while maintaining
 compatibility with SD3's latent space requirements.
 
 It handles the neural network architecture and forward pass
@@ -28,7 +27,7 @@ CONFIGURATION:
 - Output: Reconstructed 5-channel images with spectral fidelity
 - Adapters: Lightweight layers bridging 5→3→5 channels
 - Backbone: Frozen SD3 VAE for parameter efficiency
-- Loss: Multi-objective (MSE + SAM) with masked computation
+- Loss: Multi-objective with masked computation
 
 Features:
 - Spectral attention mechanism for band importance
@@ -37,23 +36,7 @@ Features:
 - SD3 pipeline compatibility
 - Scale convergence monitoring
 - Reference signature guidance
-
-LOGGING AND MONITORING:
------------------------
-- Scale convergence monitoring (global scale parameter)
-- Per-band importance weights (spectral attention)
-- Masked loss statistics (coverage, valid pixels)
-- Per-channel MSE and global SAM loss
-- Numerical stability (NaN/Inf detection)
-- Parameter count
-
-Data Flow Summary:
-------------------
-- Input: Preprocessed 5-channel plant images (from vae_multispectral_dataloader.py)
-- Model: Adapters map 5-channel input to 3-channel SD3 backbone, then back to 5-channel output
-- Output: Reconstructed 5-channel image with nonlinear transformations applied (unconstrained range)
-- Loss: Multi-objective (MSE + SAM), with pure leaf-focused masked loss computation
-- Output Format: Compatible with both training (raw tensor) and downstream pipelines (DecoderOutput)
+- Output Format compatible with both training (raw tensor) and downstream pipelines (DecoderOutput)
 """
 
 # ------------------------------------------------------------
@@ -82,9 +65,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import GroupNorm
 import logging
-import numpy as np # Added for scale monitoring
+import numpy as np
 
-# Set up logger for this module
+# Set up logger 
 logger = logging.getLogger(__name__)
 from ...configuration_utils import ConfigMixin, register_to_config
 from ...utils.accelerate_utils import apply_forward_hook
@@ -99,7 +82,7 @@ class SpectralAttention(nn.Module):
     during the adaptation process. It helps the model focus on the most
     relevant bands for the task while maintaining spectral relationships.
     
-    IMPORTANT: This module applies nonlinear transformations:
+    This module applies nonlinear transformations:
     - 1x1 convolution (linear)
     - Sigmoid activation (nonlinear: maps to [0,1] range)
     - Element-wise multiplication with input (nonlinear due to sigmoid weights)
@@ -110,10 +93,9 @@ class SpectralAttention(nn.Module):
     def __init__(self, num_bands: int):
         super().__init__()
         # 1x1 convolution learns per-band importance weights
-        # Sigmoid ensures weights are in [0,1] range for interpretable scaling
         self.attention = nn.Sequential(
             nn.Conv2d(num_bands, num_bands, kernel_size=1),  # Linear transformation
-            nn.Sigmoid()  # Nonlinear activation: ensures weights are between 0 and 1
+            nn.Sigmoid()  # Nonlinear activation
         )
 
         self.wavelengths = {
@@ -138,7 +120,8 @@ class SpectralAttention(nn.Module):
         which bands the model finds most important for the task.
         """
         with torch.no_grad():
-            # Create a dummy input to get attention weights, on the same device as the module
+            # Create a dummy input to get attention weights, on the same device as the module. All-1 tensor allows probing the attention module to read 
+            # current per-band importance without requiring real data, and guarantees correct shape/device
             device = next(self.parameters()).device
             dummy_input = torch.ones(1, len(self.wavelengths), 1, 1, device=device)
             attention_weights = self.attention(dummy_input).squeeze()
@@ -183,7 +166,7 @@ class SpectralAdapter(nn.Module):
         self.norm1 = GroupNorm(8, 32)
         self.norm2 = GroupNorm(8, 32)
 
-        # SiLU activation (also known as Swish) - nonlinear activation function
+        # SiLU activation ("Swish") - nonlinear activation function
         self.activation = nn.SiLU()
 
         #  global scale parameter monitoring
@@ -232,7 +215,7 @@ class SpectralAdapter(nn.Module):
         x = self.conv3(x)
 
         # Apply learnable linear transformation
-        # Helps align the dynamic range of output to [-1, 1] in a trainable and smooth way
+        # Helps align the dynamic range of output to [-1, 1] in a trainable, smooth way
         # Facilitates downstream consistency and spectral fidelity by allowing the model
         # to learn appropriate output magnitudes (instead of forcing via hard bounds)
 
@@ -424,7 +407,7 @@ def compute_sam_loss(original: torch.Tensor, reconstructed: torch.Tensor) -> tor
 
 # Adapter Configuration:
 # ------------------------------------------
-# This constructor registers all adapter-relevant settings for reproducibility.
+# Registers all adapter-relevant settings for reproducibility.
 # These settings are saved to config.json via save_pretrained() for model reloading.
 #
 class AutoencoderKLMultispectralAdapter(AutoencoderKL):

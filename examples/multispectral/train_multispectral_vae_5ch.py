@@ -39,21 +39,11 @@ Data Flow Summary:
 - Input: Preprocessed 5-channel plant images and masks (from vae_multispectral_dataloader.py)
 - Model: Adapters map 5-channel input to 3-channel HF's AutoencoderKL backbone, then back to 5-channel output
 - Output: Reconstructed 5-channel image, with losses computed for both spatial and spectral fidelity
-- Loss: Multi-objective (MSE + SAM), with mask-aware background handling
+- Loss: Multi-objective, with mask-aware background handling
 - Logging: Per-epoch metrics, band importance, and SSIM for scientific analysis
 
-LOGGING AND MONITORING:
------------------------
-- Training/validation loss (total, per-channel MSE, SAM)
-- Learning rate and gradient norm
-- Per-band MSE and SSIM (5 spectral bands)
-- Spectral signature comparison with reference
-- Scale convergence monitoring
-- Output range statistics
-- Model health (memory usage, NaN detection)
-- Band importance weights (spectral attention)
-
 Training Strategy:
+------------------
 The model should naturally learn to produce outputs in the [-1, 1] range because:
 Input data is normalized to [-1, 1]
 Loss function penalizes reconstruction error

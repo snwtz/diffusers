@@ -17,10 +17,8 @@ python examples/multispectral/test_torchmetrics_sam.py \
 Features:
 - Uses torchmetrics SpectralAngleMapper as ground truth
 - Compares custom SAM implementation with torchmetrics
-- Per-band SAM analysis 
 - Leaf-focused evaluation using background masks
 - Statistical analysis of SAM differences
-- Implementation difference analysis and error reporting
 
 """
 
@@ -99,7 +97,6 @@ def evaluate_sam_metrics(model, dataloader, device, num_samples=None):
     
     # Storage for per-sample results
     sam_scores = []
-    per_band_sam_scores = []  # For comparison with your per-band implementation
     
     logger.info("Starting SAM evaluation with torchmetrics...")
     
@@ -143,7 +140,7 @@ def evaluate_sam_metrics(model, dataloader, device, num_samples=None):
             
             # Compute overall SAM using torchmetrics
             try:
-                # Torchmetrics expects data in range [0, 1], so we need to convert from [-1, 1]
+                # Torchmetrics expects data in range [0, 1]
                 batch_01 = (batch + 1.0) / 2.0
                 reconstruction_01 = (reconstruction + 1.0) / 2.0
                 
@@ -173,34 +170,6 @@ def evaluate_sam_metrics(model, dataloader, device, num_samples=None):
                     sam_score = sam_metric(reconstruction_01, batch_01)
                     sam_scores.append(sam_score.item())
                 
-                # Compute per-band analysis for comparison
-                per_band_scores = []
-                for band_idx in range(batch.shape[1]):
-                    try:
-                        # Extract single band and treat as grayscale "image"
-                        band_orig = batch_01[:, band_idx:band_idx+1]  # Keep channel dim
-                        band_recon = reconstruction_01[:, band_idx:band_idx+1]
-                        
-                        if mask is not None:
-                            band_mask = mask
-                            # Apply mask
-                            masked_orig = band_orig * band_mask
-                            masked_recon = band_recon * band_mask
-                            
-                            # Only compute if there are valid pixels
-                            if (band_mask > 0.1).any():
-                                band_sam = sam_metric(masked_recon, masked_orig)
-                                per_band_scores.append(band_sam.item())
-                            else:
-                                per_band_scores.append(float('nan'))
-                        else:
-                            band_sam = sam_metric(band_recon, band_orig)
-                            per_band_scores.append(band_sam.item())
-                    except Exception as e:
-                        logger.warning(f"Per-band SAM failed for band {band_idx}: {e}")
-                        per_band_scores.append(float('nan'))
-                
-                per_band_sam_scores.append(per_band_scores)
                 
             except Exception as e:
                 logger.warning(f"SAM computation failed for batch {batch_idx}: {e}")
@@ -219,31 +188,11 @@ def evaluate_sam_metrics(model, dataloader, device, num_samples=None):
             }
         }
         
-        # Per-band statistics
-        if per_band_sam_scores:
-            per_band_array = np.array(per_band_sam_scores)
-            per_band_means = np.nanmean(per_band_array, axis=0)
-            per_band_stds = np.nanstd(per_band_array, axis=0)
-            
-            results['per_band_sam'] = {
-                'means': per_band_means.tolist(),
-                'stds': per_band_stds.tolist(),
-                'band_names': ['Blue (474.73nm)', 'Green (538.71nm)', 'Red (650.665nm)', 
-                              'Red-edge (730.635nm)', 'NIR (850.59nm)']
-            }
         
         logger.info(f"SAM Evaluation Results:")
         logger.info(f"  Overall SAM: {results['overall_sam']['mean']:.4f} ± {results['overall_sam']['std']:.4f} rad")
         logger.info(f"  Overall SAM (degrees): {results['overall_sam']['mean'] * 180/np.pi:.2f} ± {results['overall_sam']['std'] * 180/np.pi:.2f}°")
         
-        if 'per_band_sam' in results:
-            logger.info("  Per-band SAM (radians):")
-            for i, (name, mean_val, std_val) in enumerate(zip(
-                results['per_band_sam']['band_names'],
-                results['per_band_sam']['means'],
-                results['per_band_sam']['stds']
-            )):
-                logger.info(f"    {name}: {mean_val:.4f} ± {std_val:.4f}")
         
         return results
     else:
@@ -275,7 +224,7 @@ def compare_with_custom_sam(original, reconstructed, mask=None):
     # Torchmetrics SAM
     torchmetrics_sam = sam_metric(recon_01, orig_01).item()
     
-    # Custom SAM implementation (matching your training code)
+    # Custom SAM implementation (matching training code)
     def custom_sam_loss(orig, recon):
         # Normalize to unit vectors
         orig_norm = torch.nn.functional.normalize(orig, p=2, dim=1)
@@ -320,11 +269,6 @@ def main():
         args.output_dir = str(Path(args.model_dir).parent / "torchmetrics_sam_evaluation")
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Check torchmetrics availability
-    if not TORCHMETRICS_AVAILABLE:
-        logger.error("torchmetrics is not available. Install with: pip install torchmetrics")
-        return
-    
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
@@ -335,7 +279,7 @@ def main():
     # Create dataloader
     try:
         _, val_loader = create_vae_dataloaders(
-            train_list_path=args.val_file_list,  # Use val list for both (we only need val)
+            train_list_path=args.val_file_list,  # Use val list 
             val_list_path=args.val_file_list,
             batch_size=args.batch_size,
             resolution=512,
@@ -358,7 +302,7 @@ def main():
             json.dump(results, f, indent=2)
         logger.info(f"Results saved to: {results_file}")
         
-        # Compare implementations if requested
+        # Compare implementations 
         if args.compare_implementations and results:
             logger.info("\nComparing torchmetrics with custom SAM implementation...")
             
@@ -404,7 +348,7 @@ def main():
         logger.error(f"Evaluation failed: {e}")
         raise
     
-    logger.info("Evaluation completed successfully!")
+    logger.info("Evaluation completed.")
 
 if __name__ == '__main__':
     main() 
