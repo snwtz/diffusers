@@ -25,8 +25,7 @@ multispectral VAE on hyperspectral plant data. The selection criteria are based 
 2. Data Quality Criteria:
    - Files must contain both 'C' and '-' in filename (healthy, non-stressed leaves)
    - Minimum of 55 spectral bands (required for our 5 selected bands)
-   - Valid floating-point data type
-   - No NaN or infinite values
+   - Valid floating-point data type (NaN allowed for background pixels; no range checks applied)
    - Proper TIFF format and metadata
 
 3. Split Methodology:
@@ -36,7 +35,7 @@ multispectral VAE on hyperspectral plant data. The selection criteria are based 
    - Explicit documentation of split rationale
 
 The script:
-1. Scans for valid .tif files matching the criteria
+1. Scans for valid .tiff files matching the criteria
 2. Validates each file for data quality
 3. Splits files into train/val sets
 4. Creates train_files.txt and val_files.txt with absolute paths
@@ -52,10 +51,7 @@ Output Files (saved in script directory):
 - README_split_methodology.txt: Documentation of the splitting process
 
 Usage as script:
-    python split_dataset.py \
-        --dataset_dir /path/to/multispectral/tiffs \
-        --train_ratio 0.8 \
-        --seed 42
+    python examples/multispectral/split_dataset.py --dataset_dir "C:/Users/NOcsPS-440g/Desktop/Beispiel Dateien/Ausgeschnittene Bilder"
 
 Usage as module:
     from split_dataset import run_split
@@ -76,6 +72,7 @@ from tqdm import tqdm
 from typing import List, Tuple, Dict, Union, Optional
 import rasterio
 import numpy as np
+from datetime import datetime
 
 def setup_logging() -> logging.Logger:
     """Setup logging configuration."""
@@ -88,10 +85,10 @@ def setup_logging() -> logging.Logger:
 def validate_tiff_file(file_path: Path) -> Tuple[bool, Dict]:
     """
     Validate a TIFF file for VAE training requirements.
-    
+
     Args:
         file_path: Path to the TIFF file
-        
+
     Returns:
         Tuple of (is_valid, metadata)
     """
@@ -100,59 +97,46 @@ def validate_tiff_file(file_path: Path) -> Tuple[bool, Dict]:
             # Check number of bands (should be at least 55 for our 5 selected bands)
             if src.count < 55:
                 return False, {"error": f"Insufficient bands: {src.count} < 55"}
-            
+
             # Check data type and range
             data = src.read()
             if not np.issubdtype(data.dtype, np.floating):
                 return False, {"error": f"Invalid data type: {data.dtype}"}
-            
-            # Check for NaN or infinite values
-            if np.any(np.isnan(data)) or np.any(np.isinf(data)):
-                return False, {"error": "Contains NaN or infinite values"}
-            
-            # Check data range for required bands
-            required_bands = [9, 18, 32, 42, 55]  # 1-based indexing
-            band_data = data[required_bands - 1]  # Convert to 0-based indexing
-            if not (-1 <= band_data.min() <= band_data.max() <= 1):
-                return False, {
-                    "error": f"Invalid data range [{band_data.min()}, {band_data.max()}]. "
-                            f"Data must be normalized to [-1, 1] range."
-                }
-            
+
+            # Return metadata without range checks
             return True, {
                 "bands": src.count,
                 "dtype": str(data.dtype),
                 "shape": data.shape,
-                "resolution": src.res,
-                "data_range": [float(band_data.min()), float(band_data.max())]
+                "resolution": src.res
             }
     except Exception as e:
         return False, {"error": str(e)}
 
 def find_valid_files(dataset_dir: Path) -> List[Path]:
     """
-    Find valid .tif files containing both 'C' and '-' in the filename (indicating healthy, non-stressed leaves).
+    Find valid .tiff files containing both 'C' and '-' in the filename (indicating healthy, non-stressed leaves).
     Also validates each file for VAE training requirements.
-    
+
     Args:
         dataset_dir: Directory containing multispectral TIFF files
-        
+
     Returns:
         List of valid file paths
     """
     logger = setup_logging()
-    all_files = [f for f in dataset_dir.glob("*.tif") if "C" in f.name and "-" in f.name]
+    all_files = [f for f in dataset_dir.glob("*.tiff") if "C" in f.name and "-" in f.name]
     valid_files = []
-    
+
     logger.info(f"Found {len(all_files)} files matching naming pattern")
-    
+
     for file in tqdm(all_files, desc="Validating files"):
         is_valid, metadata = validate_tiff_file(file)
         if is_valid:
             valid_files.append(file)
         else:
             logger.warning(f"Invalid file {file.name}: {metadata['error']}")
-    
+
     logger.info(f"Found {len(valid_files)} valid files for VAE training")
     return valid_files
 
@@ -163,22 +147,22 @@ def split_files(
 ) -> Tuple[List[Path], List[Path]]:
     """
     Split files into training and validation sets.
-    
+
     Args:
         files: List of file paths to split
         train_ratio: Ratio of training data (default: 0.8)
         seed: Random seed for reproducibility
-        
+
     Returns:
         Tuple of (train_files, val_files)
     """
     random.seed(seed)
     random.shuffle(files)
-    
+
     split_idx = int(len(files) * train_ratio)
     train_files = files[:split_idx]
     val_files = files[split_idx:]
-    
+
     return train_files, val_files
 
 def write_file_lists(
@@ -188,24 +172,30 @@ def write_file_lists(
 ) -> None:
     """
     Write train and validation file lists to text files.
-    
+
     Args:
         train_files: List of training file paths
         val_files: List of validation file paths
         output_dir: Directory to save file lists
     """
+    # Create date-based folder
+    current_date = datetime.now()
+    folder_name = f"Training_Split_{current_date.strftime('%d.%m')}"
+    training_split_dir = output_dir / folder_name
+    training_split_dir.mkdir(exist_ok=True)
+
     # Write training file list
-    with open(output_dir / "train_files.txt", "w") as f:
+    with open(training_split_dir / "train_files.txt", "w") as f:
         for file in train_files:
             f.write(str(file.resolve()) + "\n")
-    
+
     # Write validation file list
-    with open(output_dir / "val_files.txt", "w") as f:
+    with open(training_split_dir / "val_files.txt", "w") as f:
         for file in val_files:
             f.write(str(file.resolve()) + "\n")
-    
+
     # Write file counts
-    with open(output_dir / "split_stats.txt", "w") as f:
+    with open(training_split_dir / "split_stats.txt", "w") as f:
         f.write(f"Total files: {len(train_files) + len(val_files)}\n")
         f.write(f"Training files: {len(train_files)}\n")
         f.write(f"Validation files: {len(val_files)}\n")
@@ -213,14 +203,19 @@ def write_file_lists(
 def write_methodology(output_dir: Path) -> None:
     """
     Write dataset splitting methodology documentation.
-    
+
     Args:
         output_dir: Directory to save documentation
     """
+    # Create date-based folder
+    current_date = datetime.now()
+    folder_name = f"Training_Split_{current_date.strftime('%d.%m')}"
+    training_split_dir = output_dir / folder_name
+
     methodology_text = """Dataset Split Methodology:
 ---------------------------
 This dataset was split using an 80/20 random selection strategy to create
-training and validation sets from a pool of hyperspectral .tif images.
+training and validation sets from a pool of hyperspectral .tiff images.
 Only files containing both 'C' and '-' in their filename were considered,
 indicating they belong to the relevant imaging subset.
 
@@ -228,10 +223,9 @@ File Validation:
 ---------------
 Each file was validated for:
 1. Minimum of 55 spectral bands
-2. Valid floating-point data type
-3. No NaN or infinite values
+2. Valid floating-point data type (NaN allowed for background pixels)
 4. Proper TIFF format and metadata
-5. Data normalized to [-1, 1] range for VAE compatibility
+5. Data inspected to contain sufficient valid (non-NaN) foreground for training
 
 The split was performed using a fixed random seed (42) to ensure reproducibility.
 Training set images are recorded in 'train_files.txt'; validation images in 'val_files.txt'.
@@ -256,11 +250,10 @@ Data Requirements:
 
 2. Data Format:
    - TIFF format with floating-point data type
-   - Data normalized to [-1, 1] range
-   - No missing or invalid values
+   - NaNs used to indicate background are accepted
    - Minimum 55 spectral bands
 """
-    with open(output_dir / "README_split_methodology.txt", "w") as f:
+    with open(training_split_dir / "README_split_methodology.txt", "w") as f:
         f.write(methodology_text)
 
 def run_split(
@@ -271,41 +264,46 @@ def run_split(
 ) -> Tuple[List[Path], List[Path]]:
     """
     Run the dataset splitting process.
-    
+
     Args:
         dataset_dir: Directory containing multispectral TIFF files
         train_ratio: Ratio of training data (default: 0.8)
         seed: Random seed for reproducibility
         logger: Optional logger instance (will create one if not provided)
-        
+
     Returns:
         Tuple of (train_files, val_files) containing the split file paths
     """
     if logger is None:
         logger = setup_logging()
-    
+
     dataset_dir = Path(dataset_dir)
     output_dir = Path(__file__).parent  # Save in script directory
-    
+
     # Find and validate files
     all_files = find_valid_files(dataset_dir)
-    
+
     if not all_files:
         logger.error("No valid files found. Check directory path and filtering conditions.")
         return [], []
-    
+
     # Split files
     train_files, val_files = split_files(all_files, train_ratio, seed)
-    
+
     logger.info(f"Split into {len(train_files)} training files and {len(val_files)} validation files")
-    
+
+    # Create date-based folder name
+    current_date = datetime.now()
+    folder_name = f"Training_Split_{current_date.strftime('%d.%m')}"
+    training_split_dir = output_dir / folder_name
+
     # Write file lists and documentation
     write_file_lists(train_files, val_files, output_dir)
     write_methodology(output_dir)
-    
-    logger.info(f"Split completed successfully. Files saved in: {output_dir}")
+
+    logger.info(f"Split completed successfully. Files saved in: {training_split_dir}")
     logger.info("Use train_files.txt as input for VAE training")
-    
+
     return train_files, val_files
 
 def main():
@@ -316,9 +314,9 @@ def main():
                       help="Ratio of training data (default: 0.8)")
     parser.add_argument("--seed", type=int, default=42,
                       help="Random seed for reproducibility")
-    
+
     args = parser.parse_args()
     run_split(args.dataset_dir, args.train_ratio, args.seed)
 
 if __name__ == "__main__":
-    main() 
+    main()

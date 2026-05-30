@@ -19,7 +19,7 @@ Module Purpose and Scientific Context:
 
 2. Technical Foundation:
    - Built on pretrained Stable Diffusion 3
-   - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectral5Ch)
+   - Uses pretrained and frozen multispectral VAE (AutoencoderKLMultispectralAdapter)
    - Integrates spectral attention mechanism
    - Implements spectral-aware loss functions
 
@@ -243,11 +243,6 @@ TODOs and Future Features:
    - [ ] Add visualization tools
    - [ ] Create evaluation pipeline
 
-4. Documentation:
-   - [ ] Add detailed API documentation
-   - [ ] Create usage examples
-   - [ ] Document best practices
-   - [ ] Add troubleshooting guide
 
 References:
 - DreamBooth paper: https://arxiv.org/abs/2208.12242
@@ -265,7 +260,7 @@ Usage:
         --pretrained_model_name_or_path stabilityai/stable-diffusion-3-medium-diffusers \
         --instance_data_dir /path/to/split \
         --output_dir /path/to/save/model \
-        --instance_prompt "photo of a healthy leaf" \
+        --instance_prompt "photo of a sks leaf" \
         --num_train_epochs 100 \
         --train_batch_size 4 \
         --learning_rate 1e-4 \
@@ -307,7 +302,7 @@ from huggingface_hub import create_repo, upload_folder
 from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
 
 from diffusers import (
-    AutoencoderKLMultispectral5Ch,
+    AutoencoderKLMultispectralAdapter,
     FlowMatchEulerDiscreteScheduler,
     SD3Transformer2DModel,
     StableDiffusion3Pipeline,
@@ -891,7 +886,7 @@ def main(args):
     text_encoder_one, text_encoder_two, text_encoder_three = load_text_encoders(args)
 
     # Initialize multispectral VAE
-    vae = AutoencoderKLMultispectral5Ch.from_pretrained(
+    vae = AutoencoderKLMultispectralAdapter.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
         revision=args.revision,

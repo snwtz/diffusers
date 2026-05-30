@@ -21,19 +21,28 @@ Thesis Context and Training Workflow:
    - Band 42 (730.635nm): Red-edge - sensitive to stress and early disease
    - Band 55 (850.59nm): NIR - strong reflectance in healthy leaves
 
-3. Training Features:
+3. Background Handling:
+   - NaN values in TIFF files represent background (cut-out regions)
+   - Binary masks (1 for leaf, 0 for background) are generated
+   - Loss computation only considers leaf regions
+   - Model focuses solely on leaf features
+   - No background inpainting or interpolation
+
+4. Training Features:
    a) Data Management:
       - Custom 5-channel MultispectralDataset
       - Deterministic train/val splitting
       - Spectral normalization pipeline
       - Memory-efficient loading
-   
+      - Background masking
+
    b) Loss Computation:
       - Per-band MSE for spatial fidelity
       - SAM loss for spectral signature preservation
+      - Masked loss computation (leaf regions only)
       - Configurable loss weighting
       - Band-specific loss tracking
-   
+
    c) Training Optimization:
       - Parameter isolation via get_trainable_params()
       - Learning rate scheduling with warmup
@@ -47,9 +56,10 @@ Thesis Context and Training Workflow:
       - SAM loss computation
       - Spectral attention weights
       - Reconstruction quality
-   
+
    b) Scientific Logging:
       - Weights & Biases integration
+      - Automatic experiment logging with wandb (setup inside `train()`)
       - Band importance visualization
       - Spectral signature plots
       - Training dynamics analysis
@@ -69,7 +79,7 @@ Development and Testing Strategy:
       - Monitor per-band MSE
       - Visualize reconstructions
       Expected: Near-perfect reconstructions in <100 iterations
-   
+
    b) Validation Metrics:
       - Per-band MSE tracking
       - SAM loss components
@@ -106,22 +116,26 @@ Usage:
     # First, split the dataset:
     python split_dataset.py \
         --dataset_dir /path/to/multispectral/tiffs \
-        --train_ratio 0.8 \
-        --seed 42
+
 
     # Then, train the VAE:
-    python train_multispectral_vae_5ch.py \
-        --output_dir /path/to/save/model \
-        --num_epochs 100 \
-        --batch_size 8 \
-        --learning_rate 1e-4 \
-        --adapter_placement both \
-        --use_spectral_attention \
-        --use_sam_loss \
-        --sam_weight 0.1 \
-        --warmup_ratio 0.1 \
-        --early_stopping_patience 10 \
-        --max_grad_norm 1.0
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 100 --batch_size 8 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 10 --max_grad_norm 1.0
+
+    # Testing
+    python examples\multispectral\train_multispectral_vae_5ch.py --train_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/train_files.txt" --val_file_list "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06/val_files.txt" --output_dir "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/examples/multispectral/Training_Split_18.06" --base_model_path "C:/Users/NOcsPS-440g/Desktop/Zina/diffusers/src/diffusers/models/autoencoders/autoencoder_kl.py" --num_epochs 2 --batch_size 1 --learning_rate 1e-4 --adapter_placement both --use_spectral_attention --use_sam_loss --sam_weight 0.1 --warmup_ratio 0.1 --early_stopping_patience 1 --max_grad_norm 1.0 --num_workers 0
+
+VAE Loading Note:
+   RGB VAE weights from SD3 could not be loaded directly via `from_pretrained()` using a config object,
+    because the class `AutoencoderKLMultispectralAdapter` expects unpacked keyword arguments, not a config instance.
+    Successfully loaded the RGB VAE weights from SD3 by explicitly:
+        1. Using `AutoencoderKL.from_config()` to parse the original RGB config.json.
+        2. Loading pretrained SD3 VAE weights with `load_state_dict`.
+        3. Passing the loaded AutoencoderKL instance as a `base_model` argument to our `AutoencoderKLMultispectralAdapter`.
+
+This approach bypasses issues with conflicting `from_pretrained` calls and allows reuse of the SD3 VAE backbone with frozen weights.
+"""
+"""
+
 """
 
 import os
@@ -135,6 +149,8 @@ from datetime import datetime
 import wandb
 import shutil
 from typing import Tuple
+import numpy as np  # Ensure numpy is imported
+from skimage.metrics import structural_similarity as ssim
 
 from diffusers import AutoencoderKLMultispectralAdapter
 from diffusers.optimization import get_cosine_schedule_with_warmup
@@ -145,47 +161,47 @@ def setup_logging(args):
     # Create logs directory
     log_dir = os.path.join(args.output_dir, 'logs')
     os.makedirs(log_dir, exist_ok=True)
-    
+
     # Setup file handler
     log_file = os.path.join(log_dir, f'training_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
     file_handler = logging.FileHandler(log_file)
     file_handler.setLevel(logging.INFO)
-    
+
     # Setup console handler
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
-    
+
     # Create formatter
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
+
     # Setup logger
     logger = logging.getLogger('multispectral_vae')
     logger.setLevel(logging.INFO)
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
-    
+
     return logger
 
-def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance):
+def log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args):
     logger.info(f"Epoch {epoch + 1}/{args.num_epochs}")
     logger.info("Training Metrics:")
-    logger.info(f"  Total Loss: {train_losses['total_loss']:.4f}")
+    logger.info(f"  Total Loss: {train_losses.get('total_loss', float('nan')):.4f}")
     logger.info("  Per-channel MSE:")
-    for i, loss in enumerate(train_losses['mse_per_channel']):
+    for i, loss in enumerate(train_losses.get('mse_per_channel', [])):
         logger.info(f"    Band {i+1}: {loss:.4f}")
     if 'sam' in train_losses:
         logger.info(f"  SAM Loss: {train_losses['sam']:.4f}")
-    
+
     logger.info("Validation Metrics:")
-    logger.info(f"  Total Loss: {val_losses['total_loss']:.4f}")
+    logger.info(f"  Total Loss: {val_losses.get('total_loss', float('nan')):.4f}")
     logger.info("  Per-channel MSE:")
-    for i, loss in enumerate(val_losses['mse_per_channel']):
+    for i, loss in enumerate(val_losses.get('mse_per_channel', [])):
         logger.info(f"    Band {i+1}: {loss:.4f}")
     if 'sam' in val_losses:
         logger.info(f"  SAM Loss: {val_losses['sam']:.4f}")
-    
+
     logger.info("Band Importance:")
     for band, importance in band_importance.items():
         logger.info(f"  {band}: {importance:.4f}")
@@ -208,35 +224,39 @@ def setup_wandb(args):
 def log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction):
     wandb.log({
         "epoch": epoch,
-        "train_total_loss": train_losses['total_loss'],
-        "val_total_loss": val_losses['total_loss'],
-        **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses['mse_per_channel'])},
-        **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses['mse_per_channel'])},
+        "train_total_loss": train_losses.get('total_loss', float('nan')),
+        "val_total_loss": val_losses.get('total_loss', float('nan')),
+        **{f"train_mse_band_{i}": loss for i, loss in enumerate(train_losses.get('mse_per_channel', []))},
+        **{f"val_mse_band_{i}": loss for i, loss in enumerate(val_losses.get('mse_per_channel', []))},
         **{f"band_importance_{k}": v for k, v in band_importance.items()},
-        "original_images": wandb.Image(batch[0]),
-        "reconstructed_images": wandb.Image(reconstruction[0])
+        # "original_images": wandb.Image(batch[0]),
+        # "reconstructed_images": wandb.Image(reconstruction[0])
+        "original_images_band0": wandb.Image(batch[0][0:1]),  # First channel as grayscale
+        "reconstructed_images_band0": wandb.Image(reconstruction[0][0:1])
     })
-    if 'sam' in train_losses:
+    if 'sam' in train_losses and 'sam' in val_losses:
         wandb.log({
             "train_sam_loss": train_losses['sam'],
             "val_sam_loss": val_losses['sam']
         })
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args):
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, is_best, args, best_val_loss=None, patience_counter=None):
     """Save model checkpoint."""
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
-        'loss': loss
+        'loss': loss,
+        'best_val_loss': best_val_loss,
+        'patience_counter': patience_counter
     }
-    
+
     # Save regular checkpoint
     checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{epoch+1}")
     model.save_pretrained(checkpoint_path)
     torch.save(checkpoint, os.path.join(checkpoint_path, 'training_state.pt'))
-    
+
     # Save best model if needed
     if is_best:
         best_model_path = os.path.join(args.output_dir, 'best_model')
@@ -250,7 +270,7 @@ def count_parameters(model):
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     non_trainable_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
     total_params = trainable_params + non_trainable_params
-    
+
     return {
         'trainable': trainable_params,
         'non_trainable': non_trainable_params,
@@ -261,13 +281,13 @@ def count_parameters(model):
 def log_parameter_counts(model, logger, wandb_log=True):
     """Log model parameter counts to logger and wandb."""
     param_counts = count_parameters(model)
-    
+
     logger.info("Model Parameter Counts:")
     logger.info(f"  Trainable parameters: {param_counts['trainable']:,}")
     logger.info(f"  Non-trainable parameters: {param_counts['non_trainable']:,}")
     logger.info(f"  Total parameters: {param_counts['total']:,}")
     logger.info(f"  Trainable percentage: {param_counts['trainable_percentage']:.2f}%")
-    
+
     if wandb_log:
         wandb.log({
             "model/trainable_params": param_counts['trainable'],
@@ -279,132 +299,228 @@ def log_parameter_counts(model, logger, wandb_log=True):
 def prepare_dataset(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
     """
     Prepare the dataset using the split files created by split_dataset.py.
-    
+
     Args:
         args: Command line arguments
-        
+
     Returns:
         Tuple of (train_loader, val_loader)
-        
+
     Implementation Notes:
     -------------------
     1. File List Management:
        - Uses split files from split_dataset.py
        - Ensures deterministic train/val splits
        - Maintains data consistency
-    
+
     2. Dataloader Configuration:
        - Uses VAE-specific dataloader module
        - Optimizes for GPU training
        - Enables efficient data loading
-    
+
     3. Error Handling:
        - Validates split files exist
        - Provides clear error messages
        - Ensures training stability
     """
-    logger = setup_logging(args)
-    
-    # Get split files from script directory
-    split_dir = Path(__file__).parent
-    train_list = split_dir / "train_files.txt"
-    val_list = split_dir / "val_files.txt"
-    
+    # Get split files from args
+    train_list = Path(args.train_file_list)
+    val_list = Path(args.val_file_list)
+
     # Validate split files exist
-    if not train_list.exists() or not val_list.exists():
-        raise FileNotFoundError(
-            f"Split files not found in {split_dir}. "
-            "Please run split_dataset.py first to create train_files.txt and val_files.txt"
-        )
-    
+    if not train_list.exists():
+        raise FileNotFoundError(f"Training file list not found: {train_list}")
+    if not val_list.exists():
+        raise FileNotFoundError(f"Validation file list not found: {val_list}")
+
     # Create dataloaders using the new VAE dataloader module
     # This factory function ensures consistent configuration and optimal settings
-    train_loader, val_loader = create_vae_dataloaders(
-        train_list_path=str(train_list),
-        val_list_path=str(val_list),
-        batch_size=args.batch_size,
-        resolution=512,  # Fixed resolution for VAE training
-        num_workers=args.num_workers,
-        use_cache=True,  # Enable caching for repeated access
-        prefetch_factor=2 if args.num_workers > 0 else None,  # Optimize data loading
-        persistent_workers=args.num_workers > 0  # Efficient worker management
-    )
-    
-    logger.info(f"Created dataloaders with {len(train_loader.dataset)} training and {len(val_loader.dataset)} validation samples")
-    
+    try:
+        train_loader, val_loader = create_vae_dataloaders(
+            train_list_path=str(train_list),
+            val_list_path=str(val_list),
+            batch_size=args.batch_size,
+            resolution=512,  # Fixed resolution for VAE training
+            num_workers=args.num_workers,
+            use_cache=True,  # Enable caching for repeated access
+            prefetch_factor=2 if args.num_workers > 0 else None,  # Optimize data loading
+            persistent_workers=args.num_workers > 0  # Efficient worker management
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to create dataloaders: {e}")
+
+    # Sample inspection — checking first training batch for NaNs
+    logger = logging.getLogger('multispectral_vae')
+    logger.info(f"Sample inspection — checking first training batch for NaNs")
+    # New debug check: inspect for NaNs before any sanitization or clamping
+    for sample_batch, _ in train_loader:
+        logger.info("Checking for NaNs/Infs in first batch (pre-sanitization)...")
+        raw_nan_check = torch.isnan(sample_batch)
+        if raw_nan_check.any():
+            logger.warning(f"NaNs detected in raw first batch before sanitization. NaN count: {raw_nan_check.sum().item()}")
+            for channel_idx in range(sample_batch.shape[1]):
+                channel_nans = raw_nan_check[:, channel_idx].sum()
+                if channel_nans > 0:
+                    logger.warning(f"  NaNs in channel {channel_idx}: {channel_nans.item()} total")
+        else:
+            logger.info("First training batch is free of NaNs (pre-sanitization).")
+        break
+
     return train_loader, val_loader
+
+def load_checkpoint(checkpoint_path: str, model, optimizer, scheduler, device):
+    """
+    Load training state from a checkpoint.
+    
+    Args:
+        checkpoint_path: Path to checkpoint directory
+        model: Model to load weights into
+        optimizer: Optimizer to load state into
+        scheduler: Scheduler to load state into
+        device: Device to load tensors on
+    
+    Returns:
+        Tuple of (start_epoch, best_val_loss, patience_counter)
+    """
+    checkpoint_file = os.path.join(checkpoint_path, 'training_state.pt')
+    if not os.path.exists(checkpoint_file):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_file}")
+    
+    logger.info(f"Loading checkpoint from: {checkpoint_path}")
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    
+    # Load model weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    logger.info(f"Loaded model weights from epoch {checkpoint['epoch']}")
+    
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    logger.info("Loaded optimizer state")
+    
+    # Load scheduler state
+    scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    logger.info("Loaded scheduler state")
+    
+    # Extract training state
+    start_epoch = checkpoint['epoch'] + 1  # Resume from next epoch
+    best_val_loss = checkpoint.get('best_val_loss', float('inf'))
+    patience_counter = checkpoint.get('patience_counter', 0)
+    
+    logger.info(f"Resuming from epoch {start_epoch} with best validation loss: {best_val_loss:.6f}")
+    
+    return start_epoch, best_val_loss, patience_counter
 
 def train(args: argparse.Namespace) -> None:
     """
     Main training function.
-    
+
     Implementation Notes:
     -------------------
     1. Model Initialization:
        - Loads pretrained SD3 model
        - Configures multispectral adapters
        - Freezes backbone for efficient training
-    
+
     2. Training Pipeline:
        - Uses cosine learning rate schedule with warmup
        - Implements EMA model averaging
        - Applies gradient clipping
        - Supports early stopping
-    
+       - Handles background masking
+
     3. Loss Computation:
        - Per-band MSE for spatial fidelity
        - Optional SAM loss for spectral preservation
+       - Masked loss computation (leaf regions only)
        - Configurable loss weighting
-    
+
     4. Validation Strategy:
        - Per-epoch validation
        - Tracks best model
        - Implements early stopping
        - Saves checkpoints
-    
+       - Evaluates only leaf regions
+
     5. Monitoring:
        - Comprehensive logging
        - Wandb integration
        - Band importance tracking
        - Training dynamics analysis
     """
-    
-    # Initialize model with adapter configuration
-    model = AutoencoderKLMultispectralAdapter.from_pretrained(
-        "stabilityai/stable-diffusion-3-medium-diffusers",
-        adapter_placement=args.adapter_placement,
-        use_spectral_attention=args.use_spectral_attention,
-        use_sam_loss=args.use_sam_loss
-    )
-    
-    # Freeze backbone (only adapters will be trained)
-    # This is crucial for parameter-efficient fine-tuning
-    model.freeze_backbone()
-    
+
+    # Setup logging first (after output_dir is set)
+    logger = setup_logging(args)
+    setup_wandb(args)
+    logger.info(f"Starting multispectral VAE training with output directory: {args.output_dir}")
+
+    # Load base SD3 VAE weights and inject fresh multispectral adapters
+    try:
+        logger.info(f"Loading base model from: {args.base_model_path}")
+        model = AutoencoderKLMultispectralAdapter.from_pretrained(
+            pretrained_model_name_or_path=args.base_model_path,
+            subfolder=args.subfolder,
+            adapter_placement=args.adapter_placement,
+            use_spectral_attention=args.use_spectral_attention,
+            use_sam_loss=args.use_sam_loss
+        )
+        logger.info("Successfully loaded base model")
+    except Exception as e:
+        logger.error(f"Failed to load base model: {e}")
+        raise RuntimeError(f"Model loading failed: {e}")
+
+    # NOTE: Unlike typical SD pipelines where model inputs are passed as dictionaries with keys like "pixel_values",
+    #       this training script uses direct tensor inputs. This works because our custom model accepts tensor input directly,
+    #       but care must be taken when integrating with HuggingFace-style SD pipelines later.
+
+    # Validate model has required methods
+    required_methods = ['freeze_backbone', 'get_trainable_params', 'compute_losses']
+    for method in required_methods:
+        if not hasattr(model, method):
+            raise AttributeError(f"Model missing required method: {method}")
+
+    # Freeze backbone for parameter-efficient fine-tuning
+    try:
+        model.freeze_backbone()
+        logger.info("Backbone frozen successfully")
+    except Exception as e:
+        logger.error(f"Failed to freeze backbone: {e}")
+        raise RuntimeError(f"Backbone freezing failed: {e}")
+
     # Move model to device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-    
-    # Setup logging
-    logger = setup_logging(args)
-    
+    logger.info(f"Model moved to device: {device}")
+
     # Log parameter counts before training
     # This helps track model complexity and training efficiency
     log_parameter_counts(model, logger)
-    
+
     # Prepare dataset and dataloaders
     # Uses the VAE-specific dataloader for optimal data handling
-    train_loader, val_loader = prepare_dataset(args)
-    
+    try:
+        train_loader, val_loader = prepare_dataset(args)
+        logger.info(f"Created dataloaders with {len(train_loader.dataset)} training and {len(val_loader.dataset)} validation samples")
+    except Exception as e:
+        logger.error(f"Failed to prepare dataset: {e}")
+        raise RuntimeError(f"Dataset preparation failed: {e}")
+
     # Initialize optimizer with trainable parameters
     # Only adapters are trained, backbone remains frozen
-    optimizer = torch.optim.AdamW(model.get_trainable_params(), lr=args.learning_rate)
-    
+    try:
+        trainable_params = model.get_trainable_params()
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
+        logger.info(f"Optimizer initialized with {len(trainable_params)} parameter groups")
+    except Exception as e:
+        logger.error(f"Failed to initialize optimizer: {e}")
+        raise RuntimeError(f"Optimizer initialization failed: {e}")
+
     # Calculate total training steps for scheduler
     # Enables proper learning rate scheduling
     total_steps = len(train_loader) * args.num_epochs
     warmup_steps = int(total_steps * args.warmup_ratio)
-    
+
     # Initialize scheduler
     # Cosine schedule with warmup for stable training
     scheduler = get_cosine_schedule_with_warmup(
@@ -412,114 +528,293 @@ def train(args: argparse.Namespace) -> None:
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps
     )
-    
+
     # Initialize EMA model
     # Improves training stability and final model quality
     ema_model = EMAModel(model.parameters())
-    
+
     # Setup wandb
     # Enables experiment tracking and visualization
-    setup_wandb(args)
-    
+    try:
+        setup_wandb(args)
+        logger.info("Wandb initialized successfully")
+    except Exception as e:
+        logger.warning(f"Failed to initialize wandb: {e}")
+
     # Initialize early stopping
     # Prevents overfitting and saves best model
     best_val_loss = float('inf')
     patience_counter = 0
-    
+    start_epoch = 0  # Default start epoch
+
+    # Load checkpoint if specified
+    if args.resume_from_checkpoint:
+        try:
+            start_epoch, best_val_loss, patience_counter = load_checkpoint(args.resume_from_checkpoint, model, optimizer, scheduler, device)
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise RuntimeError(f"Checkpoint loading failed: {e}")
+
     # Training loop
-    for epoch in range(args.num_epochs):
+    total_epochs_to_train = args.num_epochs - start_epoch
+    logger.info(f"Training for {total_epochs_to_train} epochs (from epoch {start_epoch} to {args.num_epochs-1})")
+    
+    for epoch in range(start_epoch, args.num_epochs):
         model.train()
         train_losses = {
             'total_loss': 0,
-            'mse_per_channel': torch.zeros(5),  # 5 bands
+            'mse_per_channel': torch.zeros(5, device=device),  # 5 bands
             'sam_loss': 0
         }
-        
+
         # Training phase
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training"):
+        for batch, mask in tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Training"):
             batch = batch.to(device)
-            
-            # Forward pass
-            output = model(batch)
-            reconstruction = output.sample
-            
-            # Get detailed losses from model
-            # Tracks both spatial and spectral fidelity
-            losses = model.compute_losses(batch, reconstruction)
-            
-            # Calculate total loss
+            mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+            # Debugging: check raw batch for NaNs before any preprocessing
+            # (Removed excessive debug logging)
+            # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+            batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
+            batch = torch.clamp(batch, min=0.0, max=1.0)
+
+            # Forward pass with input tensor (not a dict) — valid due to model's custom __call__ signature.
+            try:
+                # --- Begin NaN-sanitization in VAE forward ---
+                # Custom forward: expose encode() and decode() for NaN checks
+                posterior = model.encode(batch).latent_dist
+                # Check and sanitize posterior mean and logvar to prevent NaNs propagating into latent sample
+                if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+                    logger.warning("NaNs detected in posterior mean/logvar after encode")
+                posterior.mean = torch.nan_to_num(posterior.mean, nan=0.0)
+                posterior.logvar = torch.nan_to_num(posterior.logvar, nan=0.0)
+                z = posterior.sample()
+                # Check and sanitize latent z before decoding
+                if torch.isnan(z).any():
+                    logger.warning("NaNs detected in latent sample z")
+                z = torch.nan_to_num(z, nan=0.0)
+                reconstruction = model.decode(z)
+                # Check for NaNs in reconstruction and skip loss computation if corrupted
+                if torch.isnan(reconstruction).any():
+                    logger.warning("NaNs detected in reconstruction — skipping loss")
+                    continue
+                # --- End NaN-sanitization in VAE forward ---
+            except Exception as e:
+                logger.error(f"Forward pass failed: {e}")
+                continue
+
+            # NaN-check inserted to prevent invalid loss calculations due to corrupted model output or inputs.
+            if torch.isnan(batch).any() or torch.isnan(reconstruction).any():
+                logger.warning("NaNs detected in input to compute_losses. Skipping this batch.")
+                continue  # Skip this batch to avoid NaN loss
+
+            # CRITICAL: Apply mask to both original and reconstructed images before loss computation
+            # This ensures that only leaf regions (mask == 1) are evaluated, not background pixels
+            # Background pixels would artificially inflate loss scores since they're easy to reconstruct as zero
+            # Pass mask to compute_losses to enable soft background loss (10% weight)
+            try:
+                # Debugging: Check for Infs before loss computation
+                if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
+                    logger.warning("Infs detected in batch or reconstruction input to compute_losses")
+                # Masked loss computation: Only leaf regions (mask == 1) are evaluated
+                losses = model.compute_losses(batch * mask, reconstruction * mask, mask=mask, background_loss_weight=0.1)
+                # Debugging: Check if losses is a dict
+                if not isinstance(losses, dict):
+                    logger.error(f"compute_losses() returned non-dict: {type(losses)}")
+            except Exception as e:
+                logger.error(
+                    f"Loss computation failed: {e}\n"
+                    f"  batch shape: {batch.shape}\n"
+                    f"  reconstruction shape: {getattr(reconstruction, 'shape', 'n/a')}\n"
+                    f"  mask shape: {mask.shape} | mask sum: {mask.sum().item()}"
+                )
+                continue
+
+            # Calculate total loss with proper validation
             # Combines MSE and optional SAM loss
+            if 'mse' not in losses:
+                logger.error("MSE loss not found in model output")
+                continue
+
             total_loss = losses['mse']
             if args.use_sam_loss and 'sam' in losses:
                 total_loss = total_loss + args.sam_weight * losses['sam']
-            
+            # Debugging: Check for NaN in total loss
+            if torch.isnan(total_loss):
+                logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
+
             # Backward pass
             optimizer.zero_grad()
             total_loss.backward()
-            
+
             # Apply gradient clipping
             # Prevents exploding gradients
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), 
+                model.parameters(),
                 max_norm=args.max_grad_norm
             )
-            
+
             # Log if gradients were clipped
             # Helps monitor training stability
             if grad_norm > args.max_grad_norm:
                 logger.info(f"Gradients clipped at epoch {epoch+1}, norm: {grad_norm:.2f}")
-                wandb.log({
-                    "training/grad_norm": grad_norm,
-                    "training/gradients_clipped": 1
-                })
-            
+
             optimizer.step()
             scheduler.step()
-            
+
             # Update EMA model
             # Improves model stability
             ema_model.step(model.parameters())
-            
+
             # Track losses
             # Monitors training progress
             train_losses['total_loss'] += total_loss.item()
-            train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
+            if 'mse_per_channel' in losses:
+                train_losses['mse_per_channel'] += losses['mse_per_channel'].detach()
             if args.use_sam_loss and 'sam' in losses:
                 train_losses['sam_loss'] += losses['sam'].item()
-        
+
         # Validation phase
         model.eval()
         val_losses = {
             'total_loss': 0,
-            'mse_per_channel': torch.zeros(5),  # 5 bands
+            'mse_per_channel': torch.zeros(5, device=device),  # 5 bands
             'sam_loss': 0
         }
-        
+
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
+            ssim_per_band = []  # To accumulate average SSIM per band over all batches
+            for batch, mask in tqdm(val_loader, desc=f"Epoch {epoch+1}/{args.num_epochs} - Validation"):
                 batch = batch.to(device)
-                
+                mask = mask.to(device)  # Background mask (1 for leaf, 0 for background)
+                # (Removed debug logging for NaNs in validation batch)
+                # Sanitize batch to remove NaNs and Infs, and clamp to [0, 1]
+                batch = torch.nan_to_num(batch, nan=0.0, posinf=1.0, neginf=-1.0)
+                batch = torch.clamp(batch, min=0.0, max=1.0)
+
                 # Forward pass
-                output = model(batch)
-                reconstruction = output.sample
-                
-                # Get detailed losses from model
-                # Evaluates model performance
-                losses = model.compute_losses(batch, reconstruction)
-                
+                try:
+                    # --- Begin NaN-sanitization in VAE forward (validation) ---
+                    posterior = model.encode(batch).latent_dist
+                    # Check and sanitize posterior mean and logvar to prevent NaNs propagating into latent sample
+                    if torch.isnan(posterior.mean).any() or torch.isnan(posterior.logvar).any():
+                        logger.warning("NaNs detected in posterior mean/logvar after encode")
+                    posterior.mean = torch.nan_to_num(posterior.mean, nan=0.0)
+                    posterior.logvar = torch.nan_to_num(posterior.logvar, nan=0.0)
+                    z = posterior.sample()
+                    # Check and sanitize latent z before decoding
+                    if torch.isnan(z).any():
+                        logger.warning("NaNs detected in latent sample z")
+                    z = torch.nan_to_num(z, nan=0.0)
+                    reconstruction = model.decode(z)
+                    # Check for NaNs in reconstruction and skip loss computation if corrupted
+                    if torch.isnan(reconstruction).any():
+                        logger.warning("NaNs detected in reconstruction — skipping loss")
+                        continue
+                    # --- End NaN-sanitization in VAE forward (validation) ---
+                except Exception as e:
+                    logger.error(f"Validation forward pass failed: {e}")
+                    continue
+
+                # CRITICAL: Apply mask to both original and reconstructed images before loss computation
+                # This ensures that only leaf regions (mask == 1) are evaluated, not background pixels
+                # Background pixels would artificially inflate loss scores since they're easy to reconstruct as zero
+                # Pass mask to compute_losses to enable soft background loss (10% weight)
+                try:
+                    # Debugging: Check for Infs before loss computation (validation)
+                    if torch.isinf(batch).any() or torch.isinf(reconstruction).any():
+                        logger.warning("Infs detected in batch or reconstruction input to compute_losses (validation)")
+                    # Masked validation loss: Evaluates only leaf regions
+                    losses = model.compute_losses(batch * mask, reconstruction * mask, mask=mask, background_loss_weight=0.1)
+                    # Debugging: Check if losses is a dict
+                    if not isinstance(losses, dict):
+                        logger.error(f"compute_losses() returned non-dict: {type(losses)}")
+                except Exception as e:
+                    logger.error(
+                        f"Validation loss computation failed: {e}\n"
+                        f"  batch shape: {batch.shape}\n"
+                        f"  reconstruction shape: {getattr(reconstruction, 'shape', 'n/a')}\n"
+                        f"  mask shape: {mask.shape} | mask sum: {mask.sum().item()}"
+                    )
+                    continue
+
                 # Calculate total loss
                 # Consistent with training loss computation
+                if 'mse' not in losses:
+                    continue
+
                 total_loss = losses['mse']
                 if args.use_sam_loss and 'sam' in losses:
                     total_loss = total_loss + args.sam_weight * losses['sam']
+                # Debugging: Check for NaN in total loss (validation)
+                if torch.isnan(total_loss):
+                    logger.warning("Total loss is NaN after MSE and SAM loss aggregation")
+
+                # Compute SSIM per-band (compatibility with skimage.metrics.ssim)
+                # Loop over both batch and channel dimensions using skimage.metrics.structural_similarity
+                # CRITICAL: Apply mask to both original and reconstructed images before SSIM computation
+                # This ensures we only evaluate reconstruction quality on leaf regions, not background
+
+                # NOTE: fallback of computing SSIM without mask will include background, potentially biasing results.
+                batch_np = batch.detach()
+                recon_np = reconstruction.detach()
+                mask_np = mask.detach()  # Background mask (1 for leaf, 0 for background)
                 
+                # Accumulate average SSIM per band for this batch
+                num_bands = batch_np.shape[1]
+                batch_size = batch_np.shape[0]
+                batch_ssim_per_band = []
+                for band_idx in range(num_bands):
+                    band_ssim_total = 0.0
+                    valid_samples = 0  # Count samples with valid leaf regions
+                    for sample_idx in range(batch_size):
+                        # Apply mask to isolate leaf regions only
+                        original_band = batch_np[sample_idx, band_idx].cpu().numpy()
+                        recon_band = recon_np[sample_idx, band_idx].cpu().numpy()
+                        sample_mask = mask_np[sample_idx, 0].cpu().numpy()  # (H, W)
+                        
+                        # Only compute SSIM if there are valid leaf pixels
+                        if np.sum(sample_mask) > 0:
+                            # Apply mask to both original and reconstructed bands
+                            masked_orig = original_band * sample_mask
+                            masked_recon = recon_band * sample_mask
+                            
+                            # Compute SSIM only on the masked region
+                            # Note: skimage SSIM with mask parameter requires recent version
+                            try:
+                                ssim_val = ssim(masked_orig, masked_recon, data_range=1.0, 
+                                              mask=sample_mask.astype(bool))
+                            except TypeError:
+                                # Fallback: compute SSIM on entire image but this includes background
+                                # This is less accurate but ensures compatibility
+                                logger.warning(f"SSIM mask parameter not supported, computing on entire image for sample {sample_idx}")
+                                ssim_val = ssim(original_band, recon_band, data_range=1.0)
+                            
+                            band_ssim_total += ssim_val
+                            valid_samples += 1
+                    
+                    # Average SSIM for this band across valid samples
+                    if valid_samples > 0:
+                        batch_ssim_per_band.append(band_ssim_total / valid_samples)
+                    else:
+                        batch_ssim_per_band.append(0.0)  # No valid leaf regions
+                
+                # Accumulate per-batch SSIMs for averaging after all batches
+                if len(ssim_per_band) == 0:
+                    ssim_per_band = batch_ssim_per_band
+                else:
+                    ssim_per_band = [x + y for x, y in zip(ssim_per_band, batch_ssim_per_band)]
+
                 # Track losses
                 # Monitors validation performance
                 val_losses['total_loss'] += total_loss.item()
-                val_losses['mse_per_channel'] += losses['mse_per_channel']
+                if 'mse_per_channel' in losses:
+                    val_losses['mse_per_channel'] += losses['mse_per_channel']
                 if args.use_sam_loss and 'sam' in losses:
                     val_losses['sam_loss'] += losses['sam'].item()
-        
+            # After validation loop, average ssim_per_band over number of batches
+            if len(val_loader) > 0:
+                ssim_per_band = [v / len(val_loader) for v in ssim_per_band]
+
         # Average losses
         # Computes epoch-level metrics
         for key in train_losses:
@@ -527,24 +822,34 @@ def train(args: argparse.Namespace) -> None:
                 train_losses[key] /= len(train_loader)
             else:
                 train_losses[key] /= len(train_loader)
-        
+
         for key in val_losses:
             if isinstance(val_losses[key], torch.Tensor):
                 val_losses[key] /= len(val_loader)
             else:
                 val_losses[key] /= len(val_loader)
-        
+
         # Get band importance if using spectral attention
         # Analyzes model's spectral understanding
         band_importance = {}
-        if args.use_spectral_attention:
-            band_importance = model.input_adapter.attention.get_band_importance()
-        
+        if args.use_spectral_attention and hasattr(model, 'input_adapter') and hasattr(model.input_adapter, 'attention'):
+            try:
+                band_importance = model.input_adapter.attention.get_band_importance()
+            except Exception as e:
+                logger.warning(f"Failed to get band importance: {e}")
+
+        # print SSIM
+        avg_ssim = np.mean(ssim_per_band)
+        print(f"Avg SSIM: {avg_ssim:.4f} | Per-band SSIM: {[f'{v:.4f}' for v in ssim_per_band]}")
+
         # Log metrics
         # Tracks training progress
-        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance)
-        log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
-        
+        log_training_metrics(logger, epoch, train_losses, val_losses, band_importance, args)
+        try:
+            log_to_wandb(epoch, train_losses, val_losses, band_importance, batch, reconstruction)
+        except Exception as e:
+            logger.warning(f"Failed to log to wandb: {e}")
+
         # Save checkpoint
         # Implements model checkpointing strategy
         is_best = val_losses['total_loss'] < best_val_loss
@@ -553,19 +858,39 @@ def train(args: argparse.Namespace) -> None:
             patience_counter = 0
         else:
             patience_counter += 1
-        
+
         if (epoch + 1) % args.save_every == 0 or is_best:
-            save_checkpoint(model, optimizer, scheduler, epoch, val_losses['total_loss'], is_best, args)
-        
+            try:
+                save_checkpoint(model, optimizer, scheduler, epoch, val_losses['total_loss'], is_best, args, best_val_loss, patience_counter)
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}")
+
         # Early stopping
         # Prevents overfitting
         if patience_counter >= args.early_stopping_patience:
             logger.info(f"Early stopping triggered after {epoch + 1} epochs")
             break
 
+    # Save final model
+    try:
+        final_model_path = os.path.join(args.output_dir, 'final_model')
+        model.save_pretrained(final_model_path)
+        logger.info(f"Final model saved to: {final_model_path}")
+    except Exception as e:
+        logger.error(f"Failed to save final model: {e}")
+
+    logger.info("Training completed successfully!")
+
 def main():
     parser = argparse.ArgumentParser(description="Train 5-channel multispectral VAE")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save model checkpoints")
+    parser.add_argument("--subfolder", type=str, default="vae",
+                        help="Subfolder inside base_model_path where the VAE is stored.")
+    parser.add_argument("--train_file_list", type=str, required=True, help="Path to train_files.txt")
+    parser.add_argument("--val_file_list", type=str, required=True, help="Path to val_files.txt")
+    parser.add_argument("--output_dir", type=str, help="Directory to save model checkpoints (optional)")
+    parser.add_argument("--base_model_path", type=str,
+                      default="stabilityai/stable-diffusion-3-medium",
+                      help="Path to base SD3 model or local VAE checkpoint")
     parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Training batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
@@ -586,8 +911,18 @@ def main():
                       help="Number of epochs to wait for improvement before early stopping")
     parser.add_argument("--max_grad_norm", type=float, default=1.0,
                       help="Maximum gradient norm for clipping")
+    parser.add_argument("--resume_from_checkpoint", type=str, help="Path to checkpoint directory to resume from")
     
+
     args = parser.parse_args()
+
+    # Set default output directory if not provided
+    if args.output_dir is None:
+        args.output_dir = str(Path(args.train_file_list).parent / "model_output")
+
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
+
     train(args)
 
 if __name__ == "__main__":
